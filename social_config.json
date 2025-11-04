@@ -1,0 +1,19 @@
+{
+  "twitter": {
+    "bearer_token": "YOUR_TWITTER_BEARER_TOKEN",
+    "consumer_key": "EDa0XCWgqmgueZwtCiu4mInw7",
+    "consumer_secret": "HbS8cF98Uj8gOKMa63ZKRclgYdlsDPBRBFooGpYsKRxMPh58ry",
+    "access_token": "1956346854079180801-ofGnNB3kLCNP6c1FbEitdB9bqPHEZL",
+    "access_token_secret": "y6Y2aRwHiYHELeWzWgWMsfe5A8uHYC2Argj5LkWGOPR57"
+  },
+  "discord": {
+    "webhook_url": "https://discord.com/api/webhooks/1406394645335900302/GWwPufzzeDViqyrYEQJeh6rqIhuWWUJl1HnJcTTmb8ewL-rGCqsO_sp9kFG6CAYyZ1UX"
+  },
+
+  "odds": {
+    "api_key": "327eec13695d92e83b7e477fa5589e2c"
+  },
+	
+  "streamlit": { "url": "https://2qvgerjrstbsxem49u54bd.streamlit.app/" }
+
+}

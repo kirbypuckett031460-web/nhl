@@ -1,0 +1,23 @@
+[
+  {
+    "game_id": "offline_0",
+    "date": "2025-09-29",
+    "home_team": "BOS",
+    "away_team": "TOR",
+    "venue": "TD Garden"
+  },
+  {
+    "game_id": "offline_1",
+    "date": "2025-09-29",
+    "home_team": "COL",
+    "away_team": "EDM",
+    "venue": "Ball Arena"
+  },
+  {
+    "game_id": "offline_2",
+    "date": "2025-09-29",
+    "home_team": "FLA",
+    "away_team": "VGK",
+    "venue": "Amerant Bank Arena"
+  }
+]

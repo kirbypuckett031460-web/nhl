@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NHL Over/Under Dashboard (Clean)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif; background:#f4f6f8; margin:0; padding:24px; }
+    .container { max-width: 1200px; margin: 0 auto; background:#fff; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); overflow: hidden; }
+    .header { background: linear-gradient(135deg, #2c3e50, #3498db); color:#fff; padding:24px; }
+    .header h1 { margin:0 0 6px 0; }
+    .content { padding: 20px; }
+    .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:10px; }
+    .toolbar input, .toolbar select, .toolbar button { padding:8px 10px; border:1px solid #ccd6dd; border-radius:6px; }
+    table { width:100%; border-collapse: collapse; }
+    th { background:#2c3e50; color:#fff; text-align:left; padding:10px; }
+    td { padding:10px; border-bottom:1px solid #eef2f5; }
+    tr:hover { background:#f8fafc; }
+    .rec-over { color:#2e7d32; font-weight:600; }
+    .rec-under { color:#c62828; font-weight:600; }
+    .rec-no { color:#6b7280; font-weight:600; }
+    .status { margin-top: 14px; font-size: 14px; color:#334155; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🏒 NHL Over/Under Dashboard</h1>
+      <div>Clean static build for testing filters and Copy Best Bets</div>
+    </div>
+    <div class="content">
+
+      <div class="toolbar">
+        <input id="filterText" type="text" placeholder="Filter by team (e.g., TOR, BOS)" oninput="window.applyFilters && window.applyFilters()">
+        <select id="filterRec" onchange="window.applyFilters && window.applyFilters()">
+          <option value="">All</option>
+          <option value="OVER">OVER</option>
+          <option value="UNDER">UNDER</option>
+          <option value="No Bet">No Bet</option>
+        </select>
+        <button id="exportCsv" type="button" onclick="toCsv && toCsv()">Export CSV</button>
+        <button id="copyBest" type="button" onclick="copyBestBets && copyBestBets()">Copy Best Bets</button>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Matchup</th>
+            <th>Line</th>
+            <th>Prediction</th>
+            <th>Edge</th>
+            <th>Over %</th>
+            <th>Under %</th>
+            <th>Confidence</th>
+            <th>Env</th>
+            <th>Lineup</th>
+            <th>Recommendation</th>
+            <th>Kelly %</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- Sample rows (ensure data-matchup and data-rec exist) -->
+          <tr data-gid="2025020004" data-rec="No Bet" data-matchup="MTL @ TOR">
+            <td><strong>MTL @ TOR</strong></td>
+            <td>6.0</td>
+            <td>5.31</td>
+            <td>-0.69</td>
+            <td>33%</td>
+            <td>67%</td>
+            <td>49%</td>
+            <td>OD 7:30PM 66°F</td>
+            <td>H:2.10/A:1.95</td>
+            <td class="rec-no">No Bet</td>
+            <td>0.0%</td>
+          </tr>
+          <tr data-gid="2025020005" data-rec="UNDER" data-matchup="BOS @ WSH">
+            <td><strong>BOS @ WSH</strong></td>
+            <td>6.5</td>
+            <td>4.63</td>
+            <td>-1.87</td>
+            <td>10%</td>
+            <td>90%</td>
+            <td>95%</td>
+            <td>7:00PM 71°F</td>
+            <td>H:2.05/A:1.88</td>
+            <td class="rec-under">UNDER</td>
+            <td>5.0%</td>
+          </tr>
+          <tr data-gid="2025020006" data-rec="OVER" data-matchup="CGY @ EDM">
+            <td><strong>CGY @ EDM</strong></td>
+            <td>6.5</td>
+            <td>7.12</td>
+            <td>+0.62</td>
+            <td>63%</td>
+            <td>37%</td>
+            <td>81%</td>
+            <td>9:00PM 63°F</td>
+            <td>H:2.30/A:1.75</td>
+            <td class="rec-over">OVER</td>
+            <td>3.0%</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="status" id="status"></div>
+
+    </div>
+  </div>
+
+  <script>
+  (function(){
+    const status = document.getElementById('status');
+    const table = document.querySelector('table'); if (!table) return;
+    const tbody = table.querySelector('tbody');
+    const getRows = () => Array.from(tbody.querySelectorAll('tr'));
+    const norm = s => (s || '').replace(/\u00A0/g,' ').trim();
+
+    window.applyFilters = function(){
+      const txtEl = document.getElementById('filterText');
+      const recEl = document.getElementById('filterRec');
+      const txt = norm(txtEl && txtEl.value).toUpperCase();
+      const recUpper = norm(recEl && recEl.value).toUpperCase();
+      getRows().forEach(tr => {
+        const matchup = norm(tr.getAttribute('data-matchup')).toUpperCase();
+        const recAttr = norm(tr.getAttribute('data-rec')).toUpperCase();
+        const matchTxt = !txt || (matchup && matchup.indexOf(txt) !== -1);
+        const matchRec = !recUpper || recAttr === recUpper;
+        tr.style.display = (matchTxt && matchRec) ? 'table-row' : 'none';
+      });
+    };
+
+    window.toCsv = function(){
+      const headers = Array.from(table.querySelectorAll('thead th')).map(th => norm(th.innerText));
+      const lines = [headers.join(',')];
+      getRows().forEach(tr => {
+        if (tr.style.display === 'none') return;
+        const cols = Array.from(tr.children).map(td => '"' + norm(td.innerText).replace(/"/g,'""') + '"');
+        lines.push(cols.join(','));
+      });
+      const csv = '\ufeff' + lines.join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.style.display='none'; a.href=url; a.download='predictions.csv';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(()=>URL.revokeObjectURL(url),0);
+    };
+
+    window.copyBestBets = function(){
+      const lines = [];
+      getRows().forEach(tr => {
+        if (tr.style.display === 'none') return;
+        const recAttr = norm(tr.getAttribute('data-rec'));
+        if (recAttr === 'No Bet') return;
+        const matchup = norm(tr.getAttribute('data-matchup')) || norm(tr.children[0] && tr.children[0].innerText);
+        const line = norm(tr.children[1] && tr.children[1].innerText);
+        const pred = norm((tr.children[2] && tr.children[2].innerText) || '').replace('\n',' ');
+        const edge = norm(tr.children[3] && tr.children[3].innerText);
+        lines.push(`${matchup}: ${recAttr} ${line} (Pred ${pred}, ${edge})`);
+      });
+      const text = lines.join('\n');
+      function fallbackCopy(){
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position='fixed'; ta.style.top='-1000px';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        try { document.execCommand('copy'); alert('Best bets copied to clipboard'); } catch(e) {}
+        document.body.removeChild(ta);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(()=>{ alert('Best bets copied to clipboard'); }).catch(fallbackCopy);
+      } else {
+        fallbackCopy();
+      }
+    };
+
+    // Sorting
+    Array.from(table.querySelectorAll('thead th')).forEach((th, idx) => {
+      th.style.cursor = 'pointer';
+      th.onclick = function(){
+        const dir = th.getAttribute('data-sort') === 'asc' ? -1 : 1;
+        const rows = getRows();
+        rows.sort((a,b) => {
+          const av = norm(a.children[idx] && a.children[idx].innerText);
+          const bv = norm(b.children[idx] && b.children[idx].innerText);
+          const an = parseFloat(av.replace(/[^0-9.-]/g,'')); const bn = parseFloat(bv.replace(/[^0-9.-]/g,''));
+          if (!isNaN(an) && !isNaN(bn)) return dir*(an-bn);
+          return dir*av.localeCompare(bv);
+        });
+        tbody.innerHTML = '';
+        rows.forEach(tr => tbody.appendChild(tr));
+        th.setAttribute('data-sort', dir===1 ? 'asc' : 'desc');
+      };
+    });
+
+    // Init
+    window.applyFilters();
+    status.textContent = 'Ready — filters and Copy Best Bets are active';
+  })();
+  </script>
+</body>
+</html>

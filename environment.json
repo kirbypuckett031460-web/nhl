@@ -1,0 +1,5 @@
+{
+  "VGK@FLA": {"outdoor": false, "start_hour_local": 19, "temp_f": 72, "wind_mph": 0},
+  "TOR@BOS": {"outdoor": false, "start_hour_local": 19, "temp_f": 70, "wind_mph": 2},
+  "UTA@COL": {"outdoor": false, "start_hour_local": 20, "temp_f": 68, "wind_mph": 1}
+}
