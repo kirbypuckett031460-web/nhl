@@ -92,6 +92,28 @@ except Exception:
 
 warnings.filterwarnings('ignore')
 
+def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
+    """Ensure the parent directory exists before writing to a local file path.
+
+    Returns the normalized path when it can be safely written, otherwise None.
+    """
+    if path is None:
+        return None
+    try:
+        path_str = str(path).strip()
+        if not path_str:
+            return None
+        # Treat scheme-prefixed strings as remote URLs (skip writing)
+        if re.match(r'^[a-z][a-z0-9+.-]*://', path_str.lower()):
+            return None
+        parent = os.path.dirname(os.path.abspath(path_str))
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+        return path_str
+    except Exception as e:
+        print(f"⚠️  Could not prepare output path {path}: {e}")
+        return None
+
 @dataclass
 class OverUnderPrediction:
     """Structured over/under prediction with confidence metrics"""
@@ -4668,8 +4690,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         # If penalties60 missing, add a neutral default
                         if 'penalties60' not in rr.columns:
                             rr['penalties60'] = 8.0
-                        rr.to_csv(cli_args.referee_rates_path, index=False)
-                        print(f"✅ Wrote referees to {cli_args.referee_rates_path}")
+                        target_path = ensure_local_write_path(cli_args.referee_rates_path)
+                        if target_path:
+                            rr.to_csv(target_path, index=False)
+                            print(f"✅ Wrote referees to {target_path}")
+                        else:
+                            print(f"⚠️  Referee data fetched but could not write to {cli_args.referee_rates_path}")
             except Exception as e:
                 print(f"⚠️  Auto-populate failed: {e}")
 
@@ -4696,8 +4722,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 if rr is not None and not rr.empty:
                     if 'penalties60' not in rr.columns:
                         rr['penalties60'] = 8.0
-                    rr.to_csv(cli_args.referee_rates_path, index=False)
-                    print(f"✅ Wrote referees to {cli_args.referee_rates_path}")
+                    target_path = ensure_local_write_path(cli_args.referee_rates_path)
+                    if target_path:
+                        rr.to_csv(target_path, index=False)
+                        print(f"✅ Wrote referees to {target_path}")
+                    else:
+                        print(f"⚠️  Referee data fetched but could not write to {cli_args.referee_rates_path}")
                 else:
                     print("⚠️  Referee data was not updated (empty result)")
         except Exception as e:
