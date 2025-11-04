@@ -95,21 +95,27 @@ warnings.filterwarnings('ignore')
 def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
     """Ensure the parent directory exists before writing to a local file path.
 
-    Returns the normalized path when it can be safely written, otherwise None.
+    Returns the absolute path when it can be safely written, otherwise None.
     """
     if path is None:
         return None
     try:
-        path_str = str(path).strip()
-        if not path_str:
+        raw = str(path).strip()
+        if not raw:
             return None
         # Treat scheme-prefixed strings as remote URLs (skip writing)
-        if re.match(r'^[a-z][a-z0-9+.-]*://', path_str.lower()):
+        if re.match(r'^[a-z][a-z0-9+.-]*://', raw.lower()):
             return None
-        parent = os.path.dirname(os.path.abspath(path_str))
+
+        expanded = os.path.expanduser(os.path.expandvars(raw))
+        if not expanded:
+            return None
+
+        norm_path = os.path.abspath(expanded)
+        parent = os.path.dirname(norm_path)
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
-        return path_str
+        return norm_path
     except Exception as e:
         print(f"⚠️  Could not prepare output path {path}: {e}")
         return None
