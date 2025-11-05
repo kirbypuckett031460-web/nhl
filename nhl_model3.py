@@ -3391,46 +3391,109 @@ class RealDataNHLModel:
             r = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
             r.raise_for_status()
 
-            # Normalize HTML to plain text for robust regex matching
             html_doc = r.text
-            # Unescape HTML entities, remove tags, and collapse whitespace
-            text = html_parser.unescape(html_doc)
-            text = re.sub(r"<[^>]+>", " ", text)
-            text = re.sub(r"\s+", " ", text).strip()
+
+            def clean_ref_name(raw: str) -> Optional[str]:
+                if not raw:
+                    return None
+                txt = html_parser.unescape(raw)
+                txt = re.sub(r"<[^>]+>", " ", txt)
+                txt = re.sub(r"\s*\(#?\d+\)\s*", " ", txt)
+                txt = re.sub(r"\s*#\d+\b", " ", txt)
+                txt = re.sub(r"\b(Referees?|Lines(persons|men)?|Officials?)\b.*$", " ", txt, flags=re.IGNORECASE)
+                txt = re.sub(r"[|/&]", " ", txt)
+                txt = re.sub(r"\s+", " ", txt).strip(" ,;:-")
+                if len(txt) < 3 or not re.search(r"[A-Za-z]", txt):
+                    return None
+                if not re.search(r"\s", txt):  # require at least first + last name
+                    return None
+                if re.search(r"\d", txt):
+                    return None
+                words = [w for w in txt.split() if w]
+                if len(words) > 4:
+                    return None
+                if any(w[0].islower() for w in words if w):
+                    return None
+                lowered = txt.lower()
+                if ' at ' in lowered or ' vs ' in lowered:
+                    return None
+                banned_words = {
+                    'game', 'games', 'birthplace', 'career', 'goals', 'goal', 'penl', 'pim',
+                    'records', 'win', 'loss', 'notes', 'lines', 'official', 'penalty', 'percent',
+                    'season', 'preview', 'matchup', 'team', 'teams', 'working', 'liney',
+                    'tonight', 'home', 'away', 'pm', 'pp', 'ppg', 'ppp', 'shootout'
+                }
+                if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in banned_words):
+                    return None
+                return txt
 
             names: Set[str] = set()
 
-            # Prefer explicit "Referees:" section, stopping at common next headings
-            pat = re.compile(
-                r"Referees?\s*:\s*(.+?)(?:\r?\n|Lines|Linespersons|Linesmen|Officials|$)",
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-
-            for m in pat.finditer(text):
-                chunk = m.group(1)
-                # Split on common separators
-                parts = re.split(r"\s+and\s+|,|/|&", chunk)
-
-                for p in parts:
-                    # Remove sweater numbers like (#23) and any trailing role markers
-                    nm = re.sub(r"\s*\(#?\d+\)\s*", "", p)
-                    nm = re.sub(r"\b(Referees?|Lines(persons|men)?)\b.*$", "", nm, flags=re.IGNORECASE)
-                    nm = nm.strip()
-                    # Filter obviously invalid tokens
-                    if len(nm) >= 3 and re.search(r"[A-Za-z]", nm):
+            # First, look for table sections that explicitly label REFEREES
+            table_pattern = re.compile(r"<table[^>]*>(.*?)</table>", flags=re.IGNORECASE | re.DOTALL)
+            strong_pattern = re.compile(r"<strong[^>]*>(.*?)</strong>", flags=re.IGNORECASE | re.DOTALL)
+            for m in table_pattern.finditer(html_doc):
+                table_html = m.group(1)
+                if not re.search(r">\s*Referees?\s*<", table_html, flags=re.IGNORECASE):
+                    continue
+                section_html = table_html
+                lower_html = table_html.lower()
+                for marker in ['linespersons', 'linesmen', 'linespeople', 'lines']:
+                    idx = lower_html.find(marker)
+                    if idx != -1:
+                        section_html = table_html[:idx]
+                        break
+                for raw_name in strong_pattern.findall(section_html):
+                    if not re.search(r"#\d+", raw_name):
+                        continue
+                    nm = clean_ref_name(raw_name)
+                    if nm:
                         names.add(nm)
 
-            # Fallback: sometimes the entire line is compact without newlines
             if not names:
-                m2 = re.search(r"Referees?\s*:\s*([^:]+?)(?:Lines|$)", text, flags=re.IGNORECASE)
-                if m2:
-                    chunk = m2.group(1)
-                    for p in re.split(r"\s+and\s+|,|/|&", chunk):
-                        nm = re.sub(r"\s*\(#?\d+\)\s*", "", p)
-                        nm = re.sub(r"\b(Referees?|Lines(persons|men)?)\b.*$", "", nm, flags=re.IGNORECASE)
-                        nm = nm.strip()
-                        if len(nm) >= 3 and re.search(r"[A-Za-z]", nm):
+                # Normalize HTML to plain text for regex fallback parsing
+                text = html_parser.unescape(html_doc)
+                text = re.sub(r"<[^>]+>", " ", text)
+                text = re.sub(r"\s+", " ", text).strip()
+
+                # Prefer explicit "Referees" section, allowing colon to be optional
+                pat = re.compile(
+                    r"Referees?\s*:?\s*(.+?)(?:Lines|Linespersons|Linesmen|Officials|Referee Assignments|$)",
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+
+                for m in pat.finditer(text):
+                    chunk = m.group(1)
+                    name_hits = False
+                    for nm_match in re.finditer(r"([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+)+)\s*#?\d{1,3}", chunk):
+                        nm = clean_ref_name(nm_match.group(1))
+                        if nm:
                             names.add(nm)
+                            name_hits = True
+                    if not name_hits:
+                        parts = re.split(r"\s+and\s+|,|/|&", chunk)
+                        for p in parts:
+                            nm = clean_ref_name(p)
+                            if nm:
+                                names.add(nm)
+
+                # Fallback: capture compact inline patterns like "REFEREES Name #00 Name #00"
+                if not names:
+                    inline_pat = re.compile(r"Referees?\s*:?\s*([^:]+?)(?:Lines|Officials|$)", flags=re.IGNORECASE)
+                    m2 = inline_pat.search(text)
+                    if m2:
+                        chunk = m2.group(1)
+                        name_hits = False
+                        for nm_match in re.finditer(r"([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+)+)\s*#?\d{1,3}", chunk):
+                            nm = clean_ref_name(nm_match.group(1))
+                            if nm:
+                                names.add(nm)
+                                name_hits = True
+                        if not name_hits:
+                            for p in re.split(r"\s+and\s+|,|/|&", chunk):
+                                nm = clean_ref_name(p)
+                                if nm:
+                                    names.add(nm)
 
             if not names:
                 return None
