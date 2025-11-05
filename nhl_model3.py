@@ -29,6 +29,7 @@ import argparse
 import os
 import time
 import json
+from urllib.parse import urlparse
 import html as html_parser
 from scipy.stats import norm, poisson, nbinom
 from sklearn.isotonic import IsotonicRegression
@@ -3507,8 +3508,8 @@ class RealDataNHLModel:
     def find_todays_scoutingtherefs_url(self) -> Optional[str]:
         """Best-effort to locate today's NHL officiating assignments post on scoutingtherefs.com.
 
-        Strategy: scan the current month's archive and homepage for links with a dated path that
-        contain NHL + (assign|referee|official) keywords, preferring today's date.
+        Strategy: scan the current month's archive and homepage for links that look like daily
+        officiating assignments and infer their publish dates from nearby metadata or the slug.
         """
         try:
             headers = {
@@ -3517,27 +3518,84 @@ class RealDataNHLModel:
             }
             today = datetime.now().date()
             candidates: List[Tuple[datetime, str]] = []
+            seen_links: Set[str] = set()
+
+            def parse_iso_date(raw: str) -> Optional[datetime]:
+                val = raw.strip()
+                if not val:
+                    return None
+                try:
+                    cleaned = val.replace('Z', '+00:00')
+                    return datetime.fromisoformat(cleaned)
+                except Exception:
+                    pass
+                try:
+                    return datetime.strptime(val[:10], '%Y-%m-%d')
+                except Exception:
+                    return None
+
+            def extract_date_from_url(link: str) -> Optional[datetime]:
+                try:
+                    m_full = re.search(r'scoutingtherefs\.com/(\d{4})/(\d{2})/(\d{2})/', link, flags=re.IGNORECASE)
+                    if m_full:
+                        y, mo, d = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+                        return datetime(y, mo, d)
+                    m_month = re.search(r'scoutingtherefs\.com/(\d{4})/(\d{2})/', link, flags=re.IGNORECASE)
+                    if not m_month:
+                        return None
+                    y, mo = int(m_month.group(1)), int(m_month.group(2))
+                    path = urlparse(link).path or ''
+                    slug = path.rstrip('/').split('/')[-1]
+                    nums = [int(n) for n in re.findall(r'\d+', slug)] if slug else []
+                    if len(nums) >= 3:
+                        maybe_month, maybe_day, maybe_year = nums[-3], nums[-2], nums[-1]
+                        year_val = maybe_year + 2000 if maybe_year < 100 else maybe_year
+                        if 1 <= maybe_month <= 12 and 1 <= maybe_day <= 31:
+                            try:
+                                return datetime(year_val, maybe_month, maybe_day)
+                            except Exception:
+                                pass
+                    for day_candidate in reversed(nums):
+                        if 1 <= day_candidate <= 31:
+                            try:
+                                return datetime(y, mo, day_candidate)
+                            except Exception:
+                                continue
+                    return datetime(y, mo, 1)
+                except Exception:
+                    return None
 
             def harvest(page_url: str) -> None:
                 try:
                     resp = requests.get(page_url, timeout=20, headers=headers, allow_redirects=True)
-                    if not resp.ok:
-                        return
+                    resp.raise_for_status()
                     html = resp.text
-                    for m in re.finditer(r'href=["\'](https?://scoutingtherefs\.com/(\d{4})/(\d{2})/(\d{2})/[^"\']+)["\']', html, flags=re.IGNORECASE):
-                        link = m.group(1)
-                        y, mo, d = int(m.group(2)), int(m.group(3)), int(m.group(4))
-                        try:
-                            dt = datetime(y, mo, d).date()
-                        except Exception:
-                            continue
-                        ll = link.lower()
-                        if 'nhl' in ll and (('assign' in ll) or ('referee' in ll) or ('official' in ll)):
-                            candidates.append((dt, link))
                 except Exception:
                     return
 
-            # Monthly archive then homepage as fallback
+                for m in re.finditer(r'href=["\'](https?://scoutingtherefs\.com/[^"\']+)["\']', html, flags=re.IGNORECASE):
+                    link = m.group(1)
+                    ll = link.lower()
+                    if 'nhl' not in ll or not any(k in ll for k in ('assign', 'referee', 'official')):
+                        continue
+                    if link in seen_links:
+                        continue
+                    seen_links.add(link)
+
+                    snippet = html[max(0, m.start() - 500):min(len(html), m.end() + 500)]
+                    dt_match = re.search(r'datetime\s*=\s*["\']([^"\']+)["\']', snippet, flags=re.IGNORECASE)
+                    dt_val: Optional[datetime]
+                    if dt_match:
+                        iso_dt = parse_iso_date(dt_match.group(1))
+                        dt_val = iso_dt if iso_dt else None
+                    else:
+                        dt_val = None
+                    if dt_val is None:
+                        dt_val = extract_date_from_url(link)
+                    if dt_val is None:
+                        continue
+                    candidates.append((dt_val.date(), link))
+
             month_url = f"https://scoutingtherefs.com/{today.year}/{today.month:02d}/"
             harvest(month_url)
             harvest("https://scoutingtherefs.com/")
@@ -3545,10 +3603,8 @@ class RealDataNHLModel:
             if not candidates:
                 return None
 
-            # Rank by closeness to today, then latest date
-            candidates.sort(key=lambda x: (abs((x[0] - today).days), -int(x[0].strftime('%s'))))
+            candidates.sort(key=lambda x: (abs((x[0] - today).days), -int(datetime.combine(x[0], datetime.min.time()).timestamp())))
             best_dt, best_link = candidates[0]
-            # Prefer same-day; allow +/-1 day if nothing exact
             if abs((best_dt - today).days) <= 1:
                 return best_link
             return None
