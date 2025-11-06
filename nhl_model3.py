@@ -99,7 +99,7 @@ def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
 
     Returns the absolute path when it can be safely written. If the path is
     not writable (common on Windows when pointing to protected locations
-    such as ``C:\``), a fallback under the user's home directory is used.
+    such as ``C:\\``), a fallback under the user's home directory is used.
     """
 
     if path is None:
