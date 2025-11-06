@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Set
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import webbrowser
 import argparse
 import os
@@ -210,6 +210,13 @@ class OverUnderPrediction:
     # Environment / lineup summaries for dashboard
     env_info: Optional[str] = None
     lineup_info: Optional[str] = None
+    # Referee enrichment (crew assignments & scoring tendencies)
+    ref_goals_gm: Optional[float] = None
+    referee_crew: List[str] = field(default_factory=list)
+    referee_avg_goals: Optional[float] = None
+    referee_home_bias: Optional[float] = None
+    referee_info: Optional[str] = None
+    referee_source: Optional[str] = None
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
 
@@ -650,6 +657,23 @@ class SocialMediaPoster:
                         val_bits.append(f"O {p.over_probability:.0%} / U {p.under_probability:.0%}")
                     except Exception:
                         pass
+                    ref_bits = getattr(p, 'referee_info', None)
+                    if not ref_bits:
+                        crew_list = getattr(p, 'referee_crew', []) or []
+                        ref_bits = ", ".join([str(n) for n in crew_list if str(n).strip()])
+                    ref_metrics: List[str] = []
+                    if isinstance(p.referee_avg_goals, (int, float)) and np.isfinite(p.referee_avg_goals):
+                        ref_metrics.append(f"{p.referee_avg_goals:.2f} G/G")
+                    if isinstance(p.referee_home_bias, (int, float)) and np.isfinite(p.referee_home_bias):
+                        ref_metrics.append(f"HB {p.referee_home_bias:+.2f}")
+                    if isinstance(p.ref_goals_gm, (int, float)) and np.isfinite(p.ref_goals_gm) and not ref_metrics:
+                        ref_metrics.append(f"Feature {p.ref_goals_gm:.2f} G/G")
+                    if ref_bits or ref_metrics:
+                        detail = ref_bits or ''
+                        if ref_metrics:
+                            metric_txt = ", ".join(ref_metrics)
+                            detail = f"{detail} ({metric_txt})" if detail else metric_txt
+                        val_bits.append(f"Refs {detail}")
                     embed["fields"].append({
                         "name": name,
                         "value": " | ".join(val_bits),
@@ -1019,6 +1043,19 @@ class SocialMediaPoster:
                 field_value = f"**Line:** {pred.betting_line} | **Pred:** {pred.predicted_total:.1f}\n"
                 field_value += f"**Rec:** {pred.recommendation} ({pred.edge:+.2f})\n"
                 field_value += f"**Conf:** {pred.confidence:.0%}"
+                ref_bits = getattr(pred, 'referee_info', None)
+                if not ref_bits:
+                    crew_list = getattr(pred, 'referee_crew', []) or []
+                    ref_bits = ", ".join([str(n) for n in crew_list if str(n).strip()])
+                if ref_bits:
+                    ref_metrics: List[str] = []
+                    if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
+                        ref_metrics.append(f"{pred.referee_avg_goals:.2f} G/G")
+                    if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias):
+                        ref_metrics.append(f"HB {pred.referee_home_bias:+.2f}")
+                    if ref_metrics:
+                        ref_bits = f"{ref_bits} ({', '.join(ref_metrics)})" if ref_bits else ", ".join(ref_metrics)
+                    field_value += f"\n**Refs:** {ref_bits}"
                 
                 embed["fields"].append({
                     "name": field_name,
@@ -3974,6 +4011,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             'consensus_total': p.consensus_total,
             'line_diff_vs_consensus': p.line_diff,
             'best_book': p.best_over_book if rec_side == 'OVER' else p.best_under_book,
+            'referee_info': p.referee_info,
+            'referee_avg_goals': p.referee_avg_goals,
+            'referee_home_bias': p.referee_home_bias,
             'closing_total': close_total,
             'clv_vs_closing': clv
         })
@@ -4022,6 +4062,12 @@ def save_predictions_excel(predictions: List[OverUnderPrediction], out_path: str
                 'line_diff_vs_consensus': p.line_diff,
                 'best_over_book': p.best_over_book,
                 'best_under_book': p.best_under_book,
+                'ref_goals_gm': p.ref_goals_gm,
+                'referee_crew': ", ".join(p.referee_crew) if getattr(p, 'referee_crew', None) else None,
+                'referee_avg_goals': p.referee_avg_goals,
+                'referee_home_bias': p.referee_home_bias,
+                'referee_info': p.referee_info,
+                'referee_source': p.referee_source,
                 'env_info': p.env_info,
                 'lineup_info': p.lineup_info
             })
@@ -4105,6 +4151,11 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         conf_txt = f"{conf_val:.0%}" if isinstance(conf_val, (int, float)) else ''
         env_txt = getattr(p, 'env_info', '') or ''
         lineup_txt = getattr(p, 'lineup_info', '') or ''
+        ref_txt = getattr(p, 'referee_info', None)
+        if not ref_txt:
+            crew_list = getattr(p, 'referee_crew', []) or []
+            ref_txt = ", ".join([str(n) for n in crew_list if str(n).strip()])
+        ref_txt = ref_txt or ''
         kelly_val = getattr(p, 'kelly_bet_size', None)
         kelly_txt = f"{kelly_val:.1f}%" if isinstance(kelly_val, (int, float)) else ''
         rows_html.append(
@@ -4116,6 +4167,7 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
             f"<td>{over_txt}</td>"
             f"<td>{under_txt}</td>"
             f"<td>{conf_txt}</td>"
+            f"<td>{ref_txt}</td>"
             f"<td>{env_txt}</td>"
             f"<td>{lineup_txt}</td>"
             f"<td class='{cls}'>{rec}</td>"
@@ -4135,7 +4187,7 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         "tr:nth-child(even) { background:#fafafa; }\n"
         "</style></head><body>\n<table>\n<thead><tr>\n"
         "<th>Matchup</th><th>Line</th><th>Predicted</th><th>Edge</th>\n"
-        "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
+        "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Referees</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
         "</tr></thead>\n<tbody>\n"
     )
     tail = "\n</tbody></table>\n</body></html>\n"
@@ -4300,6 +4352,12 @@ def save_predictions_image(
         else:
             pick_txt = str(recommendation)
 
+        referee_display = getattr(pred, 'referee_info', None)
+        if not referee_display:
+            crew_list = getattr(pred, 'referee_crew', []) or []
+            referee_display = ", ".join([str(n) for n in crew_list if str(n).strip()])
+        ref_goal_display = _fmt_float(getattr(pred, 'referee_avg_goals', None)) if getattr(pred, 'referee_avg_goals', None) is not None else ''
+
         rows.append({
             'Time': display_time,
             'Away': str(getattr(pred, 'away_team', '')),
@@ -4308,6 +4366,8 @@ def save_predictions_image(
             'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
             'Pick': pick_txt,
             'Conf%': _fmt_conf(getattr(pred, 'confidence', None)),
+            'Refs': referee_display or '',
+            'Ref G/G': ref_goal_display,
             '_sort_key': sort_key
         })
 
@@ -4393,6 +4453,24 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         conf_color = '#27ae60' if pred.confidence > 0.75 else '#f39c12' if pred.confidence > 0.6 else '#e74c3c'
         edge_color = '#27ae60' if pred.edge > 0.2 else '#e74c3c' if pred.edge < -0.2 else '#95a5a6'
         
+        referee_display = getattr(pred, 'referee_info', None)
+        if not referee_display:
+            crew_list = getattr(pred, 'referee_crew', []) or []
+            referee_display = ", ".join([str(n) for n in crew_list if str(n).strip()])
+        referee_display = referee_display or ''
+        referee_metric_bits: List[str] = []
+        if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
+            referee_metric_bits.append(f"{pred.referee_avg_goals:.2f} G/G")
+        if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias):
+            referee_metric_bits.append(f"HB {pred.referee_home_bias:+.2f}")
+        if isinstance(pred.ref_goals_gm, (int, float)) and np.isfinite(pred.ref_goals_gm) and not referee_metric_bits:
+            referee_metric_bits.append(f"Feature {pred.ref_goals_gm:.2f} G/G")
+        referee_cell = referee_display
+        if referee_metric_bits:
+            metrics_txt = ", ".join(referee_metric_bits)
+            metric_html = f"<div style=\"font-size: 0.8rem; color:#7f8c8d;\">{metrics_txt}</div>"
+            referee_cell = f"{referee_display}{metric_html}" if referee_display else metric_html
+
         row = f"""
         <tr data-gid="{pred.game_id}" data-rec="{pred.recommendation}" data-matchup="{pred.away_team} @ {pred.home_team}">
             <td><strong>{pred.away_team} @ {pred.home_team}</strong></td>
@@ -4421,6 +4499,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <span>{pred.confidence:.0%}</span>
                 </div>
             </td>
+            <td>{referee_cell}</td>
             <td>{pred.env_info or ''}</td>
             <td>{pred.lineup_info or ''}</td>
             <td>
@@ -4650,6 +4729,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <li><b>Edge</b>: Predicted total minus line (positive favors OVER).</li>
                     <li><b>Over% / Under%</b>: Probability estimates for each side (Fair shows no‑vig).</li>
                     <li><b>Confidence</b>: Composite score (edge, calibration, dispersion, movement).</li>
+                    <li><b>Refs</b>: Assigned crew with scoring and bias tendencies.</li>
                     <li><b>Env</b>: Outdoor flag, local start hour, temperature.</li>
                     <li><b>Lineup</b>: Aggregate lineup strength (Home/Away).</li>
                     <li><b>Recommendation</b>: OVER/UNDER/No Bet based on thresholds.</li>
@@ -4678,6 +4758,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                         <th>📈 Over %</th>
                         <th>📉 Under %</th>
                         <th>🔥 Confidence</th>
+                        <th>🧑‍⚖️ Refs</th>
                         <th>🌤️ Env</th>
                         <th>👥 Lineup</th>
                         <th>💡 Recommendation</th>
@@ -5124,13 +5205,31 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 penalty_rates = model.load_penalty_rates(pr_path)
             except Exception:
                 penalty_rates = None
+
+            rr_path = getattr(cli_args, 'referee_rates_path', None) if cli_args else os.getenv('REFEREE_RATES_PATH')
             referee_rates = None
+            referee_rates_source: Optional[str] = None
             try:
-                rr_path = getattr(cli_args, 'referee_rates_path', None) if cli_args else os.getenv('REFEREE_RATES_PATH')
                 referee_rates = model.load_referee_rates(rr_path)
+                if isinstance(referee_rates, pd.DataFrame) and not referee_rates.empty:
+                    referee_rates_source = str(rr_path) if rr_path else None
             except Exception:
                 referee_rates = None
+
+            referee_default_goal: Optional[float] = None
+            if isinstance(referee_rates, pd.DataFrame) and 'goals_gm' in referee_rates.columns:
+                try:
+                    referee_default_goal = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean())
+                    if not np.isfinite(referee_default_goal):
+                        referee_default_goal = None
+                except Exception:
+                    referee_default_goal = None
+
+            referee_goal_map: Dict[str, float] = {}
+            referee_bias_map: Dict[str, float] = {}
+
             # Attempt to auto-map referees to today's games from ScoutingTheRefs URL
+            referee_assignments_source: Optional[str] = None
             referee_map = {}
             try:
                 auto_url = getattr(cli_args, 'referees_url', None) if cli_args else os.getenv('REFEREES_URL')
@@ -5138,33 +5237,28 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     auto_url = model.find_todays_scoutingtherefs_url()
                 if auto_url:
                     referee_map = model.build_referee_crew_map(auto_url, todays_games)
+                    referee_assignments_source = str(auto_url)
             except Exception:
                 referee_map = {}
+                referee_assignments_source = None
 
             # Pre-compute referee Goals/Gm feature for today's matchups
             try:
                 if isinstance(todays_features, pd.DataFrame) and 'ref_goals_gm' not in todays_features.columns:
                     todays_features['ref_goals_gm'] = np.nan
                 if isinstance(referee_rates, pd.DataFrame):
-                    default_goal = None
-                    if 'goals_gm' in referee_rates.columns:
-                        try:
-                            default_goal = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean())
-                        except Exception:
-                            default_goal = None
-                        if default_goal is not None and not np.isfinite(default_goal):
-                            default_goal = None
-                    crew_goal_map: Dict[str, float] = {}
                     if isinstance(referee_map, dict) and referee_map:
                         for matchup_key, crew in referee_map.items():
-                            avg_goals, _ = model.crew_features(crew, referee_rates)
+                            avg_goals, avg_bias = model.crew_features(crew, referee_rates)
                             if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
-                                crew_goal_map[matchup_key] = float(avg_goals)
+                                referee_goal_map[matchup_key] = float(avg_goals)
+                            if isinstance(avg_bias, (int, float)) and np.isfinite(avg_bias):
+                                referee_bias_map[matchup_key] = float(avg_bias)
                     if isinstance(todays_features, pd.DataFrame):
                         goal_values = []
                         for _, row in todays_features[['away_team', 'home_team']].iterrows():
                             mk = f"{row['away_team']}@{row['home_team']}"
-                            val = crew_goal_map.get(mk, default_goal)
+                            val = referee_goal_map.get(mk, referee_default_goal)
                             goal_values.append(float(val) if isinstance(val, (int, float)) and np.isfinite(val) else np.nan)
                         todays_features['ref_goals_gm'] = goal_values
             except Exception:
@@ -5340,12 +5434,48 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     pred.away_team = game.get('away_team', 'AWAY')
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
-                    try:
-                        ref_goal_val = game.get('ref_goals_gm')
-                        if isinstance(ref_goal_val, (int, float)) and np.isfinite(ref_goal_val):
-                            setattr(pred, 'ref_goals_gm', float(ref_goal_val))
-                    except Exception:
-                        pass
+
+                    ref_goal_val = game.get('ref_goals_gm')
+                    if isinstance(ref_goal_val, (int, float)) and np.isfinite(ref_goal_val):
+                        pred.ref_goals_gm = float(ref_goal_val)
+                    else:
+                        pred.ref_goals_gm = None
+
+                    matchup_key = f"{pred.away_team}@{pred.home_team}"
+                    crew_names: List[str] = []
+                    if isinstance(referee_map, dict):
+                        raw_crew = referee_map.get(matchup_key)
+                        if isinstance(raw_crew, (list, tuple, set)):
+                            crew_names = [str(n).strip() for n in raw_crew if str(n).strip()]
+                        elif isinstance(raw_crew, str) and raw_crew.strip():
+                            crew_names = [n.strip() for n in re.split(r",|;|/|\band\b", raw_crew, flags=re.IGNORECASE) if n.strip()]
+                    pred.referee_crew = crew_names
+
+                    crew_goal_val = referee_goal_map.get(matchup_key, referee_default_goal)
+                    if isinstance(crew_goal_val, (int, float)) and np.isfinite(crew_goal_val):
+                        pred.referee_avg_goals = float(crew_goal_val)
+                        if pred.ref_goals_gm is None:
+                            pred.ref_goals_gm = float(crew_goal_val)
+
+                    bias_val = referee_bias_map.get(matchup_key)
+                    if isinstance(bias_val, (int, float)) and np.isfinite(bias_val):
+                        pred.referee_home_bias = float(bias_val)
+
+                    source_val = referee_assignments_source or referee_rates_source
+                    if source_val:
+                        pred.referee_source = source_val
+
+                    info_parts: List[str] = []
+                    if crew_names:
+                        info_parts.append(", ".join(crew_names))
+                    metric_parts: List[str] = []
+                    if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
+                        metric_parts.append(f"{pred.referee_avg_goals:.2f} G/G")
+                    if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias):
+                        metric_parts.append(f"HB {pred.referee_home_bias:+.2f}")
+                    if metric_parts:
+                        info_parts.append(f"({', '.join(metric_parts)})")
+                    pred.referee_info = " ".join(info_parts) if info_parts else None
                     # Capture scheduled start time (Eastern) for social media presentation
                     try:
                         game_date_raw = game.get('date')
