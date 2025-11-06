@@ -5083,11 +5083,21 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             except Exception as e:
                 print(f"⚠️  Auto-populate failed: {e}")
 
+        referee_rates_path = (
+            getattr(cli_args, 'referee_rates_path', None)
+            if cli_args else os.getenv('REFEREE_RATES_PATH', 'referees.csv')
+        )
+        referees_url_config = (
+            getattr(cli_args, 'referees_url', None)
+            if cli_args else os.getenv('REFEREES_URL')
+        )
+        referee_rates_fetched: Optional[pd.DataFrame] = None
+
         # Independently refresh referees.csv if a path is provided, even without --auto-populate
         try:
-            if cli_args and getattr(cli_args, 'referee_rates_path', None):
+            if referee_rates_path:
                 rr = None
-                src_url = getattr(cli_args, 'referees_url', None)
+                src_url = referees_url_config
                 if not src_url:
                     try:
                         rr_url = model.find_todays_scoutingtherefs_url()
@@ -5104,17 +5114,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     except Exception:
                         rr = None
                 if rr is not None and not rr.empty:
+                    referee_rates_fetched = rr
                     if 'goals_gm' not in rr.columns:
                         rr['goals_gm'] = 6.2
-                    target_path = ensure_local_write_path(cli_args.referee_rates_path)
+                    target_path = ensure_local_write_path(referee_rates_path)
                     if target_path:
                         try:
                             rr.to_csv(target_path, index=False)
                             print(f"✅ Wrote referees to {target_path}")
+                            referee_rates_path = target_path
                         except Exception as e:
                             print(f"⚠️  Referee data fetched but could not write to {target_path}: {e}")
                     else:
-                        print(f"⚠️  Referee data fetched but could not write to {cli_args.referee_rates_path}")
+                        print(f"⚠️  Referee data fetched but could not write to {referee_rates_path}")
                 else:
                     print("⚠️  Referee data was not updated (empty result)")
         except Exception as e:
@@ -5133,7 +5145,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             combined_data = pd.concat([historical_data, todays_games], ignore_index=True)
             combined_features = model.create_enhanced_features(combined_data)
             todays_features = combined_features.tail(len(todays_games)).copy()
-            
+
             # Load full odds including American prices if available
             if cli_args and cli_args.odds_path:
                 os.environ['ODDS_JSON_PATH'] = cli_args.odds_path
@@ -5206,15 +5218,21 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             except Exception:
                 penalty_rates = None
 
-            rr_path = getattr(cli_args, 'referee_rates_path', None) if cli_args else os.getenv('REFEREE_RATES_PATH')
+            rr_path = referee_rates_path
             referee_rates = None
             referee_rates_source: Optional[str] = None
-            try:
-                referee_rates = model.load_referee_rates(rr_path)
-                if isinstance(referee_rates, pd.DataFrame) and not referee_rates.empty:
-                    referee_rates_source = str(rr_path) if rr_path else None
-            except Exception:
-                referee_rates = None
+
+            if referee_rates_fetched is not None and isinstance(referee_rates_fetched, pd.DataFrame) and not referee_rates_fetched.empty:
+                referee_rates = referee_rates_fetched.copy()
+                referee_rates_source = referees_url_config or str(rr_path)
+
+            if referee_rates is None:
+                try:
+                    referee_rates = model.load_referee_rates(rr_path)
+                    if isinstance(referee_rates, pd.DataFrame) and not referee_rates.empty and referee_rates_source is None:
+                        referee_rates_source = str(rr_path) if rr_path else None
+                except Exception:
+                    referee_rates = None
 
             referee_default_goal: Optional[float] = None
             if isinstance(referee_rates, pd.DataFrame) and 'goals_gm' in referee_rates.columns:
@@ -5232,7 +5250,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             referee_assignments_source: Optional[str] = None
             referee_map = {}
             try:
-                auto_url = getattr(cli_args, 'referees_url', None) if cli_args else os.getenv('REFEREES_URL')
+                auto_url = referees_url_config
                 if not auto_url:
                     auto_url = model.find_todays_scoutingtherefs_url()
                 if auto_url:
