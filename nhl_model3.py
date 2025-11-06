@@ -3379,8 +3379,10 @@ class RealDataNHLModel:
     def scrape_referees_scoutingtherefs(self, url: Optional[str]) -> Optional[pd.DataFrame]:
         """Scrape an assignments page for referee names; returns DataFrame with 'ref'.
 
-        This implementation is resilient to HTML markup (anchors/strong tags) by
-        stripping tags and parsing the surrounding text near "Referees:".
+        Attempts to use the WordPress API (`/wp-json/wp/v2/posts/{id}`) for a cleaner
+        content payload before falling back to scraping the rendered HTML. The parser
+        is designed to be resilient to markup changes by focusing on the text surrounding
+        "Referees" headings and jersey numbers.
         """
         if not url:
             return None
@@ -3389,33 +3391,34 @@ class RealDataNHLModel:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9'
             }
-            r = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
-            r.raise_for_status()
-
-            html_doc = r.text
 
             def clean_ref_name(raw: str) -> Optional[str]:
                 if not raw:
                     return None
-                txt = html_parser.unescape(raw)
+                txt = html_parser.unescape(str(raw))
+                txt = txt.replace('\u2019', "'")
                 txt = re.sub(r"<[^>]+>", " ", txt)
+                txt = txt.replace('\xa0', ' ').replace('\u2013', ' ').replace('\u2014', ' ')
                 txt = re.sub(r"\s*\(#?\d+\)\s*", " ", txt)
                 txt = re.sub(r"\s*#\d+\b", " ", txt)
                 txt = re.sub(r"\b(Referees?|Lines(persons|men)?|Officials?)\b.*$", " ", txt, flags=re.IGNORECASE)
                 txt = re.sub(r"[|/&]", " ", txt)
                 txt = re.sub(r"\s+", " ", txt).strip(" ,;:-")
-                if len(txt) < 3 or not re.search(r"[A-Za-z]", txt):
+                if len(txt) < 3 or not any(ch.isalpha() for ch in txt):
                     return None
-                if not re.search(r"\s", txt):  # require at least first + last name
+                if any(ch.isdigit() for ch in txt):
                     return None
-                if re.search(r"\d", txt):
+                words = [w.strip(" .") for w in txt.split() if w.strip(" .")]
+                if len(words) < 2 or len(words) > 5:
                     return None
-                words = [w for w in txt.split() if w]
-                if len(words) > 4:
+                suffixes = {'jr', 'jr.', 'sr', 'sr.', 'ii', 'iii', 'iv'}
+                if words and words[-1].lower() in suffixes:
+                    words = words[:-1]
+                if not words:
                     return None
-                if any(w[0].islower() for w in words if w):
+                if any(word and word[0].islower() for word in words if word and word[0].isalpha()):
                     return None
-                lowered = txt.lower()
+                lowered = " ".join(words).lower()
                 if ' at ' in lowered or ' vs ' in lowered:
                     return None
                 banned_words = {
@@ -3426,75 +3429,98 @@ class RealDataNHLModel:
                 }
                 if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in banned_words):
                     return None
-                return txt
+                return " ".join(words)
+
+            def extract_post_id(target_url: str) -> Optional[str]:
+                try:
+                    parts = [p for p in (urlparse(target_url).path or '').split('/') if p]
+                    for part in reversed(parts):
+                        if part.isdigit() and len(part) >= 5 and int(part) > 1900:
+                            return part
+                except Exception:
+                    return None
+                return None
+
+            def fetch_wp_content(post_id: str) -> Optional[str]:
+                try:
+                    api_url = f"https://scoutingtherefs.com/wp-json/wp/v2/posts/{post_id}"
+                    resp = requests.get(api_url, params={'_fields': 'content.rendered'}, headers=headers, timeout=20)
+                    resp.raise_for_status()
+                    if not resp.headers.get('content-type', '').startswith('application/json'):
+                        return None
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        content = data.get('content')
+                        if isinstance(content, dict):
+                            return content.get('rendered')
+                        if isinstance(content, str):
+                            return content
+                except Exception:
+                    return None
+                return None
+
+            def fetch_html(target_url: str) -> Optional[str]:
+                try:
+                    resp = requests.get(target_url, timeout=20, headers=headers, allow_redirects=True)
+                    resp.raise_for_status()
+                    return resp.text
+                except Exception:
+                    return None
+
+            def iter_referee_chunks(html_blob: str):
+                if not html_blob:
+                    return
+                normalized = html_parser.unescape(html_blob)
+                normalized = normalized.replace('\u2019', "'")
+                table_pat = re.compile(r"<table[^>]*>.*?</table>", flags=re.IGNORECASE | re.DOTALL)
+                tables = [m.group(0) for m in table_pat.finditer(normalized) if re.search(r"Referees?", m.group(0), flags=re.IGNORECASE)]
+                search_targets = tables if tables else [normalized]
+                section_pat = re.compile(
+                    r"Referees?\s*:?\s*(.*?)(?=Lines|Linespersons|Linesmen|Officials|Referee Assignments|$)",
+                    flags=re.IGNORECASE
+                )
+                for target in search_targets:
+                    plain = html_parser.unescape(target)
+                    plain = re.sub(r"<[^>]+>", " ", plain)
+                    plain = plain.replace('\xa0', ' ').replace('\u2013', ' ').replace('\u2014', ' ')
+                    plain = re.sub(r"\s+", " ", plain)
+                    for match in section_pat.finditer(plain):
+                        chunk = match.group(1)
+                        if chunk:
+                            yield chunk[:600]
+
+            def collect_names(html_blob: str) -> Set[str]:
+                found: Set[str] = set()
+                for chunk in iter_referee_chunks(html_blob):
+                    chunk = chunk.replace('\u2019', "'").replace('\xa0', ' ')
+                    chunk = chunk.replace('\u2013', ' ').replace('\u2014', ' ')
+                    chunk = re.sub(r"\s+", " ", chunk)
+                    exact = False
+                    for nm_match in re.finditer(r"([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\-]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\-]+)+)\s*#\s*\d{1,3}", chunk):
+                        nm = clean_ref_name(nm_match.group(1))
+                        if nm:
+                            found.add(nm)
+                            exact = True
+                    if exact:
+                        continue
+                    for part in re.split(r"\s+(?:and|&|/)\s+|,|;", chunk):
+                        nm = clean_ref_name(part)
+                        if nm:
+                            found.add(nm)
+                return found
 
             names: Set[str] = set()
 
-            # First, look for table sections that explicitly label REFEREES
-            table_pattern = re.compile(r"<table[^>]*>(.*?)</table>", flags=re.IGNORECASE | re.DOTALL)
-            strong_pattern = re.compile(r"<strong[^>]*>(.*?)</strong>", flags=re.IGNORECASE | re.DOTALL)
-            for m in table_pattern.finditer(html_doc):
-                table_html = m.group(1)
-                if not re.search(r">\s*Referees?\s*<", table_html, flags=re.IGNORECASE):
-                    continue
-                section_html = table_html
-                lower_html = table_html.lower()
-                for marker in ['linespersons', 'linesmen', 'linespeople', 'lines']:
-                    idx = lower_html.find(marker)
-                    if idx != -1:
-                        section_html = table_html[:idx]
-                        break
-                for raw_name in strong_pattern.findall(section_html):
-                    if not re.search(r"#\d+", raw_name):
-                        continue
-                    nm = clean_ref_name(raw_name)
-                    if nm:
-                        names.add(nm)
+            post_id = extract_post_id(url)
+            if post_id:
+                wp_html = fetch_wp_content(post_id)
+                if wp_html:
+                    names.update(collect_names(wp_html))
 
             if not names:
-                # Normalize HTML to plain text for regex fallback parsing
-                text = html_parser.unescape(html_doc)
-                text = re.sub(r"<[^>]+>", " ", text)
-                text = re.sub(r"\s+", " ", text).strip()
-
-                # Prefer explicit "Referees" section, allowing colon to be optional
-                pat = re.compile(
-                    r"Referees?\s*:?\s*(.+?)(?:Lines|Linespersons|Linesmen|Officials|Referee Assignments|$)",
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-
-                for m in pat.finditer(text):
-                    chunk = m.group(1)
-                    name_hits = False
-                    for nm_match in re.finditer(r"([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+)+)\s*#?\d{1,3}", chunk):
-                        nm = clean_ref_name(nm_match.group(1))
-                        if nm:
-                            names.add(nm)
-                            name_hits = True
-                    if not name_hits:
-                        parts = re.split(r"\s+and\s+|,|/|&", chunk)
-                        for p in parts:
-                            nm = clean_ref_name(p)
-                            if nm:
-                                names.add(nm)
-
-                # Fallback: capture compact inline patterns like "REFEREES Name #00 Name #00"
-                if not names:
-                    inline_pat = re.compile(r"Referees?\s*:?\s*([^:]+?)(?:Lines|Officials|$)", flags=re.IGNORECASE)
-                    m2 = inline_pat.search(text)
-                    if m2:
-                        chunk = m2.group(1)
-                        name_hits = False
-                        for nm_match in re.finditer(r"([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+)+)\s*#?\d{1,3}", chunk):
-                            nm = clean_ref_name(nm_match.group(1))
-                            if nm:
-                                names.add(nm)
-                                name_hits = True
-                        if not name_hits:
-                            for p in re.split(r"\s+and\s+|,|/|&", chunk):
-                                nm = clean_ref_name(p)
-                                if nm:
-                                    names.add(nm)
+                page_html = fetch_html(url)
+                if page_html:
+                    names.update(collect_names(page_html))
 
             if not names:
                 return None
@@ -3533,6 +3559,69 @@ class RealDataNHLModel:
                     return datetime.strptime(val[:10], '%Y-%m-%d')
                 except Exception:
                     return None
+
+            def register_candidate(dt_val: Optional[datetime], link: Optional[str]) -> None:
+                if dt_val is None or link is None:
+                    return
+                if link in seen_links:
+                    return
+                seen_links.add(link)
+                candidates.append((dt_val.date(), link))
+
+            def is_assignment_link(link: Optional[str], title: Optional[str] = None) -> bool:
+                ll = (link or '').lower()
+                tt = (title or '').lower()
+                if not ll and not tt:
+                    return False
+                keywords = ('referee', 'referees', 'official', 'assign', 'linesperson', 'linespersons', 'linesmen', 'linespeople')
+                if not any(k in ll for k in keywords) and not any(k in tt for k in keywords):
+                    return False
+                if 'nhl' not in ll and 'nhl' not in tt:
+                    return False
+                return True
+
+            def harvest_wp_posts() -> None:
+                api_url = "https://scoutingtherefs.com/wp-json/wp/v2/posts"
+                queries = [
+                    {'search': "Today's NHL Referees"},
+                    {'search': "NHL Referees and Linespersons"},
+                    {'search': 'NHL Referees'}
+                ]
+                base_params = {
+                    'per_page': 20,
+                    '_fields': 'date,date_gmt,link,title.rendered',
+                    'orderby': 'date',
+                    'order': 'desc'
+                }
+                for query in queries + [{}]:
+                    try:
+                        params = {**base_params, **query}
+                        resp = requests.get(api_url, params=params, headers=headers, timeout=15)
+                        resp.raise_for_status()
+                        posts = resp.json()
+                        if isinstance(posts, dict):
+                            posts = [posts]
+                        if not isinstance(posts, list):
+                            continue
+                        for post in posts:
+                            if not isinstance(post, dict):
+                                continue
+                            link = post.get('link')
+                            title_obj = post.get('title')
+                            title = title_obj.get('rendered') if isinstance(title_obj, dict) else title_obj if isinstance(title_obj, str) else ''
+                            if not is_assignment_link(link, title):
+                                continue
+                            dt_val = None
+                            for key in ('date', 'date_gmt'):
+                                raw = post.get(key)
+                                if isinstance(raw, str):
+                                    dt_val = parse_iso_date(raw)
+                                    if dt_val:
+                                        break
+                            if dt_val:
+                                register_candidate(dt_val, link)
+                    except Exception:
+                        continue
 
             def extract_date_from_url(link: str) -> Optional[datetime]:
                 try:
@@ -3594,8 +3683,9 @@ class RealDataNHLModel:
                         dt_val = extract_date_from_url(link)
                     if dt_val is None:
                         continue
-                    candidates.append((dt_val.date(), link))
+                    register_candidate(dt_val, link)
 
+            harvest_wp_posts()
             month_url = f"https://scoutingtherefs.com/{today.year}/{today.month:02d}/"
             harvest(month_url)
             harvest("https://scoutingtherefs.com/")
@@ -5479,7 +5569,7 @@ if __name__ == "__main__":
     parser.add_argument('--team-rates-path', type=str, default=os.getenv('TEAM_RATES_PATH', None), help='CSV or URL with team xG/CF/HDCF/PP/PK rates')
     parser.add_argument('--goalie-gsax-path', type=str, default=os.getenv('GOALIE_GSAX_PATH', None), help='CSV or URL with goalie rolling GSAx and prob_start')
     parser.add_argument('--penalty-rates-path', type=str, default=os.getenv('PENALTY_RATES_PATH', None), help='CSV or URL with team penalties drawn/taken per 60')
-    parser.add_argument('--referee-rates-path', type=str, default=os.getenv('REFEREE_RATES_PATH', None), help='CSV or URL with referee penalties per 60 (optional)')
+    parser.add_argument('--referee-rates-path', type=str, default=os.getenv('REFEREE_RATES_PATH', 'referees.csv'), help='CSV or URL with referee penalties per 60 (optional)')
     parser.add_argument('--environment-path', type=str, default=os.getenv('ENVIRONMENT_JSON', None), help='Path to environment JSON (outdoor/start time/weather)')
     parser.add_argument('--env-refresh', action='store_true', help='Refresh/overwrite today entries in environment.json')
     parser.add_argument('--lineup-path', type=str, default=os.getenv('LINEUP_STRENGTH_CSV', None), help='Path to lineup strength CSV (team,lineup_strength)')
