@@ -31,6 +31,7 @@ import time
 import json
 from urllib.parse import urlparse
 import html as html_parser
+import errno
 from scipy.stats import norm, poisson, nbinom
 from sklearn.isotonic import IsotonicRegression
 try:
@@ -96,27 +97,73 @@ warnings.filterwarnings('ignore')
 def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
     """Ensure the parent directory exists before writing to a local file path.
 
-    Returns the absolute path when it can be safely written, otherwise None.
+    Returns the absolute path when it can be safely written. If the path is
+    not writable (common on Windows when pointing to protected locations
+    such as ``C:\``), a fallback under the user's home directory is used.
     """
+
     if path is None:
         return None
+
+    raw = str(path).strip()
+    if not raw:
+        return None
+
+    # Treat scheme-prefixed strings as remote URLs (skip writing)
+    if re.match(r'^[a-z][a-z0-9+.-]*://', raw.lower()):
+        return None
+
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if not expanded:
+        return None
+
+    norm_path = os.path.abspath(expanded)
+    basename = os.path.basename(norm_path).strip() or "output.csv"
+
+    def build_fallback_path() -> Optional[str]:
+        """Return a writable fallback path for the same filename."""
+
+        candidates = [
+            os.path.join(os.path.expanduser("~"), "nhl_model_data"),
+            os.path.abspath(os.getcwd()),
+        ]
+
+        for candidate in candidates:
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                return os.path.abspath(os.path.join(candidate, basename))
+            except Exception:
+                continue
+        return None
+
+    parent = os.path.dirname(norm_path) or os.getcwd()
+
     try:
-        raw = str(path).strip()
-        if not raw:
-            return None
-        # Treat scheme-prefixed strings as remote URLs (skip writing)
-        if re.match(r'^[a-z][a-z0-9+.-]*://', raw.lower()):
-            return None
-
-        expanded = os.path.expanduser(os.path.expandvars(raw))
-        if not expanded:
-            return None
-
-        norm_path = os.path.abspath(expanded)
-        parent = os.path.dirname(norm_path)
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
+
+        if parent and not os.access(parent, os.W_OK):
+            fallback_path = build_fallback_path()
+            if fallback_path:
+                print(f"⚠️  No write access to directory {parent}. Using fallback {fallback_path}")
+                return fallback_path
+            return None
+
         return norm_path
+    except PermissionError:
+        fallback_path = build_fallback_path()
+        if fallback_path:
+            print(f"⚠️  Permission denied for {norm_path}. Using fallback {fallback_path}")
+            return fallback_path
+        return None
+    except OSError as e:
+        if getattr(e, 'errno', None) in (errno.EACCES, errno.EROFS):
+            fallback_path = build_fallback_path()
+            if fallback_path:
+                print(f"⚠️  Permission denied for {norm_path}. Using fallback {fallback_path}")
+                return fallback_path
+        print(f"⚠️  Could not prepare output path {path}: {e}")
+        return None
     except Exception as e:
         print(f"⚠️  Could not prepare output path {path}: {e}")
         return None
@@ -4884,8 +4931,15 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         except Exception:
                             tr = None
                     if tr is not None:
-                        tr.to_csv(cli_args.team_rates_path, index=False)
-                        print(f"✅ Wrote team rates to {cli_args.team_rates_path}")
+                        target_path = ensure_local_write_path(cli_args.team_rates_path)
+                        if target_path:
+                            try:
+                                tr.to_csv(target_path, index=False)
+                                print(f"✅ Wrote team rates to {target_path}")
+                            except Exception as e:
+                                print(f"⚠️  Team rates fetched but could not write to {target_path}: {e}")
+                        else:
+                            print(f"⚠️  Team rates fetched but could not determine local path for {cli_args.team_rates_path}")
                 if cli_args.goalie_gsax_url and cli_args.goalie_gsax_path:
                     gg = None
                     try:
@@ -4897,13 +4951,27 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         except Exception:
                             gg = None
                     if gg is not None:
-                        gg.to_csv(cli_args.goalie_gsax_path, index=False)
-                        print(f"✅ Wrote goalie GSAx to {cli_args.goalie_gsax_path}")
+                        target_path = ensure_local_write_path(cli_args.goalie_gsax_path)
+                        if target_path:
+                            try:
+                                gg.to_csv(target_path, index=False)
+                                print(f"✅ Wrote goalie GSAx to {target_path}")
+                            except Exception as e:
+                                print(f"⚠️  Goalie GSAx fetched but could not write to {target_path}: {e}")
+                        else:
+                            print(f"⚠️  Goalie GSAx fetched but could not determine local path for {cli_args.goalie_gsax_path}")
                 if cli_args.penalties_url and cli_args.penalty_rates_path:
                     pr = model.load_penalty_rates(cli_args.penalties_url)
                     if pr is not None:
-                        pr.to_csv(cli_args.penalty_rates_path, index=False)
-                        print(f"✅ Wrote penalties to {cli_args.penalty_rates_path}")
+                        target_path = ensure_local_write_path(cli_args.penalty_rates_path)
+                        if target_path:
+                            try:
+                                pr.to_csv(target_path, index=False)
+                                print(f"✅ Wrote penalties to {target_path}")
+                            except Exception as e:
+                                print(f"⚠️  Penalty rates fetched but could not write to {target_path}: {e}")
+                        else:
+                            print(f"⚠️  Penalty rates fetched but could not determine local path for {cli_args.penalty_rates_path}")
                 if (cli_args.referees_url or True) and cli_args.referee_rates_path:
                     rr = None
                     try:
@@ -4924,8 +4992,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             rr['goals_gm'] = 6.2
                         target_path = ensure_local_write_path(cli_args.referee_rates_path)
                         if target_path:
-                            rr.to_csv(target_path, index=False)
-                            print(f"✅ Wrote referees to {target_path}")
+                            try:
+                                rr.to_csv(target_path, index=False)
+                                print(f"✅ Wrote referees to {target_path}")
+                            except Exception as e:
+                                print(f"⚠️  Referee data fetched but could not write to {target_path}: {e}")
                         else:
                             print(f"⚠️  Referee data fetched but could not write to {cli_args.referee_rates_path}")
             except Exception as e:
@@ -4956,8 +5027,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         rr['goals_gm'] = 6.2
                     target_path = ensure_local_write_path(cli_args.referee_rates_path)
                     if target_path:
-                        rr.to_csv(target_path, index=False)
-                        print(f"✅ Wrote referees to {target_path}")
+                        try:
+                            rr.to_csv(target_path, index=False)
+                            print(f"✅ Wrote referees to {target_path}")
+                        except Exception as e:
+                            print(f"⚠️  Referee data fetched but could not write to {target_path}: {e}")
                     else:
                         print(f"⚠️  Referee data fetched but could not write to {cli_args.referee_rates_path}")
                 else:
