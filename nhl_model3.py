@@ -2281,7 +2281,7 @@ class RealDataNHLModel:
         ]
         # Add rink bias proxy and penalties
         extra_optional = [
-            'penalties_drawn60', 'penalties_taken60', 'ref_penalties60', 'rink_bias'
+            'penalties_drawn60', 'penalties_taken60', 'ref_goals_gm', 'rink_bias'
         ]
         for col in extra_optional:
             if col in df.columns:
@@ -3269,10 +3269,10 @@ class RealDataNHLModel:
         return crew_map
 
     def crew_features(self, crew_names: List[str], referee_rates: Optional[pd.DataFrame]) -> Tuple[Optional[float], Optional[float]]:
-        """Compute crew penalties/60 average and a naive home-bias proxy if available.
+        """Compute crew goals/game average and a naive home-bias proxy if available.
 
-        Expects `referee_rates` to optionally have columns: ref, penalties60, home_bias (or similar).
-        Returns (avg_pens60, avg_home_bias).
+        Expects `referee_rates` to optionally have columns like: ref, Goals/Gm (or similar), home_bias.
+        Returns (avg_goals_gm, avg_home_bias).
         """
         if not crew_names or referee_rates is None or not isinstance(referee_rates, pd.DataFrame):
             return None, None
@@ -3282,12 +3282,21 @@ class RealDataNHLModel:
             ref_col = cols.get('ref') or cols.get('name') or cols.get('official')
             if not ref_col:
                 return None, None
-            pens_col = cols.get('penalties60') or cols.get('pens60') or cols.get('pen_rate')
+            goal_col = None
+            for key in ['goals/gm', 'goals per game', 'goals_per_game', 'goals gm', 'goalspg', 'gpg']:
+                if key in cols:
+                    goal_col = cols[key]
+                    break
+            if goal_col is None:
+                for lc, orig in cols.items():
+                    if re.search(r'goals\s*/?\s*g(m|ame)', lc) or re.search(r'goals\s*per\s*game', lc) or re.search(r'\bgpg\b', lc):
+                        goal_col = orig
+                        break
             bias_col = cols.get('home_bias') or cols.get('homebias')
             sub = df[df[ref_col].astype(str).str.upper().isin([n.upper() for n in crew_names])]
-            avg_p = float(pd.to_numeric(sub[pens_col], errors='coerce').dropna().mean()) if pens_col and pens_col in sub else None
+            avg_goals = float(pd.to_numeric(sub[goal_col], errors='coerce').dropna().mean()) if goal_col and goal_col in sub else None
             avg_b = float(pd.to_numeric(sub[bias_col], errors='coerce').dropna().mean()) if bias_col and bias_col in sub else None
-            return avg_p, avg_b
+            return avg_goals, avg_b
         except Exception:
             return None, None
 
@@ -3295,7 +3304,7 @@ class RealDataNHLModel:
     def load_referee_rates(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
         """Load referee rates from a CSV path/URL or attempt to parse an HTML page.
 
-        Returns a DataFrame with at least column 'ref' and optionally 'penalties60', 'home_bias'.
+        Returns a DataFrame with at least column 'ref' and optionally 'goals_gm', 'home_bias'.
         """
         if not path_or_url:
             return None
@@ -3357,14 +3366,22 @@ class RealDataNHLModel:
 
             # Optional numeric columns
             pens_col: Optional[str] = None
+            goal_col: Optional[str] = None
             bias_col: Optional[str] = None
             for lc, orig in lower_to_orig.items():
+                if goal_col is None and (
+                    lc == 'goals/gm' or 'goals/gm' in lc or 'goals per game' in lc or 'goals_per_game' in lc
+                    or 'goals gm' in lc or re.search(r'goals\s*/?\s*g(m|ame)', lc) or re.search(r'\bgpg\b', lc)
+                ):
+                    goal_col = orig
                 if pens_col is None and (lc == 'penalties60' or 'pens60' in lc or 'penalties/60' in lc or re.search(r'pen[a-z]*\s*/?\s*60', lc)):
                     pens_col = orig
                 if bias_col is None and ('home_bias' in lc or 'home bias' in lc or lc == 'homebias'):
                     bias_col = orig
 
             out = pd.DataFrame({'ref': df[ref_col].astype(str).str.strip()})
+            if goal_col and goal_col in df:
+                out['goals_gm'] = pd.to_numeric(df[goal_col], errors='coerce')
             if pens_col and pens_col in df:
                 out['penalties60'] = pd.to_numeric(df[pens_col], errors='coerce')
             if bias_col and bias_col in df:
@@ -4902,9 +4919,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     except Exception:
                         rr = None
                     if rr is not None and not rr.empty:
-                        # If penalties60 missing, add a neutral default
-                        if 'penalties60' not in rr.columns:
-                            rr['penalties60'] = 8.0
+                        # Ensure Goals/Gm present with a neutral baseline if missing
+                        if 'goals_gm' not in rr.columns:
+                            rr['goals_gm'] = 6.2
                         target_path = ensure_local_write_path(cli_args.referee_rates_path)
                         if target_path:
                             rr.to_csv(target_path, index=False)
@@ -4935,8 +4952,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     except Exception:
                         rr = None
                 if rr is not None and not rr.empty:
-                    if 'penalties60' not in rr.columns:
-                        rr['penalties60'] = 8.0
+                    if 'goals_gm' not in rr.columns:
+                        rr['goals_gm'] = 6.2
                     target_path = ensure_local_write_path(cli_args.referee_rates_path)
                     if target_path:
                         rr.to_csv(target_path, index=False)
@@ -4960,7 +4977,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 pass
             combined_data = pd.concat([historical_data, todays_games], ignore_index=True)
             combined_features = model.create_enhanced_features(combined_data)
-            todays_features = combined_features.tail(len(todays_games))
+            todays_features = combined_features.tail(len(todays_games)).copy()
             
             # Load full odds including American prices if available
             if cli_args and cli_args.odds_path:
@@ -5049,6 +5066,35 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     referee_map = model.build_referee_crew_map(auto_url, todays_games)
             except Exception:
                 referee_map = {}
+
+            # Pre-compute referee Goals/Gm feature for today's matchups
+            try:
+                if isinstance(todays_features, pd.DataFrame) and 'ref_goals_gm' not in todays_features.columns:
+                    todays_features['ref_goals_gm'] = np.nan
+                if isinstance(referee_rates, pd.DataFrame):
+                    default_goal = None
+                    if 'goals_gm' in referee_rates.columns:
+                        try:
+                            default_goal = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean())
+                        except Exception:
+                            default_goal = None
+                        if default_goal is not None and not np.isfinite(default_goal):
+                            default_goal = None
+                    crew_goal_map: Dict[str, float] = {}
+                    if isinstance(referee_map, dict) and referee_map:
+                        for matchup_key, crew in referee_map.items():
+                            avg_goals, _ = model.crew_features(crew, referee_rates)
+                            if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
+                                crew_goal_map[matchup_key] = float(avg_goals)
+                    if isinstance(todays_features, pd.DataFrame):
+                        goal_values = []
+                        for _, row in todays_features[['away_team', 'home_team']].iterrows():
+                            mk = f"{row['away_team']}@{row['home_team']}"
+                            val = crew_goal_map.get(mk, default_goal)
+                            goal_values.append(float(val) if isinstance(val, (int, float)) and np.isfinite(val) else np.nan)
+                        todays_features['ref_goals_gm'] = goal_values
+            except Exception:
+                pass
 
             # Optional odds history logging
             if cli_args and getattr(cli_args, 'log_odds_history', False):
@@ -5220,6 +5266,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     pred.away_team = game.get('away_team', 'AWAY')
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
+                    try:
+                        ref_goal_val = game.get('ref_goals_gm')
+                        if isinstance(ref_goal_val, (int, float)) and np.isfinite(ref_goal_val):
+                            setattr(pred, 'ref_goals_gm', float(ref_goal_val))
+                    except Exception:
+                        pass
                     # Capture scheduled start time (Eastern) for social media presentation
                     try:
                         game_date_raw = game.get('date')
@@ -5327,22 +5379,25 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 total_adj += float(max(-0.4, min(0.4, 0.015 * (pens - 7.0))))
                         except Exception:
                             pass
-                    # Referee penalties/60: small global nudge based on average crew rate (if available)
+                    # Referee Goals/Gm: small global nudge based on average crew scoring profile (if available)
                     try:
                         # Prefer crew-specific average when auto-mapped; else fall back to global mean
                         if isinstance(referee_map, dict) and referee_map:
                             mk = f"{pred.away_team}@{pred.home_team}"
                             crew = referee_map.get(mk)
-                            avg_p, avg_b = model.crew_features(crew, referee_rates)
-                            if isinstance(avg_p, (int, float)) and np.isfinite(avg_p):
-                                total_adj += float(max(-0.25, min(0.25, 0.012 * (avg_p - 8.0))))
+                            avg_goals, avg_b = model.crew_features(crew, referee_rates)
+                            if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
+                                baseline_g = 6.2
+                                goal_coeff = 0.05
+                                total_adj += float(max(-0.25, min(0.25, goal_coeff * (avg_goals - baseline_g))))
                             # home-bias (if provided): tiny tilt towards totals via PP frequency proxy
                             if isinstance(avg_b, (int, float)) and np.isfinite(avg_b):
                                 total_adj += float(max(-0.05, min(0.05, 0.005 * avg_b)))
-                        elif referee_rates is not None and isinstance(referee_rates, pd.DataFrame) and 'penalties60' in referee_rates.columns:
-                            ref_avg = float(pd.to_numeric(referee_rates['penalties60'], errors='coerce').dropna().mean()) if len(referee_rates) else np.nan
+                        elif referee_rates is not None and isinstance(referee_rates, pd.DataFrame) and 'goals_gm' in referee_rates.columns:
+                            ref_avg = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean()) if len(referee_rates) else np.nan
                             if np.isfinite(ref_avg):
-                                total_adj += float(max(-0.2, min(0.2, 0.01 * (ref_avg - 8.0))))
+                                baseline_g = 6.2
+                                total_adj += float(max(-0.2, min(0.2, 0.04 * (ref_avg - baseline_g))))
                     except Exception:
                         pass
 
