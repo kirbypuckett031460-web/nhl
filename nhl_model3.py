@@ -4392,7 +4392,23 @@ def save_predictions_image(
     )
     ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
 
-    col_widths = [0.16, 0.22, 0.22, 0.08, 0.12, 0.11, 0.09]
+    # Compute column widths dynamically so the layout stays stable if columns change
+    default_col_widths = {
+        'Time': 0.12,
+        'Away': 0.18,
+        'Home': 0.18,
+        'Line': 0.08,
+        'Predicted': 0.12,
+        'Pick': 0.1,
+        'Conf%': 0.1,
+        'Refs': 0.18,
+        'Ref G/G': 0.08
+    }
+    fallback_width = max(0.08, 1.0 / max(1, len(df.columns)))
+    col_widths = [default_col_widths.get(str(col), fallback_width) for col in df.columns]
+    total_width = sum(col_widths)
+    if total_width > 0:
+        col_widths = [w / total_width for w in col_widths]
     table = plt.table(
         cellText=df.values,
         colLabels=df.columns,
