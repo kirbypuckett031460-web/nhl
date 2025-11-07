@@ -20,7 +20,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss
 import warnings
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
 import io
 import re
 from dataclasses import dataclass, field
@@ -32,6 +32,7 @@ import json
 from urllib.parse import urlparse
 import html as html_parser
 import errno
+import unicodedata
 from scipy.stats import norm, poisson, nbinom
 from sklearn.isotonic import IsotonicRegression
 try:
@@ -91,6 +92,12 @@ try:
     PARAMIKO_AVAILABLE = True
 except Exception:
     PARAMIKO_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+    BEAUTIFULSOUP_AVAILABLE = True
+except Exception:
+    BEAUTIFULSOUP_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
 
@@ -1264,6 +1271,7 @@ class RealDataNHLModel:
         self.kelly_cap_pct: float = float(os.getenv('KELLY_CAP_PCT', 2.0))  # percent
         self.daily_exposure_cap_pct: float = float(os.getenv('DAILY_EXPOSURE_CAP_PCT', 6.0))  # percent
         self.kelly_use_fair: bool = False
+        self._team_alias_map: Optional[Dict[str, str]] = None
         
     def fetch_historical_games(self, days_back: int = 30) -> pd.DataFrame:
         """Fetch historical games data with robust error handling"""
@@ -3297,6 +3305,209 @@ class RealDataNHLModel:
         return adjustments
 
     # ---------------- Referee auto-mapping helpers ----------------
+    @staticmethod
+    def _clean_ref_name(raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        try:
+            txt = html_parser.unescape(str(raw))
+            txt = txt.replace('\u2019', "'")
+            txt = re.sub(r"<[^>]+>", " ", txt)
+            txt = txt.replace('\xa0', ' ').replace('\u2013', ' ').replace('\u2014', ' ')
+            txt = re.sub(r"\s*\(#?\d+\)\s*", " ", txt)
+            txt = re.sub(r"\s*#\d+\b", " ", txt)
+            txt = re.sub(r"[|/&]", " ", txt)
+            txt = re.sub(r"\s+", " ", txt).strip(" ,;:-")
+            if len(txt) < 3 or not any(ch.isalpha() for ch in txt):
+                return None
+            if any(ch.isdigit() for ch in txt):
+                return None
+            words = [w.strip(" .") for w in txt.split() if w.strip(" .")]
+            if len(words) < 2 or len(words) > 5:
+                return None
+            suffixes = {'jr', 'jr.', 'sr', 'sr.', 'ii', 'iii', 'iv'}
+            if words and words[-1].lower() in suffixes:
+                words = words[:-1]
+            if not words:
+                return None
+            if any(word and word[0].islower() for word in words if word and word[0].isalpha()):
+                return None
+            lowered = " ".join(words).lower()
+            if ' at ' in lowered or ' vs ' in lowered:
+                return None
+            banned_words = {
+                'game', 'games', 'birthplace', 'career', 'goals', 'goal', 'penl', 'pim',
+                'records', 'win', 'loss', 'notes', 'lines', 'official', 'penalty', 'percent',
+                'season', 'preview', 'matchup', 'team', 'teams', 'working', 'liney',
+                'tonight', 'home', 'away', 'pm', 'pp', 'ppg', 'ppp', 'shootout'
+            }
+            if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in banned_words):
+                return None
+            return " ".join(words)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_team_key(name: Optional[str]) -> str:
+        if not name:
+            return ""
+        normalized = unicodedata.normalize('NFKD', str(name))
+        normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+        normalized = normalized.replace('&', 'AND')
+        return re.sub(r'[^A-Z0-9]', '', normalized.upper())
+
+    def _get_team_alias_map(self) -> Dict[str, str]:
+        if not isinstance(self._team_alias_map, dict) or not self._team_alias_map:
+            alias_map: Dict[str, str] = {}
+            try:
+                teams = NHLDataFetcher()._get_fallback_teams()
+            except Exception:
+                teams = {}
+            for info in teams.values():
+                name = str(info.get('name', ''))
+                abbr = str(info.get('abbreviation', '')).upper()
+                if not abbr:
+                    continue
+                variants = {
+                    name,
+                    abbr,
+                    name.replace('St.', 'St'),
+                    name.replace('St', 'Saint'),
+                    name.replace('Saint', 'St'),
+                    name.replace('.', ''),
+                    name.replace('-', ' '),
+                }
+                for variant in variants:
+                    key = self._normalize_team_key(variant)
+                    if key and key not in alias_map:
+                        alias_map[key] = abbr
+                alias_map.setdefault(self._normalize_team_key(abbr), abbr)
+            # Additional manual aliases for recent rebrands/alternates
+            manual_aliases = {
+                'UTAHHOCKEYCLUB': 'UTA',
+                'UTAHNHL': 'UTA',
+                'ARIZONACOYOTES': 'ARI',
+                'QUEBEKNORDIQUES': 'QUE',
+            }
+            for key, value in manual_aliases.items():
+                alias_map.setdefault(key, value)
+            self._team_alias_map = alias_map
+        return self._team_alias_map or {}
+
+    def _extract_matchup_from_text(self, text: str, alias_map: Dict[str, str]) -> Optional[Dict[str, Optional[str]]]:
+        if not text:
+            return None
+        normalized = html_parser.unescape(text)
+        normalized = normalized.replace('\u2013', ' - ').replace('\u2014', ' - ')
+        match = re.search(r'([A-Za-z0-9 .\'’&-]+?)\s+at\s+([A-Za-z0-9 .\'’&-]+)', normalized, flags=re.IGNORECASE)
+        if not match:
+            return None
+        away_raw = match.group(1).strip()
+        home_raw = match.group(2).strip()
+
+        def clean_team(val: str) -> str:
+            val = re.sub(r'\s+[-–—]\s+.*$', '', val)
+            val = re.sub(r'\s+\d{1,2}:\d{2}\s*(?:[AP]M)?\s*(?:ET|CT|MT|PT)?\b.*$', '', val, flags=re.IGNORECASE)
+            val = re.sub(r'\s+\d{4}\b.*$', '', val)
+            val = re.sub(r'\s*\(.*?\)\s*$', '', val)
+            val = re.sub(r'\s+\d+\s*$', '', val)
+            return " ".join(val.split())
+
+        away_name = clean_team(away_raw)
+        home_name = clean_team(home_raw)
+        away_abbr = alias_map.get(self._normalize_team_key(away_name))
+        home_abbr = alias_map.get(self._normalize_team_key(home_name))
+        matchup = None
+        if away_abbr and home_abbr:
+            matchup = f"{away_abbr}@{home_abbr}"
+        elif away_abbr or home_abbr:
+            matchup = f"{(away_abbr or away_name).upper()}@{(home_abbr or home_name).upper()}"
+
+        return {
+            'away_name': away_name,
+            'home_name': home_name,
+            'away_abbr': away_abbr,
+            'home_abbr': home_abbr,
+            'matchup': matchup
+        }
+
+    def _parse_scoutingtherefs_tables(self, html_blob: str) -> List[Dict[str, Any]]:
+        assignments: List[Dict[str, Any]] = []
+        if not html_blob:
+            return assignments
+        try:
+            alias_map = self._get_team_alias_map()
+            soup = BeautifulSoup(html_blob, 'html.parser') if BEAUTIFULSOUP_AVAILABLE else None
+            if soup:
+                entry = soup.find('div', class_='entry-content') or soup
+                current_matchup: Optional[Dict[str, Optional[str]]] = None
+                for node in entry.children:
+                    if not getattr(node, 'name', None):
+                        continue
+                    tag = node.name.lower()
+                    if tag in ('h1', 'h2', 'h3', 'p', 'div'):
+                        text = node.get_text(' ', strip=True)
+                        match_info = self._extract_matchup_from_text(text, alias_map)
+                        if match_info:
+                            current_matchup = match_info
+                            continue
+                    if tag == 'table':
+                        classes = [str(c) for c in (node.get('class') or [])]
+                        if not any(cls.lower() == 'totable' for cls in classes):
+                            continue
+                        refs: List[str] = []
+                        first_row = None
+                        for tr in node.find_all('tr'):
+                            header = tr.find('h3')
+                            if header and 'REFEREE' in header.get_text(strip=True).upper():
+                                first_row = tr.find_next_sibling('tr')
+                                break
+                        if first_row is None:
+                            rows = node.find_all('tr')
+                            first_row = rows[1] if len(rows) > 1 else None
+                        if first_row:
+                            for strong in first_row.find_all('strong'):
+                                nm = self._clean_ref_name(strong.get_text(' ', strip=True))
+                                if nm:
+                                    refs.append(nm)
+                        if refs:
+                            assignment: Dict[str, Any] = {'referees': refs}
+                            if current_matchup:
+                                assignment.update(current_matchup)
+                            assignments.append(assignment)
+            if assignments:
+                return assignments
+            # Fallback regex-based extraction if BeautifulSoup unavailable
+            header_table_pattern = re.compile(
+                r'(<h[12][^>]*>.*?</h[12]>)[\s\S]*?(<table[^>]*class="[^"]*TOTable[^"]*"[^>]*>[\s\S]*?</table>)',
+                flags=re.IGNORECASE
+            )
+            for head_html, table_html in header_table_pattern.findall(html_blob):
+                header_text = re.sub(r'<[^>]+>', ' ', head_html)
+                match_info = self._extract_matchup_from_text(header_text, alias_map)
+                refs_block_match = re.search(
+                    r'<h3[^>]*>\s*REFEREES\s*</h3>(.*?)(?:<h3[^>]*>\s*LINES|$)',
+                    table_html,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                refs_block = refs_block_match.group(1) if refs_block_match else table_html
+                refs: List[str] = []
+                for strong_match in re.finditer(r'<strong[^>]*>(.*?)</strong>', refs_block, flags=re.IGNORECASE | re.DOTALL):
+                    nm = self._clean_ref_name(strong_match.group(1))
+                    if nm:
+                        refs.append(nm)
+                    if len(refs) >= 2:
+                        # Referees are always two names; stop to avoid picking stats strong tags
+                        break
+                if refs:
+                    assignment: Dict[str, Any] = {'referees': refs}
+                    if match_info:
+                        assignment.update(match_info)
+                    assignments.append(assignment)
+            return assignments
+        except Exception:
+            return []
+
     def build_referee_crew_map(self, referees_url: Optional[str], todays_games: pd.DataFrame) -> Dict[str, List[str]]:
         """Best-effort mapping from matchup 'AWAY@HOME' to list of referee names.
 
@@ -3314,37 +3525,45 @@ class RealDataNHLModel:
             r = requests.get(referees_url, timeout=20, headers=headers, allow_redirects=True)
             r.raise_for_status()
             html = r.text
-            # Build team name -> abbr map
-            name_map = {v['name'].upper(): v['abbreviation'].upper() for v in NHLDataFetcher()._get_fallback_teams().values()}
-            # Collect all team names that appear
-            team_mentions: List[Tuple[int, str]] = []
-            for full in name_map.keys():
-                for m in re.finditer(re.escape(full), html, flags=re.IGNORECASE):
-                    team_mentions.append((m.start(), name_map[full]))
-            team_mentions.sort()
-            # Find 'Referees:' anchors and associate nearest two team mentions before it
-            for m in re.finditer(r"Referees?\s*:\s*([^\n<]+)", html, flags=re.IGNORECASE):
-                idx = m.start()
-                ref_str = m.group(1)
-                # take last two distinct team abbrs before this idx
-                abbrs: List[str] = []
-                for pos, ab in reversed(team_mentions):
-                    if pos < idx and ab not in abbrs:
-                        abbrs.append(ab)
-                    if len(abbrs) >= 2:
-                        break
-                # refs list
-                refs: List[str] = []
-                for p in re.split(r"\s+and\s+|,", ref_str):
-                    nm = re.sub(r"\s*\(#?\d+\)\s*", "", p).strip()
-                    nm = re.sub(r"\s+/.*$", "", nm).strip()
-                    if len(nm) >= 3:
-                        refs.append(nm)
-                if len(abbrs) >= 2 and refs:
-                    mk1 = f"{abbrs[0]}@{abbrs[1]}"
-                    mk2 = f"{abbrs[1]}@{abbrs[0]}"
+            assignments = self._parse_scoutingtherefs_tables(html)
+            for assignment in assignments:
+                refs = [self._clean_ref_name(nm) for nm in assignment.get('referees', []) if nm]
+                refs = [nm for nm in refs if nm]
+                away = assignment.get('away_abbr')
+                home = assignment.get('home_abbr')
+                if refs and away and home:
+                    mk1 = f"{away}@{home}"
+                    mk2 = f"{home}@{away}"
                     crew_map[mk1] = refs
                     crew_map[mk2] = refs
+            # Fallback to legacy regex approach if modern parser produced nothing
+            if not crew_map:
+                name_map = {v['name'].upper(): v['abbreviation'].upper() for v in NHLDataFetcher()._get_fallback_teams().values()}
+                team_mentions: List[Tuple[int, str]] = []
+                for full in name_map.keys():
+                    for m in re.finditer(re.escape(full), html, flags=re.IGNORECASE):
+                        team_mentions.append((m.start(), name_map[full]))
+                team_mentions.sort()
+                for m in re.finditer(r"Referees?\s*:\s*([^\n<]+)", html, flags=re.IGNORECASE):
+                    idx = m.start()
+                    ref_str = m.group(1)
+                    abbrs: List[str] = []
+                    for pos, ab in reversed(team_mentions):
+                        if pos < idx and ab not in abbrs:
+                            abbrs.append(ab)
+                        if len(abbrs) >= 2:
+                            break
+                    refs: List[str] = []
+                    for p in re.split(r"\s+and\s+|,", ref_str):
+                        nm = re.sub(r"\s*\(#?\d+\)\s*", "", p).strip()
+                        nm = re.sub(r"\s+/.*$", "", nm).strip()
+                        if len(nm) >= 3:
+                            refs.append(nm)
+                    if len(abbrs) >= 2 and refs:
+                        mk1 = f"{abbrs[0]}@{abbrs[1]}"
+                        mk2 = f"{abbrs[1]}@{abbrs[0]}"
+                        crew_map[mk1] = refs
+                        crew_map[mk2] = refs
         except Exception:
             return {}
         # Filter to only today's matchups to avoid ambiguity
@@ -3493,45 +3712,6 @@ class RealDataNHLModel:
                 'Accept-Language': 'en-US,en;q=0.9'
             }
 
-            def clean_ref_name(raw: str) -> Optional[str]:
-                if not raw:
-                    return None
-                txt = html_parser.unescape(str(raw))
-                txt = txt.replace('\u2019', "'")
-                txt = re.sub(r"<[^>]+>", " ", txt)
-                txt = txt.replace('\xa0', ' ').replace('\u2013', ' ').replace('\u2014', ' ')
-                txt = re.sub(r"\s*\(#?\d+\)\s*", " ", txt)
-                txt = re.sub(r"\s*#\d+\b", " ", txt)
-                txt = re.sub(r"\b(Referees?|Lines(persons|men)?|Officials?)\b.*$", " ", txt, flags=re.IGNORECASE)
-                txt = re.sub(r"[|/&]", " ", txt)
-                txt = re.sub(r"\s+", " ", txt).strip(" ,;:-")
-                if len(txt) < 3 or not any(ch.isalpha() for ch in txt):
-                    return None
-                if any(ch.isdigit() for ch in txt):
-                    return None
-                words = [w.strip(" .") for w in txt.split() if w.strip(" .")]
-                if len(words) < 2 or len(words) > 5:
-                    return None
-                suffixes = {'jr', 'jr.', 'sr', 'sr.', 'ii', 'iii', 'iv'}
-                if words and words[-1].lower() in suffixes:
-                    words = words[:-1]
-                if not words:
-                    return None
-                if any(word and word[0].islower() for word in words if word and word[0].isalpha()):
-                    return None
-                lowered = " ".join(words).lower()
-                if ' at ' in lowered or ' vs ' in lowered:
-                    return None
-                banned_words = {
-                    'game', 'games', 'birthplace', 'career', 'goals', 'goal', 'penl', 'pim',
-                    'records', 'win', 'loss', 'notes', 'lines', 'official', 'penalty', 'percent',
-                    'season', 'preview', 'matchup', 'team', 'teams', 'working', 'liney',
-                    'tonight', 'home', 'away', 'pm', 'pp', 'ppg', 'ppp', 'shootout'
-                }
-                if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in banned_words):
-                    return None
-                return " ".join(words)
-
             def extract_post_id(target_url: str) -> Optional[str]:
                 try:
                     parts = [p for p in (urlparse(target_url).path or '').split('/') if p]
@@ -3598,36 +3778,83 @@ class RealDataNHLModel:
                     chunk = re.sub(r"\s+", " ", chunk)
                     exact = False
                     for nm_match in re.finditer(r"([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\-]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\-]+)+)\s*#\s*\d{1,3}", chunk):
-                        nm = clean_ref_name(nm_match.group(1))
+                        nm = self._clean_ref_name(nm_match.group(1))
                         if nm:
                             found.add(nm)
                             exact = True
                     if exact:
                         continue
                     for part in re.split(r"\s+(?:and|&|/)\s+|,|;", chunk):
-                        nm = clean_ref_name(part)
+                        nm = self._clean_ref_name(part)
                         if nm:
                             found.add(nm)
                 return found
 
+            assignments: List[Dict[str, Any]] = []
             names: Set[str] = set()
+            wp_html: Optional[str] = None
+            page_html: Optional[str] = None
 
             post_id = extract_post_id(url)
             if post_id:
                 wp_html = fetch_wp_content(post_id)
                 if wp_html:
-                    names.update(collect_names(wp_html))
+                    assignments = self._parse_scoutingtherefs_tables(wp_html)
+                    for assignment in assignments:
+                        for nm in assignment.get('referees', []):
+                            nm_clean = self._clean_ref_name(nm)
+                            if nm_clean:
+                                names.add(nm_clean)
 
             if not names:
                 page_html = fetch_html(url)
                 if page_html:
-                    names.update(collect_names(page_html))
+                    if not assignments:
+                        assignments = self._parse_scoutingtherefs_tables(page_html)
+                    for assignment in assignments:
+                        for nm in assignment.get('referees', []):
+                            nm_clean = self._clean_ref_name(nm)
+                            if nm_clean:
+                                names.add(nm_clean)
+
+            if not names:
+                if wp_html:
+                    names.update({nm for nm in collect_names(wp_html) if nm})
+                if not names and page_html:
+                    names.update({nm for nm in collect_names(page_html) if nm})
 
             if not names:
                 return None
 
-            out = pd.DataFrame({'ref': sorted(names)})
-            return out
+            assignment_records: List[Dict[str, Optional[str]]] = []
+            if assignments:
+                for assignment in assignments:
+                    refs = [self._clean_ref_name(nm) for nm in assignment.get('referees', []) if nm]
+                    refs = [nm for nm in refs if nm]
+                    if not refs:
+                        continue
+                    away = assignment.get('away_abbr')
+                    home = assignment.get('home_abbr')
+                    away_name = assignment.get('away_name')
+                    home_name = assignment.get('home_name')
+                    matchup = assignment.get('matchup')
+                    for nm in refs:
+                        assignment_records.append({
+                            'ref': nm,
+                            'matchup': matchup,
+                            'away_team': away,
+                            'home_team': home,
+                            'away_name': away_name,
+                            'home_name': home_name
+                        })
+
+            if assignment_records:
+                df = pd.DataFrame(assignment_records).drop_duplicates(subset=['matchup', 'ref']).reset_index(drop=True)
+                df['ref'] = df['ref'].astype(str)
+                return df
+
+            sorted_names = sorted(nm for nm in names if nm)
+            return pd.DataFrame({'ref': sorted_names})
         except Exception as e:
             print(f"⚠️  Failed to scrape referees from {url}: {e}")
             return None
