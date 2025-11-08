@@ -5960,25 +5960,49 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 total_adj += float(max(-0.4, min(0.4, 0.015 * (pens - 7.0))))
                         except Exception:
                             pass
-                    # Referee Goals/Gm: small global nudge based on average crew scoring profile (if available)
+                    # Referee Goals/Gm: small global nudge based on crew scoring profile (if available)
                     try:
-                        # Prefer crew-specific average when auto-mapped; else fall back to global mean
-                        if isinstance(referee_map, dict) and referee_map:
+                        baseline_g = 6.2
+                        if isinstance(referee_default_goal, (int, float)) and np.isfinite(referee_default_goal):
+                            baseline_g = float(referee_default_goal)
+                        elif referee_rates is not None and isinstance(referee_rates, pd.DataFrame) and 'goals_gm' in referee_rates.columns:
+                            ref_mean = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean()) if len(referee_rates) else np.nan
+                            if np.isfinite(ref_mean):
+                                baseline_g = float(ref_mean)
+
+                        ref_goal_feature: Optional[float] = None
+                        ref_bias_feature: Optional[float] = None
+
+                        if isinstance(pred.ref_goals_gm, (int, float)) and np.isfinite(pred.ref_goals_gm):
+                            ref_goal_feature = float(pred.ref_goals_gm)
+                        elif isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
+                            ref_goal_feature = float(pred.referee_avg_goals)
+
+                        if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias):
+                            ref_bias_feature = float(pred.referee_home_bias)
+
+                        if (ref_goal_feature is None or ref_bias_feature is None) and isinstance(referee_map, dict) and referee_map:
                             mk = f"{pred.away_team}@{pred.home_team}"
                             crew = referee_map.get(mk)
                             avg_goals, avg_b = model.crew_features(crew, referee_rates)
-                            if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
-                                baseline_g = 6.2
-                                goal_coeff = 0.05
-                                total_adj += float(max(-0.25, min(0.25, goal_coeff * (avg_goals - baseline_g))))
-                            # home-bias (if provided): tiny tilt towards totals via PP frequency proxy
-                            if isinstance(avg_b, (int, float)) and np.isfinite(avg_b):
-                                total_adj += float(max(-0.05, min(0.05, 0.005 * avg_b)))
-                        elif referee_rates is not None and isinstance(referee_rates, pd.DataFrame) and 'goals_gm' in referee_rates.columns:
-                            ref_avg = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean()) if len(referee_rates) else np.nan
-                            if np.isfinite(ref_avg):
-                                baseline_g = 6.2
-                                total_adj += float(max(-0.2, min(0.2, 0.04 * (ref_avg - baseline_g))))
+                            if ref_goal_feature is None and isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
+                                ref_goal_feature = float(avg_goals)
+                                if pred.referee_avg_goals is None:
+                                    pred.referee_avg_goals = ref_goal_feature
+                                if pred.ref_goals_gm is None:
+                                    pred.ref_goals_gm = ref_goal_feature
+                            if ref_bias_feature is None and isinstance(avg_b, (int, float)) and np.isfinite(avg_b):
+                                ref_bias_feature = float(avg_b)
+                                if pred.referee_home_bias is None:
+                                    pred.referee_home_bias = ref_bias_feature
+
+                        if ref_goal_feature is not None:
+                            goal_coeff = 0.05
+                            adj_val = goal_coeff * (ref_goal_feature - baseline_g)
+                            total_adj += float(max(-0.25, min(0.25, adj_val)))
+
+                        if ref_bias_feature is not None:
+                            total_adj += float(max(-0.05, min(0.05, 0.005 * ref_bias_feature)))
                     except Exception:
                         pass
 
