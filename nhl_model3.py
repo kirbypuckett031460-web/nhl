@@ -3455,25 +3455,106 @@ class RealDataNHLModel:
                         classes = [str(c) for c in (node.get('class') or [])]
                         if not any(cls.lower() == 'totable' for cls in classes):
                             continue
-                        refs: List[str] = []
-                        first_row = None
+
+                        def extract_first_float(cell) -> Optional[float]:
+                            try:
+                                strong = cell.find('strong')
+                                candidates: List[str] = []
+                                if strong:
+                                    candidates.append(strong.get_text(' ', strip=True))
+                                candidates.append(cell.get_text(' ', strip=True))
+                                for candidate in candidates:
+                                    match = re.search(r'[-+]?\d+(?:\.\d+)?', candidate)
+                                    if match:
+                                        try:
+                                            return float(match.group(0))
+                                        except Exception:
+                                            continue
+                            except Exception:
+                                return None
+                            return None
+
+                        def normalize_label(label: str) -> Optional[str]:
+                            lbl = (label or '').strip().lower()
+                            if not lbl:
+                                return None
+                            if 'goals' in lbl and ('/g' in lbl or 'per game' in lbl or 'gm' in lbl or 'goalspg' in lbl or 'g/g' in lbl):
+                                return 'goals_gm'
+                            if re.search(r'\bgoals?\s*per\s*game\b', lbl):
+                                return 'goals_gm'
+                            return None
+
+                        ref_entries: List[Dict[str, Any]] = []
+                        expect_ref_names = False
                         for tr in node.find_all('tr'):
                             header = tr.find('h3')
-                            if header and 'REFEREE' in header.get_text(strip=True).upper():
-                                first_row = tr.find_next_sibling('tr')
-                                break
-                        if first_row is None:
-                            rows = node.find_all('tr')
-                            first_row = rows[1] if len(rows) > 1 else None
-                        if first_row:
-                            for strong in first_row.find_all('strong'):
-                                nm = self._clean_ref_name(strong.get_text(' ', strip=True))
-                                if nm:
-                                    refs.append(nm)
+                            if header:
+                                header_txt = header.get_text(' ', strip=True)
+                                if header_txt:
+                                    header_upper = header_txt.upper()
+                                    if 'REFEREE' in header_upper:
+                                        expect_ref_names = True
+                                        continue
+                                    if 'LINES' in header_upper:
+                                        break
+
+                            if expect_ref_names:
+                                ref_entries = []
+                                for cell in tr.find_all('td'):
+                                    strong = cell.find('strong')
+                                    if not strong:
+                                        continue
+                                    nm = self._clean_ref_name(strong.get_text(' ', strip=True))
+                                    if nm:
+                                        ref_entries.append({'name': nm, 'stats': {}})
+                                expect_ref_names = False
+                                continue
+
+                            if not ref_entries:
+                                continue
+
+                            cells = tr.find_all('td')
+                            if not cells:
+                                continue
+                            label_text = cells[0].get_text(' ', strip=True) if cells else ''
+                            stat_key = normalize_label(label_text)
+                            if not stat_key:
+                                continue
+                            value_cells = cells[1:]
+                            if not value_cells:
+                                continue
+                            for idx, entry in enumerate(ref_entries):
+                                if idx >= len(value_cells):
+                                    break
+                                val = extract_first_float(value_cells[idx])
+                                if val is not None:
+                                    entry_stats = entry.setdefault('stats', {})
+                                    entry_stats[stat_key] = val
+
+                        refs: List[str] = [entry['name'] for entry in ref_entries if entry.get('name')]
                         if refs:
                             assignment: Dict[str, Any] = {'referees': refs}
                             if current_matchup:
                                 assignment.update(current_matchup)
+                            stats_map: Dict[str, Dict[str, Any]] = {
+                                entry['name']: entry['stats']
+                                for entry in ref_entries
+                                if entry.get('stats')
+                            }
+                            if stats_map:
+                                assignment['referee_stats'] = stats_map
+                                goal_values = [
+                                    stats.get('goals_gm')
+                                    for stats in stats_map.values()
+                                    if isinstance(stats.get('goals_gm'), (int, float))
+                                ]
+                                goal_values = [float(v) for v in goal_values if v is not None]
+                                if goal_values:
+                                    try:
+                                        avg_val = float(np.mean(goal_values))
+                                        assignment['crew_goals_gm'] = round(avg_val, 3)
+                                    except Exception:
+                                        pass
                             assignments.append(assignment)
             if assignments:
                 return assignments
@@ -3826,7 +3907,7 @@ class RealDataNHLModel:
             if not names:
                 return None
 
-            assignment_records: List[Dict[str, Optional[str]]] = []
+            assignment_records: List[Dict[str, Optional[Any]]] = []
             if assignments:
                 for assignment in assignments:
                     refs = [self._clean_ref_name(nm) for nm in assignment.get('referees', []) if nm]
@@ -3838,14 +3919,52 @@ class RealDataNHLModel:
                     away_name = assignment.get('away_name')
                     home_name = assignment.get('home_name')
                     matchup = assignment.get('matchup')
+                    stats_map_raw = assignment.get('referee_stats') or {}
+                    stats_lookup: Dict[str, Dict[str, Any]] = {}
+                    for key, val in stats_map_raw.items():
+                        nm_clean = self._clean_ref_name(key)
+                        if nm_clean:
+                            if isinstance(val, dict):
+                                stats_lookup[nm_clean] = val
+                            else:
+                                stats_lookup[nm_clean] = {}
+
+                    crew_goal_val = assignment.get('crew_goals_gm')
+
+                    def coerce_float(val: Any) -> Optional[float]:
+                        try:
+                            if val is None:
+                                return None
+                            if isinstance(val, (int, float)):
+                                if np.isfinite(val):
+                                    return float(val)
+                                return None
+                            if isinstance(val, str):
+                                stripped = val.strip()
+                                if not stripped:
+                                    return None
+                                num = float(stripped)
+                                if np.isfinite(num):
+                                    return float(num)
+                                return None
+                        except Exception:
+                            return None
+                        return None
+
+                    crew_goal_float = coerce_float(crew_goal_val)
+
                     for nm in refs:
+                        stats_for_ref = stats_lookup.get(nm, {})
+                        goals_val = coerce_float(stats_for_ref.get('goals_gm'))
                         assignment_records.append({
                             'ref': nm,
                             'matchup': matchup,
                             'away_team': away,
                             'home_team': home,
                             'away_name': away_name,
-                            'home_name': home_name
+                            'home_name': home_name,
+                            'goals_gm': goals_val,
+                            'crew_goals_gm': crew_goal_float
                         })
 
             if assignment_records:
