@@ -4579,11 +4579,10 @@ def save_predictions_image(
         else:
             pick_txt = str(recommendation)
 
-        referee_display = getattr(pred, 'referee_info', None)
-        if not referee_display:
-            crew_list = getattr(pred, 'referee_crew', []) or []
-            referee_display = ", ".join([str(n) for n in crew_list if str(n).strip()])
-        ref_goal_display = _fmt_float(getattr(pred, 'referee_avg_goals', None)) if getattr(pred, 'referee_avg_goals', None) is not None else ''
+        ref_goal_value = getattr(pred, 'ref_goals_gm', None)
+        if ref_goal_value is None:
+            ref_goal_value = getattr(pred, 'referee_avg_goals', None)
+        ref_goal_display = _fmt_float(ref_goal_value) if ref_goal_value is not None else ''
 
         rows.append({
             'Time': display_time,
@@ -4593,7 +4592,6 @@ def save_predictions_image(
             'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
             'Pick': pick_txt,
             'Conf%': _fmt_conf(getattr(pred, 'confidence', None)),
-            'Refs': referee_display or '',
             'Ref G/G': ref_goal_display,
             '_sort_key': sort_key
         })
@@ -4628,7 +4626,6 @@ def save_predictions_image(
         'Predicted': 0.12,
         'Pick': 0.1,
         'Conf%': 0.1,
-        'Refs': 0.18,
         'Ref G/G': 0.08
     }
     fallback_width = max(0.08, 1.0 / max(1, len(df.columns)))
