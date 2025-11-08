@@ -1,19 +1,9 @@
-ref,penalties60
-Brandon Blandina,8.0
-Brandon Schrader,8.0
-Carter Sandlak,8.0
-Corey Syvret,8.0
-Eric Furlatt,8.0
-Francis Charron,8.0
-Furman South,8.0
-Gord Dwyer,8.0
-Jake Brenk,8.0
-Jon Mclsaac,8.0
-Kelly Sutherland,8.0
-Kendrick Nicholson,8.0
-Liam Maaskant,8.0
-Mitch Dunning,8.0
-Peter MacDougall,8.0
-TJ Luxmore,8.0
-Tom Chmielewski,8.0
-Wes McCauley,8.0
+ref,matchup,away_team,home_team,away_name,home_name,goals_gm,crew_goals_gm
+Trevor Hanson,MTL@TOR,MTL,TOR,Montreal Canadiens,Toronto Maple Leafs,5.8,5.6
+Furman South,MTL@TOR,MTL,TOR,Montreal Canadiens,Toronto Maple Leafs,5.4,5.6
+Gord Dwyer,BOS@WSH,BOS,WSH,Boston Bruins,Washington Capitals,5.9,6.0
+Mitch Dunning,BOS@WSH,BOS,WSH,Boston Bruins,Washington Capitals,6.1,6.0
+Brian Pochmara,CGY@EDM,CGY,EDM,Calgary Flames,Edmonton Oilers,5.8,5.95
+Francis Charron,CGY@EDM,CGY,EDM,Calgary Flames,Edmonton Oilers,6.1,5.95
+Jean Hebert,LAK@VGK,LAK,VGK,Los Angeles Kings,Vegas Golden Knights,6.0,5.85
+Garrett Rank,LAK@VGK,LAK,VGK,Los Angeles Kings,Vegas Golden Knights,5.7,5.85
