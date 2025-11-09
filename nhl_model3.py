@@ -224,6 +224,7 @@ class OverUnderPrediction:
     referee_home_bias: Optional[float] = None
     referee_info: Optional[str] = None
     referee_source: Optional[str] = None
+    ref_goal_adjustment: Optional[float] = None
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
 
@@ -1272,6 +1273,11 @@ class RealDataNHLModel:
         self.daily_exposure_cap_pct: float = float(os.getenv('DAILY_EXPOSURE_CAP_PCT', 6.0))  # percent
         self.kelly_use_fair: bool = False
         self._team_alias_map: Optional[Dict[str, str]] = None
+        self.ref_goal_baseline: Optional[float] = None
+        try:
+            self.ref_goal_weight: float = float(os.getenv('REF_GOAL_WEIGHT', 0.05))
+        except Exception:
+            self.ref_goal_weight = 0.05
         
     def fetch_historical_games(self, days_back: int = 30) -> pd.DataFrame:
         """Fetch historical games data with robust error handling"""
@@ -2394,6 +2400,24 @@ class RealDataNHLModel:
         dates = dates[mask]
         
         self.feature_names = available_features
+
+        if 'ref_goals_gm' in df.columns:
+            try:
+                ref_series = pd.to_numeric(df.loc[mask, 'ref_goals_gm'], errors='coerce')
+            except Exception:
+                ref_series = None
+            if ref_series is not None:
+                try:
+                    valid_ref = ref_series.dropna()
+                    if len(valid_ref):
+                        self.ref_goal_baseline = float(valid_ref.mean())
+                except Exception:
+                    pass
+        if self.ref_goal_baseline is None or not np.isfinite(self.ref_goal_baseline):
+            try:
+                self.ref_goal_baseline = float(os.getenv('REF_GOAL_BASELINE', 6.2))
+            except Exception:
+                self.ref_goal_baseline = 6.2
         
         print(f"Prepared {len(X)} samples with {len(available_features)} features")
         
@@ -2615,6 +2639,21 @@ class RealDataNHLModel:
         
         if not self.total_model:
             raise ValueError("Model not trained")
+
+        ref_goal_value: Optional[float] = None
+        ref_goal_adjustment: float = 0.0
+        ref_idx: Optional[int] = None
+        try:
+            ref_idx = self.feature_names.index('ref_goals_gm')
+        except (ValueError, AttributeError):
+            ref_idx = None
+        if ref_idx is not None and 0 <= ref_idx < len(game_features):
+            try:
+                candidate_val = float(game_features[ref_idx])
+            except Exception:
+                candidate_val = np.nan
+            if np.isfinite(candidate_val):
+                ref_goal_value = candidate_val
         
         # Scale features
         features_scaled = self.scaler.transform(game_features.reshape(1, -1))
@@ -2643,6 +2682,24 @@ class RealDataNHLModel:
             predicted_total = 0.6 * ensemble_pred + 0.4 * poisson_mu
         else:
             predicted_total = ensemble_pred
+        
+        if ref_goal_value is not None:
+            baseline_val = getattr(self, 'ref_goal_baseline', None)
+            if baseline_val is None or not np.isfinite(baseline_val):
+                try:
+                    baseline_val = float(os.getenv('REF_GOAL_BASELINE', 6.2))
+                except Exception:
+                    baseline_val = 6.2
+            try:
+                weight_val = float(getattr(self, 'ref_goal_weight', 0.05))
+            except Exception:
+                weight_val = 0.05
+            if weight_val != 0:
+                ref_goal_adjustment = float(weight_val * (ref_goal_value - baseline_val))
+                ref_goal_adjustment = float(max(-0.35, min(0.35, ref_goal_adjustment)))
+                predicted_total = float(predicted_total + ref_goal_adjustment)
+        else:
+            ref_goal_adjustment = 0.0
         
         # Calculate probabilities with calibrated uncertainty and push handling
         edge = predicted_total - betting_line
@@ -2867,7 +2924,8 @@ class RealDataNHLModel:
             fair_over_prob=fair_over, fair_under_prob=fair_under,
             odds_source=odds_source,
             ev_over_novig=ev_over_novig, ev_under_novig=ev_under_novig,
-            consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff
+            consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff,
+            ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment
         )
 
     def get_betting_lines(self, todays_games: pd.DataFrame) -> Dict[str, float]:
@@ -5638,6 +5696,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             val = referee_goal_map.get(mk, referee_default_goal)
                             goal_values.append(float(val) if isinstance(val, (int, float)) and np.isfinite(val) else np.nan)
                         todays_features['ref_goals_gm'] = goal_values
+                        baseline_fill = getattr(model, 'ref_goal_baseline', None)
+                        if baseline_fill is None or not np.isfinite(baseline_fill):
+                            if isinstance(referee_default_goal, (int, float)) and np.isfinite(referee_default_goal):
+                                baseline_fill = float(referee_default_goal)
+                            else:
+                                try:
+                                    baseline_fill = float(os.getenv('REF_GOAL_BASELINE', 6.2))
+                                except Exception:
+                                    baseline_fill = 6.2
+                        todays_features['ref_goals_gm'] = pd.to_numeric(todays_features['ref_goals_gm'], errors='coerce').fillna(baseline_fill)
             except Exception:
                 pass
 
@@ -5997,9 +6065,15 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                     pred.referee_home_bias = ref_bias_feature
 
                         if ref_goal_feature is not None:
-                            goal_coeff = 0.05
-                            adj_val = goal_coeff * (ref_goal_feature - baseline_g)
-                            total_adj += float(max(-0.25, min(0.25, adj_val)))
+                            try:
+                                residual_coeff = float(max(0.0, 0.05 - float(getattr(model, 'ref_goal_weight', 0.0))))
+                            except Exception:
+                                residual_coeff = 0.0
+                            if residual_coeff > 0:
+                                adj_val = residual_coeff * (ref_goal_feature - baseline_g)
+                                adj_val = float(max(-0.25, min(0.25, adj_val)))
+                                total_adj += adj_val
+                                pred.ref_goal_adjustment = float((pred.ref_goal_adjustment or 0.0) + adj_val)
 
                         if ref_bias_feature is not None:
                             total_adj += float(max(-0.05, min(0.05, 0.005 * ref_bias_feature)))
