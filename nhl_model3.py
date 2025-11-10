@@ -5662,20 +5662,113 @@ def main(cli_args: Optional[argparse.Namespace] = None):
 
             referee_goal_map: Dict[str, float] = {}
             referee_bias_map: Dict[str, float] = {}
+            referee_assignments_df: Optional[pd.DataFrame] = None
 
             # Attempt to auto-map referees to today's games from ScoutingTheRefs URL
             referee_assignments_source: Optional[str] = None
-            referee_map = {}
+            referee_map: Dict[str, List[str]] = {}
             try:
                 auto_url = referees_url_config
                 if not auto_url:
                     auto_url = model.find_todays_scoutingtherefs_url()
                 if auto_url:
-                    referee_map = model.build_referee_crew_map(auto_url, todays_games)
                     referee_assignments_source = str(auto_url)
+                    scraped_assignments = model.scrape_referees_scoutingtherefs(auto_url)
+                    if isinstance(scraped_assignments, pd.DataFrame) and not scraped_assignments.empty:
+                        referee_assignments_df = scraped_assignments.copy()
+                        try:
+                            if 'ref' in referee_assignments_df.columns:
+                                referee_assignments_df['ref'] = referee_assignments_df['ref'].astype(str).str.strip()
+                            if 'matchup' in referee_assignments_df.columns:
+                                referee_assignments_df['matchup'] = referee_assignments_df['matchup'].astype(str).str.upper().str.strip()
+                        except Exception:
+                            pass
+                        if 'matchup' in referee_assignments_df.columns:
+                            for mk, grp in referee_assignments_df.groupby('matchup'):
+                                mk_str = str(mk or '').strip().upper()
+                                if not mk_str or mk_str == 'NAN':
+                                    continue
+                                crew_series = grp.get('ref', pd.Series(dtype=object))
+                                crew_list = [str(nm).strip() for nm in crew_series.dropna().unique() if str(nm).strip()]
+                                parts = mk_str.split('@')
+                                if len(parts) == 2:
+                                    away_code, home_code = parts[0], parts[1]
+                                    key_primary = f"{away_code}@{home_code}"
+                                    key_secondary = f"{home_code}@{away_code}"
+                                else:
+                                    key_primary = mk_str
+                                    key_secondary = None
+                                if crew_list:
+                                    referee_map[key_primary] = crew_list
+                                    if key_secondary:
+                                        referee_map[key_secondary] = crew_list
+                                crew_vals = pd.to_numeric(grp.get('crew_goals_gm', pd.Series(dtype=float)), errors='coerce')
+                                crew_vals = crew_vals.dropna() if isinstance(crew_vals, pd.Series) else pd.Series(dtype=float)
+                                value: Optional[float] = None
+                                if isinstance(crew_vals, pd.Series) and len(crew_vals):
+                                    value = float(crew_vals.mean())
+                                if value is None or not np.isfinite(value):
+                                    indiv_vals = pd.to_numeric(grp.get('goals_gm', pd.Series(dtype=float)), errors='coerce')
+                                    if isinstance(indiv_vals, pd.Series):
+                                        indiv_vals = indiv_vals.dropna()
+                                        if len(indiv_vals):
+                                            value = float(indiv_vals.mean())
+                                if isinstance(value, (int, float)) and np.isfinite(value):
+                                    referee_goal_map[key_primary] = float(value)
+                                    if key_secondary:
+                                        referee_goal_map[key_secondary] = float(value)
+                    if not referee_map:
+                        referee_map = model.build_referee_crew_map(auto_url, todays_games)
             except Exception:
                 referee_map = {}
+                referee_assignments_df = None
                 referee_assignments_source = None
+
+            # Merge scraped goals/gm into referee rates so downstream averaging works
+            if isinstance(referee_assignments_df, pd.DataFrame) and not referee_assignments_df.empty:
+                try:
+                    assign_df = referee_assignments_df.copy()
+                    for col in ('goals_gm', 'crew_goals_gm'):
+                        if col in assign_df.columns:
+                            assign_df[col] = pd.to_numeric(assign_df[col], errors='coerce')
+                    simple_rates = None
+                    if 'goals_gm' in assign_df.columns and assign_df['goals_gm'].notna().any():
+                        simple_rates = assign_df[['ref', 'goals_gm']].dropna(subset=['ref', 'goals_gm'])
+                    elif 'crew_goals_gm' in assign_df.columns and assign_df['crew_goals_gm'].notna().any():
+                        simple_rates = assign_df[['ref', 'crew_goals_gm']].dropna(subset=['ref', 'crew_goals_gm']).rename(columns={'crew_goals_gm': 'goals_gm'})
+                    if simple_rates is not None and len(simple_rates):
+                        simple_rates = simple_rates.groupby('ref', as_index=False)['goals_gm'].mean()
+                        if referee_rates is None or not isinstance(referee_rates, pd.DataFrame) or referee_rates.empty:
+                            referee_rates = simple_rates.copy()
+                            referee_rates_source = referee_rates_source or referee_assignments_source
+                        else:
+                            merged_base = referee_rates.copy()
+                            try:
+                                merged_base['ref'] = merged_base['ref'].astype(str).str.strip()
+                                merged_base = merged_base.set_index('ref')
+                                simple_idx = simple_rates.copy()
+                                simple_idx['ref'] = simple_idx['ref'].astype(str).str.strip()
+                                simple_idx = simple_idx.set_index('ref')
+                                for col in simple_idx.columns:
+                                    if col not in merged_base.columns:
+                                        merged_base[col] = np.nan
+                                missing_refs = simple_idx.index.difference(merged_base.index)
+                                merged_base.update(simple_idx)
+                                if len(missing_refs):
+                                    merged_base = pd.concat([merged_base, simple_idx.loc[missing_refs]], axis=0)
+                                referee_rates = merged_base.reset_index()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            if (referee_default_goal is None or not np.isfinite(referee_default_goal)) and isinstance(referee_rates, pd.DataFrame) and 'goals_gm' in referee_rates.columns:
+                try:
+                    referee_default_goal = float(pd.to_numeric(referee_rates['goals_gm'], errors='coerce').dropna().mean())
+                    if not np.isfinite(referee_default_goal):
+                        referee_default_goal = None
+                except Exception:
+                    referee_default_goal = None
 
             # Pre-compute referee Goals/Gm feature for today's matchups
             try:
@@ -5686,9 +5779,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         for matchup_key, crew in referee_map.items():
                             avg_goals, avg_bias = model.crew_features(crew, referee_rates)
                             if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
-                                referee_goal_map[matchup_key] = float(avg_goals)
+                                if matchup_key not in referee_goal_map:
+                                    referee_goal_map[matchup_key] = float(avg_goals)
                             if isinstance(avg_bias, (int, float)) and np.isfinite(avg_bias):
-                                referee_bias_map[matchup_key] = float(avg_bias)
+                                if matchup_key not in referee_bias_map:
+                                    referee_bias_map[matchup_key] = float(avg_bias)
                     if isinstance(todays_features, pd.DataFrame):
                         goal_values = []
                         for _, row in todays_features[['away_team', 'home_team']].iterrows():
