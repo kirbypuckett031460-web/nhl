@@ -4849,7 +4849,7 @@ def save_predictions_image(
         f"NHL Predictions\n"
         f"{ytd_str} | {last_week_str}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
-        "Odds from FanDuel."
+        "Odds aggregated from multiple books."
     )
     ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
 
