@@ -4924,15 +4924,20 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
     betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
     avg_confidence = np.mean([p.confidence for p in betting_preds]) if betting_preds else 0
     
+    def attr_escape(value: Optional[str]) -> str:
+        if value is None:
+            return ''
+        return html_parser.escape(str(value), quote=True)
+
     prediction_rows = []
     for pred in predictions:
         conf_color = '#27ae60' if pred.confidence > 0.75 else '#f39c12' if pred.confidence > 0.6 else '#e74c3c'
         edge_color = '#27ae60' if pred.edge > 0.2 else '#e74c3c' if pred.edge < -0.2 else '#95a5a6'
         
+        crew_names = [str(n).strip() for n in (getattr(pred, 'referee_crew', []) or []) if str(n).strip()]
         referee_display = getattr(pred, 'referee_info', None)
         if not referee_display:
-            crew_list = getattr(pred, 'referee_crew', []) or []
-            referee_display = ", ".join([str(n) for n in crew_list if str(n).strip()])
+            referee_display = ", ".join(crew_names)
         referee_display = referee_display or ''
         referee_metric_bits: List[str] = []
         if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
@@ -4947,8 +4952,32 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
             metric_html = f"<div style=\"font-size: 0.8rem; color:#7f8c8d;\">{metrics_txt}</div>"
             referee_cell = f"{referee_display}{metric_html}" if referee_display else metric_html
 
+        ref_crew_attr = ", ".join(crew_names)
+        ref_avg_attr = (
+            f"{pred.referee_avg_goals:.3f}"
+            if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals)
+            else ''
+        )
+        ref_bias_attr = (
+            f"{pred.referee_home_bias:.3f}"
+            if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias)
+            else ''
+        )
+        ref_source_attr = (str(pred.referee_source).strip() if getattr(pred, 'referee_source', None) else '')
+        ref_goal_adjust_val = getattr(pred, 'ref_goal_adjustment', None)
+        ref_goal_adjust_attr = (
+            f"{ref_goal_adjust_val:.3f}"
+            if isinstance(ref_goal_adjust_val, (int, float)) and np.isfinite(ref_goal_adjust_val)
+            else ''
+        )
+
         row = f"""
-        <tr data-gid="{pred.game_id}" data-rec="{pred.recommendation}" data-matchup="{pred.away_team} @ {pred.home_team}">
+        <tr data-gid="{pred.game_id}" data-rec="{pred.recommendation}" data-matchup="{pred.away_team} @ {pred.home_team}"
+            data-ref-crew="{attr_escape(ref_crew_attr)}"
+            data-ref-avg="{attr_escape(ref_avg_attr)}"
+            data-ref-bias="{attr_escape(ref_bias_attr)}"
+            data-ref-source="{attr_escape(ref_source_attr)}"
+            data-ref-adjust="{attr_escape(ref_goal_adjust_attr)}">
             <td><strong>{pred.away_team} @ {pred.home_team}</strong></td>
             <td>{pred.betting_line:.1f}</td>
             <td><strong style="color: #2c3e50;">{pred.predicted_total:.2f}</strong>
@@ -5281,14 +5310,23 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
     }} catch(e) {{ console.log('applyFilters error', e); }}
   }};
 
-  window.toCsv = function(){{
-    const headers = Array.from(table.querySelectorAll('thead th')).map(th => norm(th.innerText));
-    const lines = [headers.join(',')];
-    getRows().forEach(tr => {{
-      if (tr.style.display === 'none') return;
-      const cols = Array.from(tr.children).map(td => '"' + norm(td.innerText).replace(/"/g,'""') + '"');
-      lines.push(cols.join(','));
-    }});
+    window.toCsv = function(){{
+      const headers = Array.from(table.querySelectorAll('thead th')).map(th => norm(th.innerText));
+      const extraHeaders = ['Referee Crew','Referee Avg Goals','Referee Home Bias','Referee Source','Ref Goal Adjustment'];
+      const quote = value => '"' + value.replace(/"/g,'""') + '"';
+      const lines = [headers.concat(extraHeaders).join(',')];
+      getRows().forEach(tr => {{
+        if (tr.style.display === 'none') return;
+        const baseCols = Array.from(tr.children).map(td => quote(norm(td.innerText)));
+        const extraCols = [
+          quote(norm(tr.getAttribute('data-ref-crew') || tr.dataset.refCrew || '')),
+          quote(norm(tr.getAttribute('data-ref-avg') || tr.dataset.refAvg || '')),
+          quote(norm(tr.getAttribute('data-ref-bias') || tr.dataset.refBias || '')),
+          quote(norm(tr.getAttribute('data-ref-source') || tr.dataset.refSource || '')),
+          quote(norm(tr.getAttribute('data-ref-adjust') || tr.dataset.refAdjust || ''))
+        ];
+        lines.push(baseCols.concat(extraCols).join(','));
+      }});
     const csv = '\ufeff' + lines.join('\n');
     const blob = new Blob([csv], {{type:'text/csv;charset=utf-8;'}});
     const url = URL.createObjectURL(blob);
