@@ -124,6 +124,20 @@ def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
     if not expanded:
         return None
 
+    # Handle Windows-style drive paths when running on POSIX environments (e.g., WSL or Linux containers)
+    if os.name != 'nt':
+        win_match = re.match(r'^([a-zA-Z]):[\\/](.*)$', expanded)
+        if win_match:
+            drive_letter = win_match.group(1).lower()
+            remainder = win_match.group(2).replace('\\', '/').lstrip('/')
+            wsl_root = f"/mnt/{drive_letter}"
+            if os.path.exists(wsl_root):
+                expanded = os.path.join(wsl_root, remainder)
+            else:
+                fallback_local = os.path.abspath(os.path.join(os.getcwd(), os.path.basename(remainder) or "output.csv"))
+                print(f"⚠️  Windows-style path {path} is not accessible on this system. Writing to {fallback_local} instead.")
+                expanded = fallback_local
+
     norm_path = os.path.abspath(expanded)
     basename = os.path.basename(norm_path).strip() or "output.csv"
 
