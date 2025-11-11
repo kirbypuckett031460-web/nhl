@@ -1,4 +1,5 @@
 import pathlib, streamlit as st
+import html
 import pandas as pd
 import io, requests, time
 from nhl_model3 import main, argparse
@@ -181,10 +182,10 @@ def filter_html(html: str, ftxt: str, frec: str) -> str:
     except Exception:
         return html
 
-def parse_rows_for_display(html: str):
+def parse_rows_for_display(html_text: str):
     import re
     rows_out = []
-    m = re.search(r"(<tbody>)([\s\S]*?)(</tbody>)", html, flags=re.I)
+    m = re.search(r"(<tbody>)([\s\S]*?)(</tbody>)", html_text, flags=re.I)
     if not m:
         return rows_out
     body = m.group(2)
@@ -198,7 +199,17 @@ def parse_rows_for_display(html: str):
         vals = [clean(x) for x in tds]
         # Extract data-rec if present
         rec_m = re.search(r"data-rec=\"([^\"]*)\"", r)
-        rec = rec_m.group(1) if rec_m else (vals[9] if len(vals) > 9 else '')
+        rec = rec_m.group(1) if rec_m else (vals[10] if len(vals) > 10 else '')
+        ref_crew_m = re.search(r"data-ref-crew=\"([^\"]*)\"", r)
+        ref_avg_m = re.search(r"data-ref-avg=\"([^\"]*)\"", r)
+        ref_bias_m = re.search(r"data-ref-bias=\"([^\"]*)\"", r)
+        ref_source_m = re.search(r"data-ref-source=\"([^\"]*)\"", r)
+        ref_adjust_m = re.search(r"data-ref-adjust=\"([^\"]*)\"", r)
+        ref_crew_raw = html.unescape(ref_crew_m.group(1)) if ref_crew_m else ''
+        ref_avg_goals = html.unescape(ref_avg_m.group(1)) if ref_avg_m else ''
+        ref_home_bias = html.unescape(ref_bias_m.group(1)) if ref_bias_m else ''
+        ref_source = html.unescape(ref_source_m.group(1)) if ref_source_m else ''
+        ref_goal_adjustment = html.unescape(ref_adjust_m.group(1)) if ref_adjust_m else ''
         rows_out.append({
             'matchup': vals[0] if len(vals) > 0 else '',
             'line': vals[1] if len(vals) > 1 else '',
@@ -207,10 +218,16 @@ def parse_rows_for_display(html: str):
             'over': vals[4] if len(vals) > 4 else '',
             'under': vals[5] if len(vals) > 5 else '',
             'conf': vals[6] if len(vals) > 6 else '',
-            'env': vals[7] if len(vals) > 7 else '',
-            'lineup': vals[8] if len(vals) > 8 else '',
+            'refs': vals[7] if len(vals) > 7 else '',
+            'env': vals[8] if len(vals) > 8 else '',
+            'lineup': vals[9] if len(vals) > 9 else '',
             'rec': rec,
-            'kelly': vals[10] if len(vals) > 10 else ''
+            'kelly': vals[11] if len(vals) > 11 else '',
+            'ref_crew_raw': ref_crew_raw,
+            'ref_avg_goals': ref_avg_goals,
+            'ref_home_bias': ref_home_bias,
+            'ref_source': ref_source,
+            'ref_goal_adjustment': ref_goal_adjustment
         })
     return rows_out
 
@@ -226,9 +243,19 @@ if html_path.exists():
         from io import StringIO
         csv_buf = StringIO()
         w = csv.writer(csv_buf)
-        w.writerow(["Matchup","Line","Predicted","Edge","Over%","Under%","Confidence","Env","Lineup","Recommendation","Kelly%"])
+        w.writerow([
+            "Matchup","Line","Predicted","Edge","Over%","Under%","Confidence","Refs",
+            "Referee Crew","Ref Avg Goals","Ref Home Bias","Ref Source","Ref Goal Adjustment",
+            "Env","Lineup","Recommendation","Kelly%"
+        ])
         for r in rows:
-            w.writerow([r['matchup'], r['line'], r['pred'], r['edge'], r['over'], r['under'], r['conf'], r['env'], r['lineup'], r['rec'], r['kelly']])
+            w.writerow([
+                r.get('matchup',''), r.get('line',''), r.get('pred',''), r.get('edge',''),
+                r.get('over',''), r.get('under',''), r.get('conf',''), r.get('refs',''),
+                r.get('ref_crew_raw',''), r.get('ref_avg_goals',''), r.get('ref_home_bias',''),
+                r.get('ref_source',''), r.get('ref_goal_adjustment',''), r.get('env',''),
+                r.get('lineup',''), r.get('rec',''), r.get('kelly','')
+            ])
         st.download_button("Export CSV", data=csv_buf.getvalue().encode("utf-8"), file_name="predictions.csv", mime="text/csv")
         # Copy best bets (use a small component to access clipboard)
         best_lines = []
