@@ -3146,12 +3146,19 @@ class RealDataNHLModel:
             }
             return mapping.get(name_u, name_u[:3])
 
-        # Aggregate odds for each matchup (filtered to FanDuel and DraftKings only)
-        tmp: Dict[str, List[Tuple[float, int, int, str, str]]] = {}
-        # Optionally collect totals from all books for dispersion metrics
+        def american_to_decimal(a: int) -> float:
+            try:
+                if a >= 100:
+                    return 1.0 + (a / 100.0)
+                return 1.0 + (100.0 / max(1, abs(a)))
+            except Exception:
+                return 1.0
+
+        # Aggregate odds for each matchup across all available books
+        tmp: Dict[str, List[Dict[str, Any]]] = {}
+        # Collect totals from all books (used for consensus/dispersion metrics)
         totals_all: Dict[str, List[float]] = {}
         matched_events = 0
-        allowed_books = { 'fanduel', 'fd' }
         for ev in data if isinstance(data, list) else []:
             try:
                 home = normalize_team(ev.get('home_team'))
@@ -3162,62 +3169,73 @@ class RealDataNHLModel:
                 matched_events += 1
                 ev_id = ev.get('id') or ev.get('event_id') or ev.get('commence_time')
                 for bk in ev.get('bookmakers', []) or []:
-                    # Collect totals for dispersion regardless of book when enabled
-                    if dispersion_all:
-                        for mkts in bk.get('markets', []) or []:
-                            if mkts.get('key') != 'totals':
-                                continue
-                            for out in mkts.get('outcomes', []) or []:
-                                pt = out.get('point')
-                                try:
-                                    if pt is not None:
-                                        totals_all.setdefault(mk, []).append(float(pt))
-                                except Exception:
-                                    pass
-                    book_key = bk.get('key') or bk.get('title')
-                    bk_key_l = (bk.get('key') or '').strip().lower()
-                    bk_title_l = (bk.get('title') or '').strip().lower()
-                    # Filter to FD only
-                    if bk_key_l not in allowed_books and bk_title_l not in allowed_books:
-                        continue
+                    book_key_raw = (bk.get('key') or '').strip()
+                    book_title_raw = (bk.get('title') or '').strip()
+                    book_key = book_key_raw or book_title_raw or 'unknown'
+                    book_title = book_title_raw or book_key_raw or 'Unknown'
+                    last_update = bk.get('last_update')
                     for mkts in bk.get('markets', []) or []:
                         if mkts.get('key') != 'totals':
                             continue
+                        lines_by_point: Dict[float, Dict[str, int]] = {}
+                        points_recorded: Set[float] = set()
                         for out in mkts.get('outcomes', []) or []:
-                            # We need total, over and under prices
-                            # Typically outcomes will include {'name': 'Over', 'point': 6.5, 'price': -110}
-                            pass
-                    # Extract over/under per bookmaker
-                    over_price = None
-                    under_price = None
-                    total_point = None
-                    for mkts in bk.get('markets', []) or []:
-                        if mkts.get('key') != 'totals':
-                            continue
-                        for out in mkts.get('outcomes', []) or []:
-                            nm = (out.get('name') or '').lower()
+                            nm = (out.get('name') or out.get('description') or '').strip().lower()
                             pt = out.get('point')
                             pr = out.get('price')
                             try:
-                                if pt is not None:
-                                    total_point = float(pt)
+                                pt_val = float(pt) if pt is not None else None
                             except Exception:
-                                pass
+                                pt_val = None
+                            if pt_val is not None:
+                                if dispersion_all and pt_val not in points_recorded:
+                                    totals_all.setdefault(mk, []).append(pt_val)
+                                    points_recorded.add(pt_val)
+                                line_entry = lines_by_point.setdefault(pt_val, {})
+                            else:
+                                line_entry = None
                             try:
-                                pr = int(pr)
+                                pr_int = int(pr)
                             except Exception:
-                                pr = None
-                            if 'over' in nm and pr is not None:
-                                over_price = pr
-                            if 'under' in nm and pr is not None:
-                                under_price = pr
-                    if total_point is not None and over_price is not None and under_price is not None:
-                        tmp.setdefault(mk, []).append((total_point, over_price, under_price, str(book_key), str(ev_id)))
+                                pr_int = None
+                            if pr_int is None or line_entry is None:
+                                continue
+                            if 'over' in nm:
+                                line_entry['over'] = pr_int
+                            elif 'under' in nm:
+                                line_entry['under'] = pr_int
+                        best_line = None
+                        best_hold = None
+                        for point, prices in lines_by_point.items():
+                            if 'over' not in prices or 'under' not in prices:
+                                continue
+                            hold = abs((1.0 / american_to_decimal(prices['over'])) + (1.0 / american_to_decimal(prices['under'])) - 1.0)
+                            if best_line is None or hold < best_hold:
+                                best_line = (point, prices['over'], prices['under'])
+                                best_hold = hold
+                        if best_line:
+                            total_point, over_price, under_price = best_line
+                            entry = {
+                                'total': total_point,
+                                'over': over_price,
+                                'under': under_price,
+                                'book_key': book_key,
+                                'book_title': book_title,
+                                'event_id': str(ev_id),
+                                'last_update': last_update
+                            }
+                            if dispersion_all:
+                                if total_point not in points_recorded:
+                                    totals_all.setdefault(mk, []).append(float(total_point))
+                            else:
+                                totals_all.setdefault(mk, []).append(float(total_point))
+                            tmp.setdefault(mk, []).append(entry)
+                            break
             except Exception:
                 continue
 
         print(f"✅ Matched realtime odds to {matched_events} of {len(matchups)} matchups")
-        # Build result per game id using consensus and best prices (FD only)
+        # Build result per game id using consensus and best prices across all books
         for _, g in todays_games.iterrows():
             gid = str(g.get('game_id'))
             mk = gid_to_matchup.get(gid)
@@ -3227,57 +3245,84 @@ class RealDataNHLModel:
             if not arr:
                 # No FD odds available for this matchup; skip returning odds (no local fallback)
                 continue
-            totals = [t[0] for t in arr]
-            overs = [t[1] for t in arr]
-            unders = [t[2] for t in arr]
+            totals = [t['total'] for t in arr if t.get('total') is not None]
+            overs = [t['over'] for t in arr if t.get('over') is not None]
+            unders = [t['under'] for t in arr if t.get('under') is not None]
             # consensus median
             try:
                 cons = float(np.median(totals))
             except Exception:
                 cons = float(totals[0])
             # best price by highest decimal payout
-            def american_to_decimal(a: int) -> float:
-                return 1.0 + (a / 100.0) if a >= 100 else 1.0 + (100.0 / abs(a))
             best_over = max(overs, key=lambda a: american_to_decimal(a)) if overs else -110
             best_under = max(unders, key=lambda a: american_to_decimal(a)) if unders else -110
+            consensus_over = None
+            consensus_under = None
+            if overs:
+                try:
+                    consensus_over = int(np.median(overs))
+                except Exception:
+                    consensus_over = int(overs[0])
+            if unders:
+                try:
+                    consensus_under = int(np.median(unders))
+                except Exception:
+                    consensus_under = int(unders[0])
             # Determine best books
             best_over_book = None
             best_under_book = None
             best_over_val = -1.0
             best_under_val = -1.0
-            for total, o, u, bk_name, ev_id in arr:
-                od = american_to_decimal(o)
-                if od > best_over_val:
-                    best_over_val = od
-                    best_over_book = bk_name
-                ud = american_to_decimal(u)
-                if ud > best_under_val:
-                    best_under_val = ud
-                    best_under_book = bk_name
+            for entry in arr:
+                o = entry.get('over')
+                u = entry.get('under')
+                bk_name = entry.get('book_title') or entry.get('book_key')
+                if o is not None:
+                    od = american_to_decimal(o)
+                    if od > best_over_val:
+                        best_over_val = od
+                        best_over_book = bk_name
+                if u is not None:
+                    ud = american_to_decimal(u)
+                    if ud > best_under_val:
+                        best_under_val = ud
+                        best_under_book = bk_name
             # include per-book list
-            books = [{'book': t[3], 'book_key': t[3], 'event_id': t[4], 'total': t[0], 'over': t[1], 'under': t[2]} for t in arr]
+            books = []
+            for entry in arr:
+                books.append({
+                    'book': entry.get('book_title') or entry.get('book_key'),
+                    'book_key': entry.get('book_key'),
+                    'event_id': entry.get('event_id'),
+                    'total': entry.get('total'),
+                    'over': entry.get('over'),
+                    'under': entry.get('under'),
+                    'last_update': entry.get('last_update')
+                })
             rec_out = {
                 'total': cons,
                 'over': int(best_over),
                 'under': int(best_under),
                 'consensus_total': cons,
                 'books': books,
+                'book_count': len(books),
+                'consensus_over': consensus_over,
+                'consensus_under': consensus_under,
                 'best_over_book': str(best_over_book) if best_over_book is not None else None,
                 'best_under_book': str(best_under_book) if best_under_book is not None else None,
-                'odds_source': 'the-odds-api:fd'
+                'odds_source': 'the-odds-api:aggregate'
             }
             # Add dispersion metrics from all books if requested
-            if dispersion_all:
-                arr_all = totals_all.get(mk, [])
-                if arr_all:
-                    try:
-                        rec_out['dispersion_total_std'] = float(np.std(arr_all))
-                        rec_out['dispersion_total_range'] = float(max(arr_all) - min(arr_all))
-                    except Exception:
-                        pass
+            arr_all = totals_all.get(mk, []) if dispersion_all else totals
+            if arr_all:
+                try:
+                    rec_out['dispersion_total_std'] = float(np.std(arr_all))
+                    rec_out['dispersion_total_range'] = float(max(arr_all) - min(arr_all))
+                except Exception:
+                    pass
             results[gid] = rec_out
 
-        # No local fallback: only return FD real-time odds per request
+        # No local fallback: only return real-time odds per request
 
         return results
 
