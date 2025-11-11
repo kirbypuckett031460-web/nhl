@@ -3137,7 +3137,7 @@ class RealDataNHLModel:
         # Optionally collect totals from all books for dispersion metrics
         totals_all: Dict[str, List[float]] = {}
         matched_events = 0
-        allowed_books = { 'fanduel', 'draftkings', 'fd', 'dk' }
+        allowed_books = { 'fanduel', 'fd' }
         for ev in data if isinstance(data, list) else []:
             try:
                 home = normalize_team(ev.get('home_team'))
@@ -3163,7 +3163,7 @@ class RealDataNHLModel:
                     book_key = bk.get('key') or bk.get('title')
                     bk_key_l = (bk.get('key') or '').strip().lower()
                     bk_title_l = (bk.get('title') or '').strip().lower()
-                    # Filter to FD/DK only
+                    # Filter to FD only
                     if bk_key_l not in allowed_books and bk_title_l not in allowed_books:
                         continue
                     for mkts in bk.get('markets', []) or []:
@@ -3203,7 +3203,7 @@ class RealDataNHLModel:
                 continue
 
         print(f"✅ Matched realtime odds to {matched_events} of {len(matchups)} matchups")
-        # Build result per game id using consensus and best prices (FD/DK only)
+        # Build result per game id using consensus and best prices (FD only)
         for _, g in todays_games.iterrows():
             gid = str(g.get('game_id'))
             mk = gid_to_matchup.get(gid)
@@ -3211,7 +3211,7 @@ class RealDataNHLModel:
                 continue
             arr = tmp.get(mk, [])
             if not arr:
-                # No FD/DK odds available for this matchup; skip returning odds (no local fallback)
+                # No FD odds available for this matchup; skip returning odds (no local fallback)
                 continue
             totals = [t[0] for t in arr]
             overs = [t[1] for t in arr]
@@ -3250,7 +3250,7 @@ class RealDataNHLModel:
                 'books': books,
                 'best_over_book': str(best_over_book) if best_over_book is not None else None,
                 'best_under_book': str(best_under_book) if best_under_book is not None else None,
-                'odds_source': 'the-odds-api:fd+dk'
+                'odds_source': 'the-odds-api:fd'
             }
             # Add dispersion metrics from all books if requested
             if dispersion_all:
@@ -3263,7 +3263,7 @@ class RealDataNHLModel:
                         pass
             results[gid] = rec_out
 
-        # No local fallback: only return FD/DK real-time odds per request
+        # No local fallback: only return FD real-time odds per request
 
         return results
 
@@ -4790,7 +4790,7 @@ def save_predictions_image(
         f"NHL Predictions\n"
         f"{ytd_str} | {last_week_str}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
-        "Odds from FanDuel and DraftKings."
+        "Odds from FanDuel."
     )
     ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
 
@@ -5369,7 +5369,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         print("\n📊 Step 1: Fetching historical NHL data...")
         print("🔄 Trying multiple data sources...")
         
-        historical_data = model.fetch_historical_games(days_back=34)
+        historical_data = model.fetch_historical_games(days_back=35)
         
         if len(historical_data) < 20:
             print(f"⚠️  Limited data ({len(historical_data)} games). Trying extended range...")
@@ -6384,7 +6384,7 @@ if __name__ == "__main__":
     parser.add_argument('--odds-regions', type=str, default='us', help='Comma-separated odds regions (e.g., us,ca,uk,eu)')
     parser.add_argument('--odds-timeout', type=int, default=25, help='Realtime odds request timeout in seconds')
     parser.add_argument('--odds-retries', type=int, default=3, help='Realtime odds fetch retries on failure')
-    parser.add_argument('--odds-dispersion-all', action='store_true', help='Collect totals from all books for dispersion metrics (still pick prices from FD/DK)')
+    parser.add_argument('--odds-dispersion-all', action='store_true', help='Collect totals from all books for dispersion metrics (still pick prices from FD)')
     parser.add_argument('--log-odds-history', action='store_true', help='Append odds snapshots to odds_history.csv')
     parser.add_argument('--odds-history-path', type=str, default='odds_history.csv', help='Path to odds history CSV')
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
