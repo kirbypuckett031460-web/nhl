@@ -4764,89 +4764,81 @@ def save_predictions_image(
 
     ytd_str, last_week_str = compute_accuracy_strings()
 
-    columns = [
-        'Matchup',
-        'Line',
-        'Predicted',
-        'Edge',
-        'Over%',
-        'Under%',
-        'Confidence',
-        'Referees',
-        'Env',
-        'Lineup',
-        'Recommendation',
-        'Kelly%'
-    ]
-    rows: List[List[str]] = []
-    rec_classes: List[str] = []
-
+    rows: List[Dict[str, str]] = []
     for pred in predictions:
-        rec = (getattr(pred, 'recommendation', None) or 'No Bet')
-        rec_upper = rec.upper()
-        rec_class = 'rec-no-bet'
-        if rec_upper.startswith('OVER'):
-            rec_class = 'rec-over'
-        elif rec_upper.startswith('UNDER'):
-            rec_class = 'rec-under'
+        # Determine scheduled time (Eastern) when available
+        display_time = getattr(pred, 'start_time_display', '')
+        raw_dt = getattr(pred, 'game_datetime', None) or getattr(pred, 'game_datetime_utc', None)
+        start_dt = None
+        if raw_dt is not None:
+            try:
+                start_dt = pd.Timestamp(raw_dt)
+            except Exception:
+                start_dt = None
+        if start_dt is None:
+            raw_str = getattr(pred, 'game_date', None)
+            if raw_str:
+                try:
+                    start_dt = pd.to_datetime(raw_str, utc=True, errors='coerce')
+                except Exception:
+                    start_dt = None
+        sort_key = float('inf')
+        if start_dt is not None and not pd.isna(start_dt):
+            try:
+                if start_dt.tzinfo is None or start_dt.tzinfo.utcoffset(start_dt) is None:
+                    start_dt = start_dt.tz_localize('UTC')
+            except (TypeError, AttributeError):
+                start_dt = start_dt.tz_localize('UTC')
+            start_dt_et = start_dt.tz_convert('US/Eastern')
+            sort_key = float(start_dt_et.timestamp())
+            if not display_time:
+                display_time = start_dt_et.strftime('%I:%M %p ET')
 
-        try:
-            over_txt = f"{pred.over_probability:.0%}"
-        except Exception:
-            over_txt = ''
-        try:
-            under_txt = f"{pred.under_probability:.0%}"
-        except Exception:
-            under_txt = ''
+        def _fmt_float(value: Optional[float]) -> str:
+            try:
+                return f"{float(value):.1f}"
+            except Exception:
+                return '—'
 
-        pred_val = getattr(pred, 'predicted_total', None)
-        pred_txt = f"{pred_val:.2f}" if isinstance(pred_val, (int, float)) else ''
+        def _fmt_conf(value: Optional[float]) -> str:
+            try:
+                val = float(value)
+                if val <= 1.0:
+                    val *= 100.0
+                return f"{val:.1f}%"
+            except Exception:
+                return '—'
 
-        edge_val = getattr(pred, 'edge', None)
-        edge_txt = f"{edge_val:+.2f}" if isinstance(edge_val, (int, float)) else ''
+        recommendation = getattr(pred, 'recommendation', '') or ''
+        if isinstance(recommendation, str):
+            pick_txt = recommendation.title()
+        else:
+            pick_txt = str(recommendation)
 
-        conf_val = getattr(pred, 'confidence', None)
-        confidence_txt = f"{conf_val:.0%}" if isinstance(conf_val, (int, float)) else ''
+        ref_goal_value = getattr(pred, 'ref_goals_gm', None)
+        if ref_goal_value is None:
+            ref_goal_value = getattr(pred, 'referee_avg_goals', None)
+        ref_goal_display = _fmt_float(ref_goal_value) if ref_goal_value is not None else ''
 
-        env_txt = getattr(pred, 'env_info', '') or ''
-        lineup_txt = getattr(pred, 'lineup_info', '') or ''
+        rows.append({
+            'Time': display_time,
+            'Away': str(getattr(pred, 'away_team', '')),
+            'Home': str(getattr(pred, 'home_team', '')),
+            'Line': _fmt_float(getattr(pred, 'betting_line', None)),
+            'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
+            'Pick': pick_txt,
+            'Conf%': _fmt_conf(getattr(pred, 'confidence', None)),
+            'Ref G/G': ref_goal_display,
+            '_sort_key': sort_key
+        })
 
-        ref_txt = getattr(pred, 'referee_info', None)
-        if not ref_txt:
-            crew_list = getattr(pred, 'referee_crew', []) or []
-            ref_txt = ", ".join([str(n) for n in crew_list if str(n).strip()])
-        ref_txt = ref_txt or ''
-
-        kelly_val = getattr(pred, 'kelly_bet_size', None)
-        kelly_txt = f"{kelly_val:.1f}%" if isinstance(kelly_val, (int, float)) else ''
-
-        line_val = getattr(pred, 'betting_line', None)
-        line_txt = '' if line_val is None else str(line_val)
-
-        matchup_txt = f"{getattr(pred, 'away_team', '')}@{getattr(pred, 'home_team', '')}"
-
-        rows.append([
-            matchup_txt,
-            line_txt,
-            pred_txt,
-            edge_txt,
-            over_txt,
-            under_txt,
-            confidence_txt,
-            ref_txt,
-            env_txt,
-            lineup_txt,
-            rec,
-            kelly_txt
-        ])
-        rec_classes.append(rec_class)
-
-    if not rows:
+    df = pd.DataFrame(rows)
+    if df.empty:
         print("ℹ️  No rows constructed for predictions table.")
         return None
 
-    df = pd.DataFrame(rows, columns=columns)
-    df = df.replace({None: '', np.nan: ''})
+    df = df.sort_values(by=['_sort_key', 'Time']).drop(columns=['_sort_key'])
+    df = df.replace({None: '—', np.nan: '—'})
 
     fig_height = 0.27 * max(1, len(df)) + 1.0
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
@@ -4863,18 +4855,14 @@ def save_predictions_image(
 
     # Compute column widths dynamically so the layout stays stable if columns change
     default_col_widths = {
-        'Matchup': 0.18,
+        'Time': 0.12,
+        'Away': 0.18,
+        'Home': 0.18,
         'Line': 0.08,
-        'Predicted': 0.1,
-        'Edge': 0.09,
-        'Over%': 0.08,
-        'Under%': 0.08,
-        'Confidence': 0.1,
-        'Referees': 0.12,
-        'Env': 0.09,
-        'Lineup': 0.1,
-        'Recommendation': 0.1,
-        'Kelly%': 0.08
+        'Predicted': 0.12,
+        'Pick': 0.1,
+        'Conf%': 0.1,
+        'Ref G/G': 0.08
     }
     fallback_width = max(0.08, 1.0 / max(1, len(df.columns)))
     col_widths = [default_col_widths.get(str(col), fallback_width) for col in df.columns]
@@ -4884,7 +4872,7 @@ def save_predictions_image(
     table = plt.table(
         cellText=df.values,
         colLabels=df.columns,
-        cellLoc='left',
+        cellLoc='center',
         colWidths=col_widths,
         loc='upper center'
     )
@@ -4893,30 +4881,24 @@ def save_predictions_image(
     table.set_fontsize(12)
     table.scale(1, 1.2)
 
-    rec_col_idx = df.columns.get_loc('Recommendation')
-
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_edgecolor('#bdc3c7')
         if row_idx == 0:
             cell.set_facecolor('#2c3e50')
-            cell.set_text_props(color='white', weight='bold', fontsize=13, ha='left')
+            cell.set_text_props(color='white', weight='bold', fontsize=13)
         else:
-            cell.set_text_props(ha='left')
-            if col_idx == rec_col_idx:
-                rec_class = rec_classes[row_idx - 1]
-                rec_value = str(df.iloc[row_idx - 1, col_idx]).strip()
-                if rec_class == 'rec-over':
+            if col_idx == 5:  # Pick column
+                pick_val = str(df.iloc[row_idx - 1, col_idx]).upper()
+                if pick_val == 'OVER':
                     cell.set_facecolor('#27ae60')
-                    cell.set_text_props(color='white', weight='bold', ha='left')
-                elif rec_class == 'rec-under':
+                    cell.set_text_props(color='white', weight='bold')
+                elif pick_val == 'UNDER':
                     cell.set_facecolor('#c0392b')
-                    cell.set_text_props(color='white', weight='bold', ha='left')
+                    cell.set_text_props(color='white', weight='bold')
                 else:
-                    cell.set_facecolor('#f9e79f')
-                    text_color = '#7d6608' if rec_value else '#2c3e50'
-                    cell.set_text_props(color=text_color, weight='bold', ha='left')
+                    cell.set_facecolor('#ecf0f1')
             elif row_idx % 2 == 0:
-                cell.set_facecolor('#fafafa')
+                cell.set_facecolor('#f8f9fa')
 
     plt.tight_layout()
     plt.savefig(image_path, bbox_inches='tight', dpi=200)
