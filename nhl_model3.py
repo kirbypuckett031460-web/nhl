@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 import requests
 from sklearn.model_selection import train_test_split, TimeSeriesSplit, RandomizedSearchCV
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss
@@ -1441,32 +1441,54 @@ class RealDataNHLModel:
         
         print("Creating enhanced features from NHL data...")
         features = features.sort_values(['date']).reset_index(drop=True)
+
+        # Helper utilities for leak-free, vectorized rolling calculations
+        def lagged_rolling_mean(group_col: str, value_col: str, window: int, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
+            if value_col not in features.columns:
+                return pd.Series(fill_value, index=features.index)
+            series = (
+                features.groupby(group_col)[value_col]
+                .transform(lambda s: s.shift().rolling(window, min_periods=min_periods).mean())
+            )
+            return series.fillna(fill_value) if fill_value is not None else series
+
+        def lagged_rolling_sum(group_col: str, value_col: str, window: int, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
+            if value_col not in features.columns:
+                return pd.Series(fill_value, index=features.index)
+            series = (
+                features.groupby(group_col)[value_col]
+                .transform(lambda s: s.shift().rolling(window, min_periods=min_periods).sum())
+            )
+            return series.fillna(fill_value) if fill_value is not None else series
+
+        def lagged_ewm(group_col: str, value_col: str, alpha: float, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
+            if value_col not in features.columns:
+                return pd.Series(fill_value, index=features.index)
+            series = (
+                features.groupby(group_col)[value_col]
+                .transform(lambda s: s.shift().ewm(alpha=alpha, min_periods=min_periods).mean())
+            )
+            return series.fillna(fill_value) if fill_value is not None else series
         
         # Team performance metrics (leak-free: shift before rolling)
         for team in ['home', 'away']:
             team_col = f'{team}_team'
+            goals_col = f'{team}_goals'
+            opp_goals_col = f'{"away" if team == "home" else "home"}_goals'
 
             for window in [3, 5, 10]:
-                features[f'{team}_gpg_l{window}'] = (
-                    features.groupby(team_col)[f'{team}_goals']
-                    .apply(lambda s: s.shift().rolling(window, min_periods=2).mean())
-                    .reset_index(level=0, drop=True)
-                    .fillna(3.0)
-                )
-
-                opp_goals_col = f'{"away" if team == "home" else "home"}_goals'
-                features[f'{team}_gag_l{window}'] = (
-                    features.groupby(team_col)[opp_goals_col]
-                    .apply(lambda s: s.shift().rolling(window, min_periods=2).mean())
-                    .reset_index(level=0, drop=True)
-                    .fillna(3.0)
-                )
+                features[f'{team}_gpg_l{window}'] = lagged_rolling_mean(team_col, goals_col, window, fill_value=3.0)
+                features[f'{team}_gag_l{window}'] = lagged_rolling_mean(team_col, opp_goals_col, window, fill_value=3.0)
         
         # Combined metrics
         features['combined_gpg'] = (features['home_gpg_l5'].fillna(3.0) + features['away_gpg_l5'].fillna(3.0)) / 2
         features['combined_gag'] = (features['home_gag_l5'].fillna(3.0) + features['away_gag_l5'].fillna(3.0)) / 2
         features['expected_pace'] = features['combined_gpg'] + features['combined_gag']
         features['pace_variance'] = abs(features['home_gpg_l5'].fillna(3.0) - features['away_gpg_l5'].fillna(3.0))
+        lagged_pace = features['expected_pace'].shift()
+        pace_mean = lagged_pace.expanding(min_periods=5).mean()
+        pace_std = lagged_pace.expanding(min_periods=5).std().replace(0.0, np.nan)
+        features['pace_zscore'] = ((lagged_pace - pace_mean) / pace_std).fillna(0.0)
 
         # Opponent-adjusted strength-of-schedule approximation using Elo and opponent rates
         try:
@@ -1569,6 +1591,13 @@ class RealDataNHLModel:
         features['home_b2b'] = (features['home_rest_days'] == 1).astype(int)
         features['away_b2b'] = (features['away_rest_days'] == 1).astype(int)
         features['b2b_penalty'] = (features['home_b2b'] * -0.2) + (features['away_b2b'] * -0.3)
+        features['rest_diff'] = (features['home_rest_days'] - features['away_rest_days']).fillna(0.0)
+        features['schedule_density_diff'] = (
+            features['home_3in4'] - features['away_3in4'] +
+            0.5 * (features['home_4in6'] - features['away_4in6'])
+        )
+        travel_series = features['travel_km'].fillna(0.0) if 'travel_km' in features.columns else pd.Series(0.0, index=features.index)
+        features['travel_fatigue_index'] = travel_series / 1000.0 - 0.15 * features['rest_diff']
         
         # Rivalry detection
         rivalry_pairs = [
@@ -1624,6 +1653,17 @@ class RealDataNHLModel:
         )
         
         features['final_prediction_base'] = features['base_total_prediction'] + features['total_adjustments']
+        # Special teams composite metrics (higher => special teams edge for OVER)
+        def _safe_series(col: str, default: float = 2.0) -> pd.Series:
+            if col not in features.columns:
+                return pd.Series(default, index=features.index)
+            return pd.to_numeric(features[col], errors='coerce').fillna(default)
+        home_pp = _safe_series('home_pp_xgf60')
+        away_pp = _safe_series('away_pp_xgf60')
+        home_pk = _safe_series('home_pk_xga60', default=2.0)
+        away_pk = _safe_series('away_pk_xga60', default=2.0)
+        features['special_teams_index'] = (home_pp - away_pk) + (away_pp - home_pk)
+        features['special_teams_diff'] = (home_pp - away_pp)
 
         # Timezone-based features (coarse mapping by team)
         def team_tz_offset(team: str) -> int:
@@ -1758,25 +1798,39 @@ class RealDataNHLModel:
             # Convert xGF/60 to per-game proxy with scale; heuristic factor 0.6
             features[f'{team}_finish_delta'] = gpg_ewm - (0.6 * xgf60)
 
+        # Shooting and save percentage trends (rolling 5 games, leak-free)
+        for team in ['home', 'away']:
+            team_col = f'{team}_team'
+            goals_col = f'{team}_goals'
+            shots_col = f'{team}_shots'
+            opp_goals_col = f'{"away" if team == "home" else "home"}_goals'
+            opp_shots_col = f'{"away" if team == "home" else "home"}_shots'
+
+            goals_roll = lagged_rolling_sum(team_col, goals_col, window=5, min_periods=2, fill_value=0.0)
+            shots_roll = lagged_rolling_sum(team_col, shots_col, window=5, min_periods=2, fill_value=0.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                shoot_pct = goals_roll / shots_roll.replace(0.0, np.nan)
+            features[f'{team}_shoot_pct_l5'] = shoot_pct.clip(0.05, 0.4).fillna(0.1)
+
+            goals_allowed_roll = lagged_rolling_sum(team_col, opp_goals_col, window=5, min_periods=2, fill_value=0.0)
+            shots_faced_roll = lagged_rolling_sum(team_col, opp_shots_col, window=5, min_periods=2, fill_value=0.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                save_pct = 1.0 - (goals_allowed_roll / shots_faced_roll.replace(0.0, np.nan))
+            features[f'{team}_save_pct_l5'] = save_pct.clip(0.75, 0.99).fillna(0.92)
+
         # EWM variants for stability/recency
         for team in ['home', 'away']:
-            for metric_base, src_col in [('gpg_ewm', f'{team}_goals'), ('gag_ewm', f'{"away" if team=="home" else "home"}_goals')]:
-                ewm_series = (
-                    features.groupby(f'{team}_team')[src_col]
-                    .apply(lambda s: s.shift().ewm(alpha=0.3, min_periods=2).mean())
-                    .reset_index(level=0, drop=True)
-                )
-                features[f'{team}_{metric_base}'] = ewm_series.fillna(3.0)
+            team_col = f'{team}_team'
+            opp_goals_col = f'{"away" if team=="home" else "home"}_goals'
+            features[f'{team}_gpg_ewm'] = lagged_ewm(team_col, f'{team}_goals', alpha=0.3, fill_value=3.0)
+            features[f'{team}_gag_ewm'] = lagged_ewm(team_col, opp_goals_col, alpha=0.3, fill_value=3.0)
             # EWM for xGF/60 and HDCF/60 proxies
             for metric in ['5v5_xgf60', '5v5_hdcf60']:
                 col = f'{team}_{metric}'
-                ewm_series = (
-                    features.groupby(f'{team}_team')[col]
-                    .apply(lambda s: s.shift().ewm(alpha=0.3, min_periods=2).mean())
-                    .reset_index(level=0, drop=True)
-                )
                 prefix = metric.split('_')[0]
-                features[f"{team}_{prefix}_ewm"] = ewm_series.fillna(features[col].fillna(0.0))
+                base_series = features[col] if col in features.columns else pd.Series(0.0, index=features.index)
+                ewm_series = lagged_ewm(team_col, col, alpha=0.3, fill_value=None)
+                features[f"{team}_{prefix}_ewm"] = ewm_series.fillna(base_series.fillna(0.0))
 
         # Score-state pace proxies: use EWM goal differential by team
         try:
@@ -2372,10 +2426,10 @@ class RealDataNHLModel:
         feature_cols = [
             'home_gpg_l3', 'away_gpg_l3', 'home_gpg_l5', 'away_gpg_l5', 'home_gpg_l10', 'away_gpg_l10',
             'home_gag_l3', 'away_gag_l3', 'home_gag_l5', 'away_gag_l5', 'home_gag_l10', 'away_gag_l10',
-            'combined_gpg', 'combined_gag', 'expected_pace', 'pace_variance',
+            'combined_gpg', 'combined_gag', 'expected_pace', 'pace_variance', 'pace_zscore',
             'venue_total_avg', 'altitude_bonus', 'rivalry_boost', 'b2b_penalty',
-            'home_b2b', 'away_b2b', 'season_progress', 'late_season',
-            'base_total_prediction', 'total_adjustments', 'final_prediction_base',
+            'home_b2b', 'away_b2b', 'season_progress', 'late_season', 'rest_diff', 'schedule_density_diff',
+            'base_total_prediction', 'total_adjustments', 'final_prediction_base', 'travel_fatigue_index',
             'timezone_diff', 'travel_penalty', 'home_elo', 'away_elo', 'elo_diff',
             'sos_elo', 'home_sos_true', 'away_sos_true', 'sos_true_diff',
             'home_3in4','away_3in4','home_4in6','away_4in6',
@@ -2386,10 +2440,12 @@ class RealDataNHLModel:
             'home_pp_xgf60', 'away_pp_xgf60', 'home_pk_xga60', 'away_pk_xga60',
             'home_gsax_ewm', 'away_gsax_ewm', 'travel_km',
             'home_gpg_ewm', 'away_gpg_ewm', 'home_gag_ewm', 'away_gag_ewm',
-            'home_5v5_ewm', 'away_5v5_ewm',
+            'home_5v5_ewm', 'away_5v5_ewm', 'home_shoot_pct_l5', 'away_shoot_pct_l5',
+            'home_save_pct_l5', 'away_save_pct_l5',
             # Shot quality/creation
             'home_rush60','away_rush60','home_rebounds60','away_rebounds60','home_slot60','away_slot60',
-            'home_finish_delta','away_finish_delta'
+            'home_finish_delta','away_finish_delta',
+            'special_teams_index','special_teams_diff'
         ]
         # Add rink bias proxy and penalties
         extra_optional = [
@@ -2487,6 +2543,24 @@ class RealDataNHLModel:
         )
         gb_search.fit(X_train_scaled, y_train)
 
+        hgb_base = HistGradientBoostingRegressor(
+            random_state=42,
+            early_stopping=True,
+            loss='squared_error'
+        )
+        hgb_params = {
+            'learning_rate': [0.03, 0.05, 0.08, 0.1],
+            'max_iter': [225, 275, 325, 375],
+            'max_depth': [None, 3, 5, 7],
+            'min_samples_leaf': [10, 15, 20, 30],
+            'l2_regularization': [0.0, 0.1, 0.3, 0.6]
+        }
+        hgb_search = RandomizedSearchCV(
+            hgb_base, hgb_params, n_iter=8, cv=tscv, random_state=42,
+            scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
+        )
+        hgb_search.fit(X_train_scaled, y_train)
+
         ridge_base = Ridge()
         ridge_params = {'alpha': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]}
         ridge_search = RandomizedSearchCV(
@@ -2496,42 +2570,54 @@ class RealDataNHLModel:
         ridge_search.fit(X_train_scaled, y_train)
 
         # Collect tuned models
+        model_order = ['rf', 'gb', 'ridge', 'hgb']
         models = {
             'rf': rf_search.best_estimator_,
             'gb': gb_search.best_estimator_,
-            'ridge': ridge_search.best_estimator_
+            'ridge': ridge_search.best_estimator_,
+            'hgb': hgb_search.best_estimator_
         }
 
         # Learn stacking weights via OOF predictions across time-series splits
-        weights_array = np.array([0.45, 0.35, 0.20], dtype=float)
+        weights_array = np.array([0.32, 0.28, 0.20, 0.20], dtype=float)
         try:
             X_all = X_sorted
             y_all = y_sorted
             if len(X_all) >= 40:
                 tscv_w = TimeSeriesSplit(n_splits=min(5, max(3, len(X_all)//20)))
-                oof = {k: np.full(len(X_all), np.nan) for k in models.keys()}
+                P = None
+                oof = {name: np.full(len(X_all), np.nan) for name in model_order}
                 for tr_idx, val_idx in tscv_w.split(X_all):
                     scaler_fold = StandardScaler()
                     X_tr_s = scaler_fold.fit_transform(X_all.iloc[tr_idx])
                     X_val_s = scaler_fold.transform(X_all.iloc[val_idx])
-                    for name, est in models.items():
+                    for name in model_order:
+                        est = models[name]
                         est_fold = type(est)(**est.get_params())
                         est_fold.fit(X_tr_s, y_all.iloc[tr_idx])
                         oof[name][val_idx] = est_fold.predict(X_val_s)
-                valid = ~np.isnan(next(iter(oof.values())))
-                P = np.vstack([oof['rf'][valid], oof['gb'][valid], oof['ridge'][valid]]).T
+                first_key = model_order[0]
+                valid = ~np.isnan(oof[first_key])
+                if valid.any():
+                    P = np.vstack([oof[name][valid] for name in model_order]).T
                 y_oof = y_all.iloc[valid].values
-                coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
-                coefs = np.clip(coefs, 0.0, None)
-                if coefs.sum() > 0:
-                    weights_array = coefs / coefs.sum()
+                if P is not None and P.size:
+                    coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
+                    coefs = np.clip(coefs, 0.0, None)
+                    if coefs.sum() > 0:
+                        weights_array = coefs / coefs.sum()
         except Exception:
             pass
+        if not np.isfinite(weights_array).all() or weights_array.sum() <= 0:
+            weights_array = np.ones(len(model_order), dtype=float) / len(model_order)
+        else:
+            weights_array = weights_array / weights_array.sum()
 
         # Final train/test fit for reporting and persistence
         trained_models = {}
         test_preds = []
-        for name, est in models.items():
+        for name in model_order:
+            est = models[name]
             est_final = type(est)(**est.get_params())
             est_final.fit(X_train_scaled, y_train)
             trained_models[name] = est_final
@@ -2575,6 +2661,7 @@ class RealDataNHLModel:
         # Store trained model
         self.total_model = {
             'models': trained_models,
+            'model_order': model_order,
             'weights': weights_array.tolist(),
             'scaler': self.scaler,
             'feature_names': self.feature_names,
@@ -2673,14 +2760,39 @@ class RealDataNHLModel:
         features_scaled = self.scaler.transform(game_features.reshape(1, -1))
         
         # Get predictions from ensemble
-        models = self.total_model['models']
-        weights = self.total_model['weights']
-        
-        rf_pred = models['rf'].predict(features_scaled)[0]
-        gb_pred = models['gb'].predict(features_scaled)[0]
-        ridge_pred = models['ridge'].predict(features_scaled)[0]
-        
-        ensemble_pred = weights[0] * rf_pred + weights[1] * gb_pred + weights[2] * ridge_pred
+        models = self.total_model.get('models', {})
+        weights = np.array(self.total_model.get('weights', []), dtype=float)
+        model_order = self.total_model.get('model_order', list(models.keys()))
+
+        preds: List[float] = []
+        for name in model_order:
+            estimator = models.get(name)
+            if estimator is None:
+                preds.append(0.0)
+                continue
+            try:
+                preds.append(float(estimator.predict(features_scaled)[0]))
+            except Exception:
+                preds.append(0.0)
+        if not preds:
+            raise ValueError("No trained ensemble models available for prediction")
+
+        preds_arr = np.array(preds, dtype=float)
+        if len(weights) != len(preds_arr):
+            if len(preds_arr) == 0:
+                weights = np.array([1.0], dtype=float)
+            elif len(weights) == 0:
+                weights = np.ones(len(preds_arr), dtype=float)
+            elif len(weights) > len(preds_arr):
+                weights = weights[:len(preds_arr)]
+            else:
+                pad_len = len(preds_arr) - len(weights)
+                pad_values = np.full(pad_len, weights.mean() if weights.size else 1.0)
+                weights = np.concatenate([weights, pad_values])
+        if not np.isfinite(weights).all() or weights.sum() <= 0:
+            weights = np.ones(len(preds_arr), dtype=float)
+        weights = weights / weights.sum()
+        ensemble_pred = float(np.dot(weights, preds_arr))
 
         # Poisson expected total
         poisson_model = self.total_model.get('poisson_model')
@@ -6015,7 +6127,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             defaults = {
                                 'home_gpg_l5': 3.0, 'away_gpg_l5': 3.0,
                                 'combined_gpg': 3.0, 'venue_total_avg': 6.2,
-                                'base_total_prediction': 6.2, 'final_prediction_base': 6.2
+                                'base_total_prediction': 6.2, 'final_prediction_base': 6.2,
+                                'pace_zscore': 0.0, 'rest_diff': 0.0, 'schedule_density_diff': 0.0,
+                                'travel_fatigue_index': 0.0,
+                                'home_shoot_pct_l5': 0.10, 'away_shoot_pct_l5': 0.10,
+                                'home_save_pct_l5': 0.92, 'away_save_pct_l5': 0.92,
+                                'special_teams_index': 0.0, 'special_teams_diff': 0.0
                             }
                             feature_values.append(defaults.get(feature_name, 0.0))
                     
