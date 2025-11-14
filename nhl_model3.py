@@ -3774,25 +3774,27 @@ class RealDataNHLModel:
                             assignment: Dict[str, Any] = {'referees': refs}
                             if current_matchup:
                                 assignment.update(current_matchup)
-                            stats_map: Dict[str, Dict[str, Any]] = {
-                                entry['name']: entry['stats']
-                                for entry in ref_entries
-                                if entry.get('stats')
-                            }
+                            stats_map: Dict[str, Dict[str, Any]] = {}
+                            goal_values: List[float] = []
+                            for entry in ref_entries:
+                                nm = entry.get('name')
+                                stats = entry.get('stats') if isinstance(entry, dict) else None
+                                if nm and isinstance(stats, dict) and stats:
+                                    stats_map[nm] = stats
+                                    val = stats.get('goals_gm')
+                                    if isinstance(val, (int, float)) and np.isfinite(val):
+                                        goal_values.append(float(val))
+                                elif nm:
+                                    stats_map.setdefault(nm, {})
                             if stats_map:
                                 assignment['referee_stats'] = stats_map
-                                goal_values = [
-                                    stats.get('goals_gm')
-                                    for stats in stats_map.values()
-                                    if isinstance(stats.get('goals_gm'), (int, float))
-                                ]
-                                goal_values = [float(v) for v in goal_values if v is not None]
-                                if goal_values:
-                                    try:
-                                        avg_val = float(np.mean(goal_values))
-                                        assignment['crew_goals_gm'] = round(avg_val, 3)
-                                    except Exception:
-                                        pass
+                            if goal_values:
+                                try:
+                                    trimmed = goal_values[:2] if len(goal_values) >= 2 else goal_values
+                                    avg_val = float(np.mean(trimmed))
+                                    assignment['crew_goals_gm'] = round(avg_val, 3)
+                                except Exception:
+                                    pass
                             assignments.append(assignment)
             if assignments:
                 return assignments
@@ -3900,24 +3902,51 @@ class RealDataNHLModel:
             return None, None
         try:
             df = referee_rates.copy()
-            cols = {c.lower(): c for c in df.columns}
+            cols = {str(c).strip().lower(): c for c in df.columns}
             ref_col = cols.get('ref') or cols.get('name') or cols.get('official')
             if not ref_col:
                 return None, None
-            goal_col = None
-            for key in ['goals/gm', 'goals per game', 'goals_per_game', 'goals gm', 'goalspg', 'gpg']:
+
+            goal_col: Optional[str] = None
+            goal_aliases = ['goals_gm', 'goals/gm', 'goals per game', 'goals_per_game', 'goals gm', 'goalspg', 'gpg', 'goalsgm']
+            for key in goal_aliases:
                 if key in cols:
                     goal_col = cols[key]
                     break
             if goal_col is None:
                 for lc, orig in cols.items():
-                    if re.search(r'goals\s*/?\s*g(m|ame)', lc) or re.search(r'goals\s*per\s*game', lc) or re.search(r'\bgpg\b', lc):
+                    normalized = re.sub(r'[_-]+', ' ', lc)
+                    if (
+                        re.search(r'goals\s*/?\s*g(m|ame)', normalized)
+                        or re.search(r'goals\s*per\s*game', normalized)
+                        or re.search(r'\bgpg\b', normalized)
+                        or 'goalspg' in normalized
+                    ):
                         goal_col = orig
                         break
+
             bias_col = cols.get('home_bias') or cols.get('homebias')
-            sub = df[df[ref_col].astype(str).str.upper().isin([n.upper() for n in crew_names])]
-            avg_goals = float(pd.to_numeric(sub[goal_col], errors='coerce').dropna().mean()) if goal_col and goal_col in sub else None
-            avg_b = float(pd.to_numeric(sub[bias_col], errors='coerce').dropna().mean()) if bias_col and bias_col in sub else None
+            order_map = {str(n).upper(): idx for idx, n in enumerate(crew_names)}
+            sub = df[df[ref_col].astype(str).str.upper().isin(order_map.keys())].copy()
+
+            avg_goals: Optional[float] = None
+            if goal_col and goal_col in sub.columns:
+                sub['__order'] = sub[ref_col].astype(str).str.upper().map(order_map)
+                sub = sub.dropna(subset=['__order']).sort_values('__order')
+                goal_series = pd.to_numeric(sub[goal_col], errors='coerce').dropna()
+                if not goal_series.empty:
+                    vals = [float(v) for v in goal_series.tolist() if np.isfinite(v)]
+                    if vals:
+                        trimmed = vals[:2] if len(vals) >= 2 else vals
+                        avg_goals = float(np.mean(trimmed))
+                sub = sub.drop(columns=['__order'], errors='ignore')
+
+            avg_b: Optional[float] = None
+            if bias_col and bias_col in sub.columns:
+                bias_series = pd.to_numeric(sub[bias_col], errors='coerce').dropna()
+                if not bias_series.empty:
+                    avg_b = float(bias_series.mean())
+
             return avg_goals, avg_b
         except Exception:
             return None, None
@@ -3990,12 +4019,22 @@ class RealDataNHLModel:
             pens_col: Optional[str] = None
             goal_col: Optional[str] = None
             bias_col: Optional[str] = None
+            goal_aliases = ['goals_gm', 'goals/gm', 'goals per game', 'goals_per_game', 'goals gm', 'goalspg', 'gpg', 'goalsgm']
+            for alias in goal_aliases:
+                if alias in lower_to_orig:
+                    goal_col = lower_to_orig[alias]
+                    break
             for lc, orig in lower_to_orig.items():
-                if goal_col is None and (
-                    lc == 'goals/gm' or 'goals/gm' in lc or 'goals per game' in lc or 'goals_per_game' in lc
-                    or 'goals gm' in lc or re.search(r'goals\s*/?\s*g(m|ame)', lc) or re.search(r'\bgpg\b', lc)
-                ):
-                    goal_col = orig
+                if goal_col is None:
+                    normalized = re.sub(r'[_-]+', ' ', lc)
+                    if (
+                        normalized == 'goals gm'
+                        or 'goals per game' in normalized
+                        or re.search(r'goals\s*/?\s*g(m|ame)', normalized)
+                        or re.search(r'\bgpg\b', normalized)
+                        or 'goalspg' in normalized
+                    ):
+                        goal_col = orig
                 if pens_col is None and (lc == 'penalties60' or 'pens60' in lc or 'penalties/60' in lc or re.search(r'pen[a-z]*\s*/?\s*60', lc)):
                     pens_col = orig
                 if bias_col is None and ('home_bias' in lc or 'home bias' in lc or lc == 'homebias'):
@@ -5635,6 +5674,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         detected_referees_url: Optional[str] = None
         referee_rates_fetched: Optional[pd.DataFrame] = None
         cached_referee_assignments_df: Optional[pd.DataFrame] = None
+        referee_default_path = os.getenv('REFEREE_RATES_PATH') or 'referees.csv'
+        if cli_args:
+            cli_ref_path = getattr(cli_args, 'referee_rates_path', None)
+            if not cli_ref_path:
+                setattr(cli_args, 'referee_rates_path', referee_default_path)
         
         # Optional auto-populate CSVs from URLs
         if cli_args and getattr(cli_args, 'auto_populate', False):
@@ -5726,10 +5770,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             except Exception as e:
                 print(f"⚠️  Auto-populate failed: {e}")
 
-        referee_rates_path = (
-            getattr(cli_args, 'referee_rates_path', None)
-            if cli_args else os.getenv('REFEREE_RATES_PATH', 'referees.csv')
-        )
+        referee_rates_path = getattr(cli_args, 'referee_rates_path', None) if cli_args else referee_default_path
+        if not referee_rates_path:
+            referee_rates_path = referee_default_path
         referees_url_config: Optional[str] = getattr(cli_args, 'referees_url', None) if cli_args else None
         if not referees_url_config:
             env_ref_url = os.getenv('REFEREES_URL')
