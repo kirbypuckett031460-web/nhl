@@ -463,8 +463,6 @@ class SocialMediaPoster:
     def __init__(self):
         self.twitter_api = None
         self.discord_webhook_url = None
-        self.streamlit_url = None
-        self.streamlit_link_posted = False
         self.discord_verify = True
         self.setup_credentials()
         if TWITTER_AVAILABLE:
@@ -485,7 +483,6 @@ class SocialMediaPoster:
         if not self.twitter_consumer_secret and api_secret:
             self.twitter_consumer_secret = api_secret
         self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-        self.streamlit_url = os.getenv('STREAMLIT_URL')
         
         # Always try to read social_config.json to backfill any missing fields
         try:
@@ -508,9 +505,6 @@ class SocialMediaPoster:
             if not self.discord_webhook_url:
                 self.discord_webhook_url = discord_config.get('webhook_url')
             
-            streamlit_config = config.get('streamlit', {})
-            if not self.streamlit_url:
-                self.streamlit_url = streamlit_config.get('url')
             # Honor DISCORD_INSECURE from env or config.deploy.discord_insecure
             insecure_env = os.getenv('DISCORD_INSECURE')
             if isinstance(insecure_env, str) and insecure_env.strip().lower() in ('1','true','yes','y'):
@@ -526,34 +520,12 @@ class SocialMediaPoster:
         try:
             dbg = {
                 'discord': 'yes' if bool(self.discord_webhook_url) else 'no',
-                'streamlit': 'yes' if bool(self.streamlit_url) else 'no',
                 'twitter': 'yes' if bool(self.twitter_bearer_token) else 'no'
             }
-            print(f"🔧 Social config -> Discord? {dbg['discord']} | Streamlit? {dbg['streamlit']} | Twitter? {dbg['twitter']}")
+            print(f"🔧 Social config -> Discord? {dbg['discord']} | Twitter? {dbg['twitter']}")
         except Exception:
             pass
 
-    def post_streamlit_link(self) -> bool:
-        """Post the Streamlit URL to Discord exactly once per run."""
-        if self.streamlit_link_posted:
-            return True
-        if not (self.streamlit_url and self.discord_webhook_url):
-            return False
-        try:
-            print("💬 Posting Streamlit link to Discord…")
-            requests.post(
-                self.discord_webhook_url,
-                json={"content": f"🔗 Streamlit Dashboard: {self.streamlit_url}"},
-                timeout=10,
-                verify=self.discord_verify
-            )
-            self.streamlit_link_posted = True
-            print("✅ Streamlit link posted to Discord")
-            return True
-        except Exception as e:
-            print(f"⚠️  Failed to post Streamlit link: {e}")
-            return False
-    
     def create_config_template(self):
         """Create a template configuration file"""
         template = {
@@ -569,9 +541,6 @@ class SocialMediaPoster:
             },
             "odds": {
                 "api_key": "YOUR_ODDS_API_KEY"
-            },
-            "streamlit": {
-                "url": "YOUR_STREAMLIT_URL"
             },
             "deploy": {
                 "method": "http",  # http | s3 | sftp
@@ -1108,11 +1077,9 @@ class SocialMediaPoster:
         else:
             results['twitter'] = False
         
-        # Minimal Discord mode: skip summary embed; only post dashboard image and Streamlit link elsewhere
+        # Minimal Discord mode: skip summary embed; rely on manual posting if needed
         print("💬 Skipping Discord summary (minimal mode)")
         results['discord'] = False
-        
-        # Streamlit link posting removed per request
         
         return results
 
@@ -1173,8 +1140,6 @@ class SocialMediaPoster:
                     resp = requests.post(self.discord_webhook_url, data=data, files=files, verify=self.discord_verify)
                     resp.raise_for_status()
                     print("✅ Dashboard image posted to Discord")
-                    # Also post Streamlit link if available (one-time)
-                    self.post_streamlit_link()
                     return True
             # Fallback: send a link to the local file path (Discord clients won't open local paths)
             print("ℹ️ Image render unavailable; posting local file path to Discord…")
@@ -1182,8 +1147,6 @@ class SocialMediaPoster:
             resp = requests.post(self.discord_webhook_url, json=payload, verify=self.discord_verify)
             resp.raise_for_status()
             print("✅ Dashboard link posted to Discord")
-            # Attempt Streamlit link as well (one-time)
-            self.post_streamlit_link()
             return True
         except Exception as e:
             print(f"❌ Discord dashboard posting failed: {e}")
@@ -5451,7 +5414,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
     if (sn0) {{ sn0.textContent = 'Initializing UI…'; }}
   }} catch(e) {{}}
 
-  // Client-side filter by Recommendation (works locally and attempts to in Streamlit iframe)
+    // Client-side filter by Recommendation (resilient to re-renders)
   window.applyFilters = function(){{
     try {{
       const recEl = document.getElementById('filterRec');
@@ -5541,7 +5504,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
     }};
   }});
 
-  // Resilient bindings for Streamlit re-renders
+    // Resilient bindings for dynamic re-renders
   const bindControls = () => {{
     // Ensure toolbar exists (do not overwrite static content)
     let bar = document.querySelector('.toolbar');
@@ -5568,7 +5531,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
     const mo = new MutationObserver(() => {{ bindControls(); }});
     mo.observe(document.body, {{ childList: true, subtree: true }});
   }} catch(e) {{}}
-  // Periodic safety rebinder for Streamlit iframe reflows
+    // Periodic safety rebinder for layout reflows
   try {{
     let tries = 0; const timer = setInterval(() => {{
       tries += 1; bindControls();
