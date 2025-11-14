@@ -189,6 +189,75 @@ def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
         print(f"⚠️  Could not prepare output path {path}: {e}")
         return None
 
+def gather_referee_output_paths(primary_path: Optional[str]) -> List[str]:
+    """Build an ordered list of referee CSV output paths, including mirrors."""
+
+    outputs: List[str] = []
+    seen: Set[str] = set()
+
+    def add_path(path_value: Optional[str]) -> None:
+        if path_value is None:
+            return
+        normalized = str(path_value).strip()
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        outputs.append(normalized)
+
+    add_path(primary_path)
+    if not outputs:
+        add_path('referees.csv')
+
+    mirror_paths = os.getenv('REFEREE_RATES_EXTRA_PATHS')
+    if mirror_paths:
+        for chunk in re.split(r'[;,]', mirror_paths):
+            add_path(chunk)
+
+    skip_windows_copy = str(os.getenv('REFEREE_RATES_SKIP_WINDOWS_COPY', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+    windows_override = os.getenv('REFEREE_RATES_WINDOWS_PATH')
+    if not skip_windows_copy:
+        if windows_override:
+            add_path(windows_override)
+        elif os.name == 'nt':
+            add_path(r'C:\nhl\referees.csv')
+
+    return outputs
+
+def write_dataframe_to_paths(
+    df: pd.DataFrame,
+    candidate_paths: List[str],
+    success_msg: str = "✅ Wrote referees",
+    failure_msg: str = "⚠️  Referee data fetched but could not write"
+) -> List[str]:
+    """Write a DataFrame to multiple locations; returns resolved paths that succeeded."""
+
+    written: List[str] = []
+
+    for raw_path in candidate_paths:
+        normalized = str(raw_path).strip() if raw_path is not None else ''
+        if not normalized:
+            continue
+
+        target_path = ensure_local_write_path(normalized)
+        if not target_path:
+            print(f"{failure_msg} to {normalized} (path is not writable)")
+            continue
+
+        if target_path in written:
+            continue
+
+        try:
+            df.to_csv(target_path, index=False)
+            print(f"{success_msg} to {target_path}")
+            written.append(target_path)
+        except Exception as e:
+            print(f"{failure_msg} to {target_path}: {e}")
+
+    return written
+
 @dataclass
 class OverUnderPrediction:
     """Structured over/under prediction with confidence metrics"""
@@ -5768,10 +5837,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         referee_rates_fetched: Optional[pd.DataFrame] = None
         cached_referee_assignments_df: Optional[pd.DataFrame] = None
         referee_default_path = os.getenv('REFEREE_RATES_PATH') or 'referees.csv'
-        if cli_args:
-            cli_ref_path = getattr(cli_args, 'referee_rates_path', None)
-            if not cli_ref_path:
-                setattr(cli_args, 'referee_rates_path', referee_default_path)
+        referee_path_preference = getattr(cli_args, 'referee_rates_path', None) if cli_args else None
+        if not referee_path_preference:
+            referee_path_preference = referee_default_path
+            if cli_args:
+                setattr(cli_args, 'referee_rates_path', referee_path_preference)
+        referee_primary_written_path: Optional[str] = None
         
         # Optional auto-populate CSVs from URLs
         if cli_args and getattr(cli_args, 'auto_populate', False):
@@ -5856,21 +5927,21 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         referee_rates_fetched = rr.copy()
                         if 'matchup' in rr.columns:
                             cached_referee_assignments_df = rr.copy()
-                        target_path = ensure_local_write_path(cli_args.referee_rates_path)
-                        if target_path:
-                            try:
-                                rr.to_csv(target_path, index=False)
-                                print(f"✅ Wrote referees to {target_path}")
-                            except Exception as e:
-                                print(f"⚠️  Referee data fetched but could not write to {target_path}: {e}")
-                        else:
-                            print(f"⚠️  Referee data fetched but could not write to {cli_args.referee_rates_path}")
+                        write_targets = gather_referee_output_paths(referee_path_preference)
+                        written_paths = write_dataframe_to_paths(
+                            rr,
+                            write_targets,
+                            success_msg="✅ Wrote referees",
+                            failure_msg="⚠️  Referee data fetched but could not write"
+                        )
+                        if written_paths and referee_primary_written_path is None:
+                            referee_primary_written_path = written_paths[0]
+                        if not written_paths and write_targets:
+                            print(f"⚠️  Referee data fetched but could not write to configured paths: {', '.join(write_targets)}")
             except Exception as e:
                 print(f"⚠️  Auto-populate failed: {e}")
 
-        referee_rates_path = getattr(cli_args, 'referee_rates_path', None) if cli_args else referee_default_path
-        if not referee_rates_path:
-            referee_rates_path = referee_default_path
+        referee_rates_path = referee_primary_written_path or referee_path_preference or referee_default_path
         referees_url_config: Optional[str] = getattr(cli_args, 'referees_url', None) if cli_args else resolved_cli_ref_url
         if not referees_url_config:
             env_ref_url = os.getenv('REFEREES_URL')
@@ -5920,16 +5991,18 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 if have_df and isinstance(referee_rates_fetched, pd.DataFrame):
                     if 'goals_gm' not in referee_rates_fetched.columns:
                         referee_rates_fetched['goals_gm'] = 6.2
-                    target_path = ensure_local_write_path(referee_rates_path)
-                    if target_path:
-                        try:
-                            referee_rates_fetched.to_csv(target_path, index=False)
-                            print(f"✅ Wrote referees to {target_path}")
-                            referee_rates_path = target_path
-                        except Exception as e:
-                            print(f"⚠️  Referee data fetched but could not write to {target_path}: {e}")
-                    else:
-                        print(f"⚠️  Referee data fetched but could not write to {referee_rates_path}")
+                    write_targets = gather_referee_output_paths(referee_path_preference)
+                    written_paths = write_dataframe_to_paths(
+                        referee_rates_fetched,
+                        write_targets,
+                        success_msg="✅ Wrote referees",
+                        failure_msg="⚠️  Referee data fetched but could not write"
+                    )
+                    if written_paths:
+                        referee_primary_written_path = written_paths[0]
+                        referee_rates_path = referee_primary_written_path
+                    elif write_targets:
+                        print(f"⚠️  Referee data fetched but could not write to configured paths: {', '.join(write_targets)}")
                 else:
                     print("⚠️  Referee data was not updated (empty result)")
         except Exception as e:
