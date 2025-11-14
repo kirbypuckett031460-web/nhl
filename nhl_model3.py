@@ -3651,6 +3651,7 @@ class RealDataNHLModel:
 
     def _parse_scoutingtherefs_tables(self, html_blob: str) -> List[Dict[str, Any]]:
         assignments: List[Dict[str, Any]] = []
+        tbd_keys: Set[str] = set()
         if not html_blob:
             return assignments
         try:
@@ -3659,6 +3660,28 @@ class RealDataNHLModel:
             if soup:
                 entry = soup.find('div', class_='entry-content') or soup
                 current_matchup: Optional[Dict[str, Optional[str]]] = None
+                def build_match_key(info: Optional[Dict[str, Any]]) -> str:
+                    if not isinstance(info, dict):
+                        return ''
+                    mk = info.get('matchup')
+                    if mk:
+                        return str(mk).upper()
+                    away = info.get('away_abbr') or self._normalize_team_key(info.get('away_name'))
+                    home = info.get('home_abbr') or self._normalize_team_key(info.get('home_name'))
+                    if away and home:
+                        return f"{away}@{home}".upper()
+                    return ''
+                def register_tbd_assignment(match_info: Dict[str, Any], reason_text: str) -> None:
+                    key = build_match_key(match_info)
+                    if not key or key in tbd_keys:
+                        return
+                    placeholder = dict(match_info)
+                    placeholder['referees'] = ['TBD SLOT A', 'TBD SLOT B']
+                    placeholder['status'] = reason_text.strip() or 'TBD'
+                    placeholder['tbd'] = True
+                    placeholder['tbd_reason'] = reason_text.strip()
+                    assignments.append(placeholder)
+                    tbd_keys.add(key)
                 for node in entry.children:
                     if not getattr(node, 'name', None):
                         continue
@@ -3668,6 +3691,14 @@ class RealDataNHLModel:
                         match_info = self._extract_matchup_from_text(text, alias_map)
                         if match_info:
                             current_matchup = match_info
+                            continue
+                        if (
+                            current_matchup
+                            and text
+                            and 'referee' in text.lower()
+                            and any(token in text.lower() for token in ('tbd', 'to be determined', 'not yet announced'))
+                        ):
+                            register_tbd_assignment(current_matchup, text)
                             continue
                     if tag == 'table':
                         classes = [str(c) for c in (node.get('class') or [])]
@@ -3754,6 +3785,13 @@ class RealDataNHLModel:
                             assignment: Dict[str, Any] = {'referees': refs}
                             if current_matchup:
                                 assignment.update(current_matchup)
+                            match_key = build_match_key(assignment)
+                            if match_key and match_key in tbd_keys:
+                                assignments = [
+                                    a for a in assignments
+                                    if not (a.get('tbd') and build_match_key(a) == match_key)
+                                ]
+                                tbd_keys.discard(match_key)
                             stats_map: Dict[str, Dict[str, Any]] = {}
                             goal_values: List[float] = []
                             for entry in ref_entries:
@@ -4169,8 +4207,11 @@ class RealDataNHLModel:
                 for assignment in assignments:
                     refs = [self._clean_ref_name(nm) for nm in assignment.get('referees', []) if nm]
                     refs = [nm for nm in refs if nm]
+                    is_tbd_assignment = bool(assignment.get('tbd'))
                     if not refs:
-                        continue
+                        if not is_tbd_assignment:
+                            continue
+                        refs = ['TBD']
                     away = assignment.get('away_abbr')
                     home = assignment.get('home_abbr')
                     away_name = assignment.get('away_name')
@@ -4209,6 +4250,9 @@ class RealDataNHLModel:
                         return None
 
                     crew_goal_float = coerce_float(crew_goal_val)
+                    status_text = assignment.get('status')
+                    if not status_text and is_tbd_assignment:
+                        status_text = 'Referees TBD'
 
                     for nm in refs:
                         stats_for_ref = stats_lookup.get(nm, {})
@@ -4221,12 +4265,23 @@ class RealDataNHLModel:
                             'away_name': away_name,
                             'home_name': home_name,
                             'goals_gm': goals_val,
-                            'crew_goals_gm': crew_goal_float
+                            'crew_goals_gm': crew_goal_float,
+                            'status': status_text,
+                            'tbd': is_tbd_assignment,
+                            'tbd_reason': assignment.get('tbd_reason')
                         })
 
             if assignment_records:
                 df = pd.DataFrame(assignment_records).drop_duplicates(subset=['matchup', 'ref']).reset_index(drop=True)
                 df['ref'] = df['ref'].astype(str)
+                try:
+                    tbd_rows = df[df.get('tbd') == True]
+                    if isinstance(tbd_rows, pd.DataFrame) and len(tbd_rows):
+                        pending = sorted({str(val) for val in tbd_rows.get('matchup').dropna().unique()})
+                        if pending:
+                            print(f"ℹ️  Referees still TBD on scoutingtherefs.com for: {', '.join(pending)}")
+                except Exception:
+                    pass
                 return df
 
             sorted_names = sorted(nm for nm in names if nm)
