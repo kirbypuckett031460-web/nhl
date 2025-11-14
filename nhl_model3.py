@@ -3600,13 +3600,18 @@ class RealDataNHLModel:
             return None
         normalized = html_parser.unescape(text)
         normalized = normalized.replace('\u2013', ' - ').replace('\u2014', ' - ')
-        match = re.search(r'([A-Za-z0-9 .\'’&-]+?)\s+at\s+([A-Za-z0-9 .\'’&-]+)', normalized, flags=re.IGNORECASE)
+        matchup_pattern = r'([A-Za-z0-9 .\'’&-]+?)\s+(?:at|vs\.?|versus)\s+([A-Za-z0-9 .\'’&-]+)'
+        match = re.search(matchup_pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            match = re.search(r'([A-Za-z0-9 .\'’&-]+?)\s*@\s*([A-Za-z0-9 .\'’&-]+)', normalized, flags=re.IGNORECASE)
         if not match:
             return None
         away_raw = match.group(1).strip()
         home_raw = match.group(2).strip()
 
         def clean_team(val: str) -> str:
+            val = re.sub(r'^(?:NHL\s+)?(?:Global|Heritage|Stadium|Winter)\s+Series\s+', '', val, flags=re.IGNORECASE)
+            val = re.sub(r'^NHL\s+', '', val, flags=re.IGNORECASE)
             val = re.sub(r'\s+[-–—]\s+.*$', '', val)
             val = re.sub(r'\s+\d{1,2}:\d{2}\s*(?:[AP]M)?\s*(?:ET|CT|MT|PT)?\b.*$', '', val, flags=re.IGNORECASE)
             val = re.sub(r'\s+\d{4}\b.*$', '', val)
@@ -3614,10 +3619,22 @@ class RealDataNHLModel:
             val = re.sub(r'\s+\d+\s*$', '', val)
             return " ".join(val.split())
 
-        away_name = clean_team(away_raw)
-        home_name = clean_team(home_raw)
-        away_abbr = alias_map.get(self._normalize_team_key(away_name))
-        home_abbr = alias_map.get(self._normalize_team_key(home_name))
+        def resolve_team(raw_val: str) -> Tuple[str, Optional[str]]:
+            cleaned = clean_team(raw_val)
+            key = self._normalize_team_key(cleaned)
+            abbr = alias_map.get(key)
+            if abbr or not cleaned:
+                return cleaned, abbr
+            parts = cleaned.split()
+            for start in range(1, len(parts)):
+                candidate = " ".join(parts[start:])
+                abbr = alias_map.get(self._normalize_team_key(candidate))
+                if abbr:
+                    return candidate, abbr
+            return cleaned, None
+
+        away_name, away_abbr = resolve_team(away_raw)
+        home_name, home_abbr = resolve_team(home_raw)
         matchup = None
         if away_abbr and home_abbr:
             matchup = f"{away_abbr}@{home_abbr}"

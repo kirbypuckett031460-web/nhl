@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NHL Over/Under Analytics Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container { 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            background: white; 
+            border-radius: 15px; 
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50, #3498db);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .toolbar input, .toolbar select, .toolbar button {
+            padding: 8px 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            padding: 25px;
+            border-radius: 10px;
+            border-left: 5px solid #3498db;
+        }
+        
+        .metric-card h3 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 1.1rem;
+        }
+        
+        .metric-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #27ae60;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        
+        th {
+            background: linear-gradient(135deg, #34495e, #2c3e50);
+            color: white;
+            padding: 15px 10px;
+            text-align: left;
+            font-weight: 600;
+        }
+        
+        td {
+            padding: 12px 10px;
+            border-bottom: 1px solid #ecf0f1;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .rec-over {
+            background: linear-gradient(135deg, #d5f4e6, #b8e6cc);
+            color: #27ae60;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .rec-under {
+            background: linear-gradient(135deg, #fadbd8, #f1948a);
+            color: #e74c3c;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .rec-no-bet {
+            background: linear-gradient(135deg, #fdeaa7, #f9e79f);
+            color: #f39c12;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .status-bar {
+            background: linear-gradient(135deg, #e8f5e8, #d5f4e6);
+            border: 1px solid #27ae60;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 30px;
+            text-align: center;
+            color: #27ae60;
+            font-weight: 500;
+        }
+        .legend {
+            margin: 12px 0 6px 0;
+            font-size: 0.9rem;
+            color: #2c3e50;
+            background: #f9fbfd;
+            border: 1px solid #e1e8f0;
+            border-radius: 8px;
+            padding: 10px 14px;
+        }
+        .legend strong { display: inline-block; margin-bottom: 6px; }
+        .legend ul { margin-left: 18px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏒 NHL Over/Under Analytics Dashboard</h1>
+            <p>Real-time predictions powered by machine learning</p>
+        </div>
+        
+        <div class="content">
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <h3>📊 Model Performance</h3>
+                    <div class="metric-value">2.326</div>
+                </div>
+                
+                <div class="metric-card">
+                    <h3>🎯 Over/Under Accuracy</h3>
+                    <div class="metric-value">33.8%</div>
+                </div>
+                
+                <div class="metric-card">
+                    <h3>💰 Betting Opportunities</h3>
+                    <div class="metric-value">0</div>
+                </div>
+                
+                <div class="metric-card">
+                    <h3>🔥 Average Confidence</h3>
+                    <div class="metric-value">0%</div>
+                </div>
+            </div>
+            
+            <h2>🎯 Today's Predictions</h2>
+
+            <div class="legend">
+                <strong>Legend</strong>
+                <ul>
+                    <li><b>Line</b>: Market total for the game.</li>
+                    <li><b>Prediction</b>: Model total with 90% CI.</li>
+                    <li><b>Edge</b>: Predicted total minus line (positive favors OVER).</li>
+                    <li><b>Over% / Under%</b>: Probability estimates for each side (Fair shows no‑vig).</li>
+                    <li><b>Confidence</b>: Composite score (edge, calibration, dispersion, movement).</li>
+                    <li><b>Refs</b>: Assigned crew with scoring and bias tendencies.</li>
+                    <li><b>Env</b>: Outdoor flag, local start hour, temperature.</li>
+                    <li><b>Lineup</b>: Aggregate lineup strength (Home/Away).</li>
+                    <li><b>Recommendation</b>: OVER/UNDER/No Bet based on thresholds.</li>
+                    <li><b>Kelly%</b>: Suggested stake (scaled for risk/dispersion).</li>
+                </ul>
+            </div>
+
+            <div class="toolbar">
+                <select id="filterRec" onchange="window.applyFilters && window.applyFilters()">
+                    <option value="All">All</option>
+                    <option value="OVER">OVER</option>
+                    <option value="UNDER">UNDER</option>
+                    <option value="No Bet">No Bet</option>
+                </select>
+                <button id="exportCsv" type="button" onclick="window.toCsv && window.toCsv()">Export CSV</button>
+                <button id="copyBest" type="button" onclick="window.copyBestBets && window.copyBestBets()">Copy Best Bets</button>
+            </div>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>🏒 Matchup</th>
+                        <th>📊 Line</th>
+                        <th>🔮 Prediction</th>
+                        <th>⚡ Edge</th>
+                        <th>📈 Over %</th>
+                        <th>📉 Under %</th>
+                        <th>🔥 Confidence</th>
+                        <th>🧑‍⚖️ Refs</th>
+                        <th>🌤️ Env</th>
+                        <th>👥 Lineup</th>
+                        <th>💡 Recommendation</th>
+                        <th>💰 Kelly %</th>
+                    </tr>
+                </thead>
+                <tbody>
+
+        <tr data-gid="2025020276" data-rec="No Bet" data-matchup="SJS @ CGY"
+            data-ref-crew=""
+            data-ref-avg="6.162"
+            data-ref-bias=""
+            data-ref-source="https://scoutingtherefs.com/2025/11/50233/todays-nhl-referees-and-linespersons-11-12-25/"
+            data-ref-adjust="0.000">
+            <td><strong>SJS @ CGY</strong></td>
+            <td>6.5</td>
+            <td><strong style="color: #2c3e50;">6.40</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 2.7–10.0 </div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
+            </td>
+            <td style="color: #95a5a6; font-weight: bold;">-0.10
+                <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
+            </td>
+            <td>28%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
+                </div>
+            </td>
+            <td>72%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
+                </div>
+            </td>
+            <td>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
+                        <div style="width: 55.23085081619502%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                    </div>
+                    <span>55%</span>
+                </div>
+            </td>
+            <td>(6.16 G/G)<div style="font-size: 0.8rem; color:#7f8c8d;">6.16 G/G</div></td>
+            <td>12:00AM 0°F</td>
+            <td>H:0.00/A:0.00</td>
+            <td>
+                <span class="rec-no-bet">No Bet</span>
+            </td>
+            <td>0.0%</td>
+        </tr>
+        <tr data-gid="2025020277" data-rec="No Bet" data-matchup="NYI @ VGK"
+            data-ref-crew=""
+            data-ref-avg="6.162"
+            data-ref-bias=""
+            data-ref-source="https://scoutingtherefs.com/2025/11/50233/todays-nhl-referees-and-linespersons-11-12-25/"
+            data-ref-adjust="0.000">
+            <td><strong>NYI @ VGK</strong></td>
+            <td>6.5</td>
+            <td><strong style="color: #2c3e50;">6.59</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 2.9–10.1 </div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
+            </td>
+            <td style="color: #95a5a6; font-weight: bold;">+0.09
+                <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
+            </td>
+            <td>57%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
+                </div>
+            </td>
+            <td>43%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
+                </div>
+            </td>
+            <td>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
+                        <div style="width: 41.47645105606603%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                    </div>
+                    <span>41%</span>
+                </div>
+            </td>
+            <td>(6.16 G/G)<div style="font-size: 0.8rem; color:#7f8c8d;">6.16 G/G</div></td>
+            <td>12:00AM 0°F</td>
+            <td>H:0.00/A:0.00</td>
+            <td>
+                <span class="rec-no-bet">No Bet</span>
+            </td>
+            <td>0.0%</td>
+        </tr>
+        <tr data-gid="2025020278" data-rec="No Bet" data-matchup="WPG @ SEA"
+            data-ref-crew=""
+            data-ref-avg="6.162"
+            data-ref-bias=""
+            data-ref-source="https://scoutingtherefs.com/2025/11/50233/todays-nhl-referees-and-linespersons-11-12-25/"
+            data-ref-adjust="0.000">
+            <td><strong>WPG @ SEA</strong></td>
+            <td>6.5</td>
+            <td><strong style="color: #2c3e50;">5.90</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 2.3–9.5 </div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
+            </td>
+            <td style="color: #e74c3c; font-weight: bold;">-0.60
+                <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
+            </td>
+            <td>57%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
+                </div>
+            </td>
+            <td>43%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
+                </div>
+            </td>
+            <td>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
+                        <div style="width: 50.43381559467252%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                    </div>
+                    <span>50%</span>
+                </div>
+            </td>
+            <td>(6.16 G/G)<div style="font-size: 0.8rem; color:#7f8c8d;">6.16 G/G</div></td>
+            <td>12:00AM 0°F</td>
+            <td>H:0.00/A:0.00</td>
+            <td>
+                <span class="rec-no-bet">No Bet</span>
+            </td>
+            <td>0.0%</td>
+        </tr>
+                </tbody>
+            </table>
+
+           <script>
+// Bind resiliently to window to survive re-renders
+(function(){
+  const table = document.querySelector('table'); if (!table) return;
+  const tbody = table.querySelector('tbody');
+  const getRows = () => Array.from(tbody.querySelectorAll('tr'));
+  const norm = s => (s || '').replace(/ /g,' ').trim();
+  try {
+    let sn0 = document.getElementById('status-note');
+    if (!sn0) {
+      const sb = document.querySelector('.status-bar');
+      if (sb) { sn0 = document.createElement('span'); sn0.id = 'status-note'; sb.appendChild(document.createTextNode(' ')); sb.appendChild(sn0); }
+    }
+    if (sn0) { sn0.textContent = 'Initializing UI…'; }
+  } catch(e) {}
+
+    // Client-side filter by Recommendation (resilient to re-renders)
+  window.applyFilters = function(){
+    try {
+      const recEl = document.getElementById('filterRec');
+      const recUpper = norm(recEl && recEl.value).toUpperCase();
+      getRows().forEach(tr => {
+        // Fallbacks: use cell text if data-attrs missing
+        let recAttr = norm(tr.getAttribute('data-rec'));
+        if (!recAttr) {
+          const recCell = Array.from(tr.children).find(td => td && td.querySelector && td.querySelector('.rec-over, .rec-under, .rec-no-bet'));
+          if (recCell) { recAttr = norm(recCell.innerText); }
+        }
+        const recUpperRow = (recAttr || '').toUpperCase();
+        const matchRec = !recUpper || recUpper === 'ALL' || recUpperRow === recUpper;
+        tr.style.display = matchRec ? 'table-row' : 'none';
+      });
+    } catch(e) { console.log('applyFilters error', e); }
+  };
+
+    window.toCsv = function(){
+      const headers = Array.from(table.querySelectorAll('thead th')).map(th => norm(th.innerText));
+      const extraHeaders = ['Referee Crew','Referee Avg Goals','Referee Home Bias','Referee Source','Ref Goal Adjustment'];
+      const quote = value => '"' + value.replace(/"/g,'""') + '"';
+      const lines = [headers.concat(extraHeaders).join(',')];
+      getRows().forEach(tr => {
+        if (tr.style.display === 'none') return;
+        const baseCols = Array.from(tr.children).map(td => quote(norm(td.innerText)));
+        const extraCols = [
+          quote(norm(tr.getAttribute('data-ref-crew') || tr.dataset.refCrew || '')),
+          quote(norm(tr.getAttribute('data-ref-avg') || tr.dataset.refAvg || '')),
+          quote(norm(tr.getAttribute('data-ref-bias') || tr.dataset.refBias || '')),
+          quote(norm(tr.getAttribute('data-ref-source') || tr.dataset.refSource || '')),
+          quote(norm(tr.getAttribute('data-ref-adjust') || tr.dataset.refAdjust || ''))
+        ];
+        lines.push(baseCols.concat(extraCols).join(','));
+      });
+    const csv = '﻿' + lines.join('
+');
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.style.display='none'; a.href=url; a.download='predictions.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  window.copyBestBets = function(){
+    const lines = [];
+    getRows().forEach(tr => {
+      if (tr.style.display === 'none') return;
+      const recAttr = norm(tr.getAttribute('data-rec'));
+      if (recAttr === 'No Bet') return;
+      const matchup = norm(tr.getAttribute('data-matchup')) || norm(tr.children[0] && tr.children[0].innerText);
+      const line = norm(tr.children[1] && tr.children[1].innerText);
+      const pred = norm((tr.children[2] && tr.children[2].innerText) || '').replace('\n',' ');
+      const edge = norm(tr.children[3] && tr.children[3].innerText);
+      lines.push(matchup + ': ' + recAttr + ' ' + line + ' (Pred ' + pred + ', ' + edge + ')');
+    });
+    const text = lines.join('
+');
+    function fallbackCopy(){
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position='fixed'; ta.style.top='-1000px';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      try { document.execCommand('copy'); alert('Best bets copied to clipboard'); } catch(e) {}
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => { alert('Best bets copied to clipboard'); }).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
+  };
+
+  Array.from(table.querySelectorAll('thead th')).forEach((th, idx) => {
+    th.style.cursor = 'pointer';
+    th.onclick = function(){
+      const dir = th.getAttribute('data-sort') === 'asc' ? -1 : 1;
+      const rows = getRows();
+      rows.sort((a,b) => {
+        const av = norm(a.children[idx] && a.children[idx].innerText);
+        const bv = norm(b.children[idx] && b.children[idx].innerText);
+        const an = parseFloat(av.replace(/[^0-9.-]/g,'')); const bn = parseFloat(bv.replace(/[^0-9.-]/g,''));
+        if (!isNaN(an) && !isNaN(bn)) return dir*(an-bn);
+        return dir*av.localeCompare(bv);
+      });
+      tbody.innerHTML = '';
+      rows.forEach(tr => tbody.appendChild(tr));
+      th.setAttribute('data-sort', dir===1 ? 'asc' : 'desc');
+    };
+  });
+
+    // Resilient bindings for dynamic re-renders
+  const bindControls = () => {
+    // Ensure toolbar exists (do not overwrite static content)
+    let bar = document.querySelector('.toolbar');
+    if (!bar) {
+      bar = document.createElement('div'); bar.className = 'toolbar';
+      const container = table.closest('.content') || document.body;
+      container.insertBefore(bar, table);
+      // Hydrate defaults if we had to create it
+      bar.innerHTML = '<select id="filterRec"><option value="All">All</option><option value="OVER">OVER</option><option value="UNDER">UNDER</option><option value="No Bet">No Bet</option></select> <button id="exportCsv" type="button">Export CSV</button> <button id="copyBest" type="button">Copy Best Bets</button>';
+    }
+    const recEl = document.getElementById('filterRec');
+    const expEl = document.getElementById('exportCsv');
+    const copyEl = document.getElementById('copyBest');
+    if (recEl && !recEl._bound) { recEl.addEventListener('change', () => { try { window.applyFilters && window.applyFilters(); } catch(e) { console.log('applyFilters error', e); } }); recEl._bound = true; }
+    if (expEl && !expEl._bound) { expEl.addEventListener('click', () => { try { window.toCsv && window.toCsv(); } catch(e) { console.log('toCsv error', e); } }); expEl._bound = true; }
+    if (copyEl && !copyEl._bound) { copyEl.addEventListener('click', () => { try { window.copyBestBets && window.copyBestBets(); } catch(e) { console.log('copyBestBets error', e); } }); copyEl._bound = true; }
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => { bindControls(); window.applyFilters && window.applyFilters(); });
+  } else {
+    bindControls();
+  }
+  try {
+    const mo = new MutationObserver(() => { bindControls(); });
+    mo.observe(document.body, { childList: true, subtree: true });
+  } catch(e) {}
+    // Periodic safety rebinder for layout reflows
+  try {
+    let tries = 0; const timer = setInterval(() => {
+      tries += 1; bindControls();
+      if (tries >= 20) clearInterval(timer);
+    }, 500);
+  } catch(e) {}
+
+  try {
+    window.applyFilters();
+    let sn = document.getElementById('status-note');
+    if (!sn) {
+      const sb = document.querySelector('.status-bar');
+      if (sb) { sn = document.createElement('span'); sn.id = 'status-note'; sb.appendChild(document.createTextNode(' ')); sb.appendChild(sn); }
+    }
+    if (sn) { sn.textContent = 'UI ready — filters active (' + (typeof window.applyFilters) + ', ' + (typeof window.copyBestBets) + ')'; }
+  } catch(e) {
+    let sn = document.getElementById('status-note');
+    if (!sn) {
+      const sb = document.querySelector('.status-bar');
+      if (sb) { sn = document.createElement('span'); sn.id = 'status-note'; sb.appendChild(document.createTextNode(' ')); sb.appendChild(sn); }
+    }
+    if (sn) { sn.textContent = 'UI init failed'; }
+  }
+})();
+</script>
+            
+
+           
+            
+            <div class="status-bar">
+                <strong>🟢 Model Status:</strong> ACTIVE |
+                <strong>📊 Training Data:</strong> 192 games |
+                <strong>🕐 Last Updated:</strong> 2025-11-14 01:17:32 PM EST |
+                <span id="status-note"></span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
