@@ -124,7 +124,7 @@ def run_model():
         xg_path=None, xg_baseline_total=6.2, xg_clamp_abs=2.0,
         kelly_mult=0.5, kelly_cap=2.0, daily_exposure_cap=6.0,
         team_rates_path=str(team_rates_csv), goalie_gsax_path=None,
-        penalty_rates_path=None, referee_rates_path=None,
+        penalty_rates_path=None, referee_rates_path=str(root / "referees.csv"),
         environment_path=str(root / "environment.json"), env_refresh=True,
         lineup_path=str(lineup_csv),
         auto_populate=False,
