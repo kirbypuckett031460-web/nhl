@@ -19,7 +19,7 @@ from sklearn.linear_model import Ridge, PoissonRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Optional, Set, Any
 import io
 import re
@@ -4235,7 +4235,40 @@ class RealDataNHLModel:
             print(f"⚠️  Failed to scrape referees from {url}: {e}")
             return None
 
-    def find_todays_scoutingtherefs_url(self) -> Optional[str]:
+    @staticmethod
+    def infer_scoutingtherefs_date_from_url(link: Optional[str]) -> Optional[date]:
+        """Best-effort extraction of the publish date encoded in a ScoutingTheRefs URL."""
+        if not link:
+            return None
+        try:
+            m_full = re.search(r'scoutingtherefs\.com/(\d{4})/(\d{2})/(\d{2})/', link, flags=re.IGNORECASE)
+            if m_full:
+                y, mo, d = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+                return date(y, mo, d)
+            m_month = re.search(r'scoutingtherefs\.com/(\d{4})/(\d{2})/', link, flags=re.IGNORECASE)
+            if not m_month:
+                return None
+            y, mo = int(m_month.group(1)), int(m_month.group(2))
+            path = urlparse(link).path or ''
+            slug = path.rstrip('/').split('/')[-1]
+            nums = [int(n) for n in re.findall(r'\d+', slug)] if slug else []
+            if len(nums) >= 3:
+                maybe_month, maybe_day, maybe_year = nums[-3], nums[-2], nums[-1]
+                if maybe_year < 100:
+                    maybe_year += 2000
+                if 1 <= maybe_month <= 12 and 1 <= maybe_day <= 31:
+                    return date(maybe_year, maybe_month, maybe_day)
+            for day_candidate in reversed(nums):
+                if 1 <= day_candidate <= 31:
+                    try:
+                        return date(y, mo, day_candidate)
+                    except Exception:
+                        continue
+            return date(y, mo, 1)
+        except Exception:
+            return None
+
+    def find_todays_scoutingtherefs_url(self, target_date: Optional[date] = None) -> Optional[str]:
         """Best-effort to locate today's NHL officiating assignments post on scoutingtherefs.com.
 
         Strategy: scan the current month's archive and homepage for links that look like daily
@@ -4246,8 +4279,8 @@ class RealDataNHLModel:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9'
             }
-            today = datetime.now().date()
-            candidates: List[Tuple[datetime, str]] = []
+            target_day = target_date or datetime.now().date()
+            candidates: List[Tuple[date, str]] = []
             seen_links: Set[str] = set()
 
             def parse_iso_date(raw: str) -> Optional[datetime]:
@@ -4270,7 +4303,7 @@ class RealDataNHLModel:
                 if link in seen_links:
                     return
                 seen_links.add(link)
-                candidates.append((dt_val.date(), link))
+                candidates.append((dt_val.date() if isinstance(dt_val, datetime) else dt_val, link))
 
             def is_assignment_link(link: Optional[str], title: Optional[str] = None) -> bool:
                 ll = (link or '').lower()
@@ -4327,37 +4360,6 @@ class RealDataNHLModel:
                     except Exception:
                         continue
 
-            def extract_date_from_url(link: str) -> Optional[datetime]:
-                try:
-                    m_full = re.search(r'scoutingtherefs\.com/(\d{4})/(\d{2})/(\d{2})/', link, flags=re.IGNORECASE)
-                    if m_full:
-                        y, mo, d = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
-                        return datetime(y, mo, d)
-                    m_month = re.search(r'scoutingtherefs\.com/(\d{4})/(\d{2})/', link, flags=re.IGNORECASE)
-                    if not m_month:
-                        return None
-                    y, mo = int(m_month.group(1)), int(m_month.group(2))
-                    path = urlparse(link).path or ''
-                    slug = path.rstrip('/').split('/')[-1]
-                    nums = [int(n) for n in re.findall(r'\d+', slug)] if slug else []
-                    if len(nums) >= 3:
-                        maybe_month, maybe_day, maybe_year = nums[-3], nums[-2], nums[-1]
-                        year_val = maybe_year + 2000 if maybe_year < 100 else maybe_year
-                        if 1 <= maybe_month <= 12 and 1 <= maybe_day <= 31:
-                            try:
-                                return datetime(year_val, maybe_month, maybe_day)
-                            except Exception:
-                                pass
-                    for day_candidate in reversed(nums):
-                        if 1 <= day_candidate <= 31:
-                            try:
-                                return datetime(y, mo, day_candidate)
-                            except Exception:
-                                continue
-                    return datetime(y, mo, 1)
-                except Exception:
-                    return None
-
             def harvest(page_url: str) -> None:
                 try:
                     resp = requests.get(page_url, timeout=20, headers=headers, allow_redirects=True)
@@ -4384,22 +4386,23 @@ class RealDataNHLModel:
                     else:
                         dt_val = None
                     if dt_val is None:
-                        dt_val = extract_date_from_url(link)
+                        inferred_date = self.infer_scoutingtherefs_date_from_url(link)
+                        dt_val = datetime.combine(inferred_date, datetime.min.time()) if inferred_date else None
                     if dt_val is None:
                         continue
                     register_candidate(dt_val, link)
 
             harvest_wp_posts()
-            month_url = f"https://scoutingtherefs.com/{today.year}/{today.month:02d}/"
+            month_url = f"https://scoutingtherefs.com/{target_day.year}/{target_day.month:02d}/"
             harvest(month_url)
             harvest("https://scoutingtherefs.com/")
 
             if not candidates:
                 return None
 
-            candidates.sort(key=lambda x: (abs((x[0] - today).days), -int(datetime.combine(x[0], datetime.min.time()).timestamp())))
+            candidates.sort(key=lambda x: (abs((x[0] - target_day).days), -int(datetime.combine(x[0], datetime.min.time()).timestamp())))
             best_dt, best_link = candidates[0]
-            if abs((best_dt - today).days) <= 1:
+            if abs((best_dt - target_day).days) <= 1:
                 return best_link
             return None
         except Exception:
@@ -5650,8 +5653,63 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         )
         
         print(f"✅ Found {len(todays_games)} games to predict")
+
+        target_date_arg = getattr(cli_args, 'date', None) if cli_args else None
+        target_game_date: Optional[date] = None
+        if target_date_arg:
+            try:
+                target_game_date = datetime.strptime(target_date_arg, '%Y-%m-%d').date()
+            except Exception:
+                target_game_date = None
+        if target_game_date is None:
+            try:
+                if isinstance(todays_games, pd.DataFrame) and 'date' in todays_games.columns:
+                    date_series = pd.to_datetime(todays_games['date'], errors='coerce')
+                    if hasattr(date_series, 'dt'):
+                        date_series = date_series.dt.date
+                    date_series = date_series.dropna()
+                    if len(date_series):
+                        target_game_date = date_series.iloc[0]
+            except Exception:
+                target_game_date = None
+        if target_game_date is None:
+            target_game_date = datetime.now().date()
+        target_game_date_str = target_game_date.strftime('%Y-%m-%d') if target_game_date else None
+
+        def ensure_fresh_referees_url(preferred_url: Optional[str]) -> Tuple[Optional[str], Optional[date], bool]:
+            resolved = preferred_url
+            parsed_date = model.infer_scoutingtherefs_date_from_url(resolved) if resolved else None
+            needs_refresh = bool(target_game_date and parsed_date and parsed_date != target_game_date)
+            auto_used = False
+            if resolved is None or needs_refresh:
+                auto_url = None
+                try:
+                    auto_url = model.find_todays_scoutingtherefs_url(target_game_date)
+                except Exception:
+                    auto_url = None
+                if auto_url:
+                    if needs_refresh and resolved:
+                        if target_game_date_str and parsed_date:
+                            print(f"ℹ️  Replacing referees URL {resolved} (dated {parsed_date.isoformat()}) with {auto_url} for {target_game_date_str}")
+                        else:
+                            print(f"ℹ️  Replacing referees URL {resolved} with detected {auto_url}")
+                    elif resolved is None and target_game_date_str:
+                        print(f"ℹ️  Auto-detected referees URL for {target_game_date_str}: {auto_url}")
+                    resolved = auto_url
+                    parsed_date = model.infer_scoutingtherefs_date_from_url(auto_url)
+                    auto_used = True
+                elif needs_refresh and resolved and parsed_date and target_game_date_str:
+                    print(f"⚠️  Provided referees URL {resolved} appears to target {parsed_date.isoformat()} but no article for {target_game_date_str} was found; continuing with provided URL.")
+            return resolved, parsed_date, auto_used
+
+        initial_cli_ref_url = getattr(cli_args, 'referees_url', None) if cli_args else None
+        resolved_cli_ref_url, resolved_cli_ref_date, initial_auto_used = ensure_fresh_referees_url(initial_cli_ref_url)
+        if cli_args:
+            setattr(cli_args, 'referees_url', resolved_cli_ref_url)
         
         detected_referees_url: Optional[str] = None
+        if initial_auto_used and resolved_cli_ref_url:
+            detected_referees_url = resolved_cli_ref_url
         referee_rates_fetched: Optional[pd.DataFrame] = None
         cached_referee_assignments_df: Optional[pd.DataFrame] = None
         referee_default_path = os.getenv('REFEREE_RATES_PATH') or 'referees.csv'
@@ -5719,9 +5777,14 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 if (cli_args.referees_url or True) and cli_args.referee_rates_path:
                     rr = None
                     try:
-                        src_url = cli_args.referees_url
+                        src_url_candidate = getattr(cli_args, 'referees_url', None)
+                        src_url, _, auto_used = ensure_fresh_referees_url(src_url_candidate)
                         if not src_url:
-                            src_url = model.find_todays_scoutingtherefs_url()
+                            src_url, _, auto_used = ensure_fresh_referees_url(None)
+                        if auto_used and src_url:
+                            detected_referees_url = src_url
+                            if cli_args:
+                                setattr(cli_args, 'referees_url', src_url)
                         if src_url:
                             detected_referees_url = src_url
                             url_l = str(src_url).lower()
@@ -5753,11 +5816,14 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         referee_rates_path = getattr(cli_args, 'referee_rates_path', None) if cli_args else referee_default_path
         if not referee_rates_path:
             referee_rates_path = referee_default_path
-        referees_url_config: Optional[str] = getattr(cli_args, 'referees_url', None) if cli_args else None
+        referees_url_config: Optional[str] = getattr(cli_args, 'referees_url', None) if cli_args else resolved_cli_ref_url
         if not referees_url_config:
             env_ref_url = os.getenv('REFEREES_URL')
             if env_ref_url:
-                referees_url_config = env_ref_url
+                env_resolved, _, env_auto_used = ensure_fresh_referees_url(env_ref_url)
+                referees_url_config = env_resolved
+                if env_auto_used and env_resolved:
+                    detected_referees_url = env_resolved
         if not referees_url_config and detected_referees_url:
             referees_url_config = detected_referees_url
 
@@ -5767,13 +5833,17 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 have_df = isinstance(referee_rates_fetched, pd.DataFrame) and not referee_rates_fetched.empty
                 rr: Optional[pd.DataFrame] = referee_rates_fetched if have_df else None
                 src_url = referees_url_config
+                if src_url:
+                    src_url, _, refreshed = ensure_fresh_referees_url(src_url)
+                    if refreshed and src_url:
+                        detected_referees_url = src_url
+                        referees_url_config = src_url
                 if not have_df:
                     if not src_url:
-                        try:
-                            rr_url = model.find_todays_scoutingtherefs_url()
-                            src_url = rr_url
-                        except Exception:
-                            src_url = None
+                        src_url, _, refreshed = ensure_fresh_referees_url(None)
+                        if refreshed and src_url:
+                            detected_referees_url = src_url
+                            referees_url_config = src_url
                     if src_url:
                         try:
                             url_l = str(src_url).lower()
@@ -5950,11 +6020,21 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 referee_assignments_source = referees_url_config or detected_referees_url or fallback_source
 
             auto_url_for_map: Optional[str] = referees_url_config or detected_referees_url
+            if auto_url_for_map:
+                auto_url_for_map, _, refreshed = ensure_fresh_referees_url(auto_url_for_map)
+                if refreshed and auto_url_for_map:
+                    detected_referees_url = auto_url_for_map
+                    if not referees_url_config:
+                        referees_url_config = auto_url_for_map
             try:
                 need_assignments = referee_assignments_df is None or referee_assignments_df.empty
                 auto_url = auto_url_for_map
                 if need_assignments and not auto_url:
-                    auto_url = model.find_todays_scoutingtherefs_url()
+                    auto_url, _, refreshed = ensure_fresh_referees_url(None)
+                    if refreshed and auto_url:
+                        detected_referees_url = auto_url
+                        if not referees_url_config:
+                            referees_url_config = auto_url
                 if need_assignments and auto_url:
                     referee_assignments_source = str(auto_url)
                     scraped_assignments = model.scrape_referees_scoutingtherefs(auto_url)
