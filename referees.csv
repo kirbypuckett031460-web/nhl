@@ -1,7 +1,9 @@
-ref,matchup,away_team,home_team,away_name,home_name,goals_gm,crew_goals_gm
-Frederick L'Ecuyer,PIT@NSH,PIT,NSH,Pittsburgh Penguins,Nashville Predators,6.1,5.95
-Trevor Hanson,PIT@NSH,PIT,NSH,Pittsburgh Penguins,Nashville Predators,5.8,5.95
-Pierre Lambert,VAN@CAR,VAN,CAR,Vancouver Canucks,Carolina Hurricanes,5.8,6.15
-Carter Sandlak,VAN@CAR,VAN,CAR,Vancouver Canucks,Carolina Hurricanes,6.5,6.15
-Wes McCauley,PHI@STL,PHI,STL,Philadelphia Flyers,St. Louis Blues,6.2,6.0
-Peter MacDougall,PHI@STL,PHI,STL,Philadelphia Flyers,St. Louis Blues,5.8,6.0
+ref,matchup,away_team,home_team,away_name,home_name,goals_gm,crew_goals_gm,status,tbd,tbd_reason
+Frederick L'Ecuyer,PIT@NSH,PIT,NSH,Pittsburgh Penguins,Nashville Predators,6.1,5.95,,False,
+Trevor Hanson,PIT@NSH,PIT,NSH,Pittsburgh Penguins,Nashville Predators,5.8,5.95,,False,
+Pierre Lambert,VAN@CAR,VAN,CAR,Vancouver Canucks,Carolina Hurricanes,5.8,6.15,,False,
+Carter Sandlak,VAN@CAR,VAN,CAR,Vancouver Canucks,Carolina Hurricanes,6.5,6.15,,False,
+Wes McCauley,PHI@STL,PHI,STL,Philadelphia Flyers,St. Louis Blues,6.2,6.0,,False,
+Peter MacDougall,PHI@STL,PHI,STL,Philadelphia Flyers,St. Louis Blues,5.8,6.0,,False,
+TBD SLOT A,NYI@UTA,NYI,UTA,New York Islanders,Utah Mammoth,,,Referees and Linesmen TBD,True,Referees and Linesmen TBD
+TBD SLOT B,NYI@UTA,NYI,UTA,New York Islanders,Utah Mammoth,,,Referees and Linesmen TBD,True,Referees and Linesmen TBD
