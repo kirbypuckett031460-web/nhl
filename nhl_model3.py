@@ -4140,6 +4140,39 @@ class RealDataNHLModel:
         except Exception as e:
             print(f"⚠️  Failed to load referee rates from {path_or_url}: {e}")
             return None
+    
+    def load_referee_assignments_csv(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
+        """Load previously scraped referee assignments (matchup + crew stats) from disk or URL."""
+        if not path_or_url:
+            return None
+        try:
+            target = str(path_or_url).strip()
+            if not target:
+                return None
+            if target.lower().startswith(('http://', 'https://')):
+                df = pd.read_csv(target)
+            else:
+                expanded = os.path.expanduser(target)
+                if not os.path.isabs(expanded):
+                    expanded = os.path.abspath(expanded)
+                if not os.path.exists(expanded):
+                    return None
+                df = pd.read_csv(expanded)
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                return None
+            required = {'ref', 'matchup'}
+            if not required.issubset({str(c) for c in df.columns}):
+                return None
+            out = df.copy()
+            out['ref'] = out['ref'].astype(str).str.strip()
+            out['matchup'] = out['matchup'].astype(str).str.upper().str.strip()
+            for col in ('goals_gm', 'crew_goals_gm'):
+                if col in out.columns:
+                    out[col] = pd.to_numeric(out[col], errors='coerce')
+            return out.dropna(subset=['ref', 'matchup'])
+        except Exception as e:
+            print(f"⚠️  Failed to load referee assignments from {path_or_url}: {e}")
+            return None
 
     def scrape_referees_scoutingtherefs(self, url: Optional[str]) -> Optional[pd.DataFrame]:
         """Scrape an assignments page for referee names; returns DataFrame with 'ref'.
@@ -4156,6 +4189,16 @@ class RealDataNHLModel:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9'
             }
+            normalized_target = str(url).strip()
+            local_path: Optional[str] = None
+            try:
+                parsed = urlparse(normalized_target)
+                if parsed.scheme == 'file':
+                    local_path = parsed.path
+                elif parsed.scheme == '' and os.path.exists(normalized_target):
+                    local_path = normalized_target
+            except Exception:
+                local_path = None
 
             def extract_post_id(target_url: str) -> Optional[str]:
                 try:
@@ -4239,20 +4282,32 @@ class RealDataNHLModel:
             names: Set[str] = set()
             wp_html: Optional[str] = None
             page_html: Optional[str] = None
+            if local_path:
+                try:
+                    with open(local_path, 'r', encoding='utf-8') as f:
+                        page_html = f.read()
+                    if not page_html:
+                        print(f"⚠️  Local referees file {local_path} was empty.")
+                except Exception as e:
+                    print(f"⚠️  Could not read local referees file {local_path}: {e}")
+                    page_html = None
 
-            post_id = extract_post_id(url)
-            if post_id:
-                wp_html = fetch_wp_content(post_id)
-                if wp_html:
-                    assignments = self._parse_scoutingtherefs_tables(wp_html)
-                    for assignment in assignments:
-                        for nm in assignment.get('referees', []):
-                            nm_clean = self._clean_ref_name(nm)
-                            if nm_clean:
-                                names.add(nm_clean)
+            post_id = None
+            if not local_path:
+                post_id = extract_post_id(url)
+                if post_id:
+                    wp_html = fetch_wp_content(post_id)
+                    if wp_html:
+                        assignments = self._parse_scoutingtherefs_tables(wp_html)
+                        for assignment in assignments:
+                            for nm in assignment.get('referees', []):
+                                nm_clean = self._clean_ref_name(nm)
+                                if nm_clean:
+                                    names.add(nm_clean)
 
             if not names:
-                page_html = fetch_html(url)
+                if page_html is None:
+                    page_html = fetch_html(url)
                 if page_html:
                     if not assignments:
                         assignments = self._parse_scoutingtherefs_tables(page_html)
@@ -6130,6 +6185,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         out['ref'] = out['ref'].astype(str).str.strip()
                     if 'matchup' in out.columns:
                         out['matchup'] = out['matchup'].astype(str).str.upper().str.strip()
+                    for col in ('goals_gm', 'crew_goals_gm'):
+                        if col in out.columns:
+                            out[col] = pd.to_numeric(out[col], errors='coerce')
                 except Exception:
                     pass
                 return out
@@ -6146,6 +6204,24 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 referee_assignments_df = normalize_referee_assignments(cached_referee_assignments_df)
                 fallback_source = rr_path if rr_path else None
                 referee_assignments_source = referees_url_config or detected_referees_url or fallback_source
+            if referee_assignments_df is None or referee_assignments_df.empty:
+                assignment_candidates: List[str] = []
+                if referee_primary_written_path:
+                    assignment_candidates.append(referee_primary_written_path)
+                if referee_path_preference and referee_path_preference not in assignment_candidates:
+                    assignment_candidates.append(referee_path_preference)
+                for candidate in assignment_candidates:
+                    if not candidate:
+                        continue
+                    disk_assignments = model.load_referee_assignments_csv(candidate)
+                    if isinstance(disk_assignments, pd.DataFrame) and not disk_assignments.empty:
+                        normalized_disk = normalize_referee_assignments(disk_assignments)
+                        referee_assignments_df = normalized_disk
+                        cached_referee_assignments_df = normalized_disk.copy()
+                        referee_assignments_source = candidate
+                        if referee_primary_written_path is None:
+                            referee_primary_written_path = candidate
+                        break
 
             auto_url_for_map: Optional[str] = referees_url_config or detected_referees_url
             if auto_url_for_map:
@@ -6271,33 +6347,35 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             try:
                 if isinstance(todays_features, pd.DataFrame) and 'ref_goals_gm' not in todays_features.columns:
                     todays_features['ref_goals_gm'] = np.nan
-                if isinstance(referee_rates, pd.DataFrame):
-                    if isinstance(referee_map, dict) and referee_map:
-                        for matchup_key, crew in referee_map.items():
-                            avg_goals, avg_bias = model.crew_features(crew, referee_rates)
-                            if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
-                                if matchup_key not in referee_goal_map:
-                                    referee_goal_map[matchup_key] = float(avg_goals)
-                            if isinstance(avg_bias, (int, float)) and np.isfinite(avg_bias):
-                                if matchup_key not in referee_bias_map:
-                                    referee_bias_map[matchup_key] = float(avg_bias)
-                    if isinstance(todays_features, pd.DataFrame):
-                        goal_values = []
-                        for _, row in todays_features[['away_team', 'home_team']].iterrows():
-                            mk = f"{row['away_team']}@{row['home_team']}"
-                            val = referee_goal_map.get(mk, referee_default_goal)
-                            goal_values.append(float(val) if isinstance(val, (int, float)) and np.isfinite(val) else np.nan)
-                        todays_features['ref_goals_gm'] = goal_values
-                        baseline_fill = getattr(model, 'ref_goal_baseline', None)
-                        if baseline_fill is None or not np.isfinite(baseline_fill):
-                            if isinstance(referee_default_goal, (int, float)) and np.isfinite(referee_default_goal):
-                                baseline_fill = float(referee_default_goal)
-                            else:
-                                try:
-                                    baseline_fill = float(os.getenv('REF_GOAL_BASELINE', 6.2))
-                                except Exception:
-                                    baseline_fill = 6.2
-                        todays_features['ref_goals_gm'] = pd.to_numeric(todays_features['ref_goals_gm'], errors='coerce').fillna(baseline_fill)
+                have_referee_rates = isinstance(referee_rates, pd.DataFrame) and not getattr(referee_rates, 'empty', True)
+                if have_referee_rates and isinstance(referee_map, dict) and referee_map:
+                    for matchup_key, crew in referee_map.items():
+                        avg_goals, avg_bias = model.crew_features(crew, referee_rates)
+                        if isinstance(avg_goals, (int, float)) and np.isfinite(avg_goals):
+                            if matchup_key not in referee_goal_map:
+                                referee_goal_map[matchup_key] = float(avg_goals)
+                        if isinstance(avg_bias, (int, float)) and np.isfinite(avg_bias):
+                            if matchup_key not in referee_bias_map:
+                                referee_bias_map[matchup_key] = float(avg_bias)
+                if isinstance(todays_features, pd.DataFrame):
+                    goal_values: List[float] = []
+                    for _, row in todays_features[['away_team', 'home_team']].iterrows():
+                        mk = f"{row['away_team']}@{row['home_team']}"
+                        val = referee_goal_map.get(mk)
+                        if val is None and isinstance(referee_default_goal, (int, float)) and np.isfinite(referee_default_goal):
+                            val = referee_default_goal
+                        goal_values.append(float(val) if isinstance(val, (int, float)) and np.isfinite(val) else np.nan)
+                    todays_features['ref_goals_gm'] = goal_values
+                    baseline_fill = getattr(model, 'ref_goal_baseline', None)
+                    if baseline_fill is None or not np.isfinite(baseline_fill):
+                        if isinstance(referee_default_goal, (int, float)) and np.isfinite(referee_default_goal):
+                            baseline_fill = float(referee_default_goal)
+                        else:
+                            try:
+                                baseline_fill = float(os.getenv('REF_GOAL_BASELINE', 6.2))
+                            except Exception:
+                                baseline_fill = 6.2
+                    todays_features['ref_goals_gm'] = pd.to_numeric(todays_features['ref_goals_gm'], errors='coerce').fillna(baseline_fill)
             except Exception:
                 pass
 
