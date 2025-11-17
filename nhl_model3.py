@@ -6974,7 +6974,7 @@ if __name__ == "__main__":
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
     parser.add_argument('--xg-baseline-total', type=float, default=float(os.getenv('XG_BASELINE_TOTAL', 6.2)), help='xG baseline total used to compute adjustments')
     parser.add_argument('--xg-clamp-abs', type=float, default=float(os.getenv('XG_CLAMP_ABS', 2.0)), help='Absolute clamp for xG total adjustment')
-    parser.add_argument('--ci-quantile', type=float, default=float(os.getenv('CI_QUANTILE', 0.90)), help='Conformal CI quantile (e.g., 0.90 for 90% radius)')
+    parser.add_argument('--ci-quantile', type=float, default=float(os.getenv('CI_QUANTILE', 0.90)), help='Conformal CI quantile (e.g., 0.90 for 90%% radius)')
     parser.add_argument('--kelly-mult', type=float, default=float(os.getenv('KELLY_MULT', 0.5)), help='Kelly multiplier (e.g., 0.5 for half Kelly)')
     parser.add_argument('--kelly-cap', type=float, default=float(os.getenv('KELLY_CAP_PCT', 2.0)), help='Max Kelly stake per bet in percent')
     parser.add_argument('--daily-exposure-cap', type=float, default=float(os.getenv('DAILY_EXPOSURE_CAP_PCT', 6.0)), help='Max total daily exposure percent')
