@@ -4592,21 +4592,46 @@ class RealDataNHLModel:
             return None
 
     def load_penalty_rates(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
-        """Minimal loader for league penalty rates; accepts CSV path/URL and returns DataFrame.
-        This is intentionally flexible; downstream code only needs a DataFrame-like object.
-        """
-        if not path_or_url:
-            return None
-        try:
-            url_l = str(path_or_url).lower().strip()
-            if url_l.startswith(('http://', 'https://')):
-                r = requests.get(path_or_url, timeout=20)
-                r.raise_for_status()
-                return pd.read_csv(io.StringIO(r.text))
-            return pd.read_csv(path_or_url)
-        except Exception as e:
-            print(f"⚠️  Failed to load penalty rates from {path_or_url}: {e}")
-            return None
+        """Load team penalty draw/take rates from a CSV/URL with sensible fallbacks."""
+
+        candidates: List[str] = []
+
+        def add_candidate(value: Optional[str]) -> None:
+            if not value:
+                return
+            normalized = str(value).strip()
+            if not normalized:
+                return
+            if normalized not in candidates:
+                candidates.append(normalized)
+
+        add_candidate(path_or_url)
+        add_candidate(os.getenv('PENALTY_RATES_PATH'))
+        add_candidate('penalties.csv')
+
+        errors: List[str] = []
+
+        for candidate in candidates:
+            try:
+                url_l = candidate.lower()
+                if url_l.startswith(('http://', 'https://')):
+                    r = requests.get(candidate, timeout=20)
+                    r.raise_for_status()
+                    return pd.read_csv(io.StringIO(r.text))
+                abs_path = os.path.abspath(candidate)
+                if os.path.exists(abs_path):
+                    return pd.read_csv(abs_path)
+                # Allow Windows-style paths on POSIX
+                if os.name != 'nt' and re.match(r'^[a-zA-Z]:[\\/]', candidate):
+                    resolved = ensure_local_write_path(candidate)
+                    if resolved and os.path.exists(resolved):
+                        return pd.read_csv(resolved)
+            except Exception as e:
+                errors.append(f"{candidate}: {e}")
+        if errors:
+            joined = "; ".join(errors)
+            print(f"⚠️  Failed to load penalty rates from candidates ({joined})")
+        return None
     
     def get_todays_games(self, target_date: Optional[str] = None, offline_path: Optional[str] = None, offline_only: bool = False) -> pd.DataFrame:
         """Get games for a target date with API and/or offline fallbacks.
@@ -6970,6 +6995,7 @@ if __name__ == "__main__":
     parser.add_argument('--odds-retries', type=int, default=3, help='Realtime odds fetch retries on failure')
     parser.add_argument('--odds-dispersion-all', action='store_true', help='Collect totals from all books for dispersion metrics (still pick prices from FD)')
     parser.add_argument('--log-odds-history', action='store_true', help='Append odds snapshots to odds_history.csv')
+    parser.add_argument('--log-odds', dest='log_odds_history', action='store_true', help='Alias for --log-odds-history')
     parser.add_argument('--odds-history-path', type=str, default='odds_history.csv', help='Path to odds history CSV')
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
     parser.add_argument('--xg-baseline-total', type=float, default=float(os.getenv('XG_BASELINE_TOTAL', 6.2)), help='xG baseline total used to compute adjustments')
@@ -6981,7 +7007,7 @@ if __name__ == "__main__":
     parser.add_argument('--kelly-use-fair', action='store_true', help='Use no-vig fair probabilities for Kelly sizing')
     parser.add_argument('--team-rates-path', type=str, default=os.getenv('TEAM_RATES_PATH', None), help='CSV or URL with team xG/CF/HDCF/PP/PK rates')
     parser.add_argument('--goalie-gsax-path', type=str, default=os.getenv('GOALIE_GSAX_PATH', None), help='CSV or URL with goalie rolling GSAx and prob_start')
-    parser.add_argument('--penalty-rates-path', type=str, default=os.getenv('PENALTY_RATES_PATH', None), help='CSV or URL with team penalties drawn/taken per 60')
+    parser.add_argument('--penalty-rates-path', type=str, default=os.getenv('PENALTY_RATES_PATH', 'penalties.csv'), help='CSV or URL with team penalties drawn/taken per 60')
     parser.add_argument('--referee-rates-path', type=str, default=os.getenv('REFEREE_RATES_PATH', 'referees.csv'), help='CSV or URL with referee penalties per 60 (optional)')
     parser.add_argument('--environment-path', type=str, default=os.getenv('ENVIRONMENT_JSON', None), help='Path to environment JSON (outdoor/start time/weather)')
     parser.add_argument('--env-refresh', action='store_true', help='Refresh/overwrite today entries in environment.json')

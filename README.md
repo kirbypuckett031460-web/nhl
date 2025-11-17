@@ -26,13 +26,14 @@ Command-line options
 - --post-social: Enable social posting (Twitter/Discord)
 - --team-rates-path: CSV/URL with team rates (xGF60 5v5, HDCF60 5v5, PP xGF60, PK xGA60)
 - --goalie-gsax-path: CSV/URL with goalie rolling GSAx and optional `prob_start`
-- --penalty-rates-path: CSV/URL with team penalties drawn/taken per 60
+- --penalty-rates-path: CSV/URL with team penalties drawn/taken per 60 (default `penalties.csv`)
 - --referee-rates-path: CSV/URL with referee penalties per 60 (optional)
 - --environment-path: Path to `environment.json` (outdoor/start time/weather per game)
 - --lineup-path: Path to `lineup_strength.csv` (team lineup strength)
 - --auto-populate: Auto-fetch MoneyPuck URLs and write normalized CSVs
 - --team-rates-url / --goalie-gsax-url / --penalties-url / --referees-url: Source URLs for auto-populate
 - --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
+- --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
 
 Examples
 --------
