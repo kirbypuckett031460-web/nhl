@@ -4965,11 +4965,6 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         conf_txt = f"{conf_val:.0%}" if isinstance(conf_val, (int, float)) else ''
         env_txt = getattr(p, 'env_info', '') or ''
         lineup_txt = getattr(p, 'lineup_info', '') or ''
-        ref_txt = getattr(p, 'referee_info', None)
-        if not ref_txt:
-            crew_list = getattr(p, 'referee_crew', []) or []
-            ref_txt = ", ".join([str(n) for n in crew_list if str(n).strip()])
-        ref_txt = ref_txt or ''
         kelly_val = getattr(p, 'kelly_bet_size', None)
         kelly_txt = f"{kelly_val:.1f}%" if isinstance(kelly_val, (int, float)) else ''
         rows_html.append(
@@ -4981,7 +4976,6 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
             f"<td>{over_txt}</td>"
             f"<td>{under_txt}</td>"
             f"<td>{conf_txt}</td>"
-            f"<td>{ref_txt}</td>"
             f"<td>{env_txt}</td>"
             f"<td>{lineup_txt}</td>"
             f"<td class='{cls}'>{rec}</td>"
@@ -5001,7 +4995,7 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         "tr:nth-child(even) { background:#fafafa; }\n"
         "</style></head><body>\n<table>\n<thead><tr>\n"
         "<th>Matchup</th><th>Line</th><th>Predicted</th><th>Edge</th>\n"
-        "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Referees</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
+        "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
         "</tr></thead>\n<tbody>\n"
     )
     tail = "\n</tbody></table>\n</body></html>\n"
@@ -5166,11 +5160,6 @@ def save_predictions_image(
         else:
             pick_txt = str(recommendation)
 
-        ref_goal_value = getattr(pred, 'ref_goals_gm', None)
-        if ref_goal_value is None:
-            ref_goal_value = getattr(pred, 'referee_avg_goals', None)
-        ref_goal_display = _fmt_float(ref_goal_value) if ref_goal_value is not None else ''
-
         rows.append({
             'Time': display_time,
             'Away': str(getattr(pred, 'away_team', '')),
@@ -5179,7 +5168,6 @@ def save_predictions_image(
             'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
             'Pick': pick_txt,
             'Conf%': _fmt_conf(getattr(pred, 'confidence', None)),
-            'Ref G/G': ref_goal_display,
             '_sort_key': sort_key
         })
 
@@ -5212,8 +5200,7 @@ def save_predictions_image(
         'Line': 0.08,
         'Predicted': 0.12,
         'Pick': 0.1,
-        'Conf%': 0.1,
-        'Ref G/G': 0.08
+        'Conf%': 0.1
     }
     fallback_width = max(0.08, 1.0 / max(1, len(df.columns)))
     col_widths = [default_col_widths.get(str(col), fallback_width) for col in df.columns]
@@ -5286,23 +5273,6 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         edge_color = '#27ae60' if pred.edge > 0.2 else '#e74c3c' if pred.edge < -0.2 else '#95a5a6'
         
         crew_names = [str(n).strip() for n in (getattr(pred, 'referee_crew', []) or []) if str(n).strip()]
-        referee_display = getattr(pred, 'referee_info', None)
-        if not referee_display:
-            referee_display = ", ".join(crew_names)
-        referee_display = referee_display or ''
-        referee_metric_bits: List[str] = []
-        if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
-            referee_metric_bits.append(f"{pred.referee_avg_goals:.2f} G/G")
-        if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias):
-            referee_metric_bits.append(f"HB {pred.referee_home_bias:+.2f}")
-        if isinstance(pred.ref_goals_gm, (int, float)) and np.isfinite(pred.ref_goals_gm) and not referee_metric_bits:
-            referee_metric_bits.append(f"Feature {pred.ref_goals_gm:.2f} G/G")
-        referee_cell = referee_display
-        if referee_metric_bits:
-            metrics_txt = ", ".join(referee_metric_bits)
-            metric_html = f"<div style=\"font-size: 0.8rem; color:#7f8c8d;\">{metrics_txt}</div>"
-            referee_cell = f"{referee_display}{metric_html}" if referee_display else metric_html
-
         ref_crew_attr = ", ".join(crew_names)
         ref_avg_attr = (
             f"{pred.referee_avg_goals:.3f}"
@@ -5355,7 +5325,6 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <span>{pred.confidence:.0%}</span>
                 </div>
             </td>
-            <td>{referee_cell}</td>
             <td>{pred.env_info or ''}</td>
             <td>{pred.lineup_info or ''}</td>
             <td>
@@ -5585,7 +5554,6 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <li><b>Edge</b>: Predicted total minus line (positive favors OVER).</li>
                     <li><b>Over% / Under%</b>: Probability estimates for each side (Fair shows no‑vig).</li>
                     <li><b>Confidence</b>: Composite score (edge, calibration, dispersion, movement).</li>
-                    <li><b>Refs</b>: Assigned crew with scoring and bias tendencies.</li>
                     <li><b>Env</b>: Outdoor flag, local start hour, temperature.</li>
                     <li><b>Lineup</b>: Aggregate lineup strength (Home/Away).</li>
                     <li><b>Recommendation</b>: OVER/UNDER/No Bet based on thresholds.</li>
@@ -5614,7 +5582,6 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                         <th>📈 Over %</th>
                         <th>📉 Under %</th>
                         <th>🔥 Confidence</th>
-                        <th>🧑‍⚖️ Refs</th>
                         <th>🌤️ Env</th>
                         <th>👥 Lineup</th>
                         <th>💡 Recommendation</th>
