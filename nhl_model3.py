@@ -208,8 +208,12 @@ def gather_referee_output_paths(primary_path: Optional[str]) -> List[str]:
         outputs.append(normalized)
 
     add_path(primary_path)
-    if not outputs:
-        add_path('referees.csv')
+
+    # Always ensure we have a local fallback file that lives alongside the repo.
+    # This keeps referees.csv up to date even when callers point to Windows-only paths
+    # (e.g., C:\nhl\referees.csv) that aren't writable inside a Linux container.
+    local_fallback = os.getenv('REFEREE_RATES_LOCAL_FALLBACK', 'referees.csv')
+    add_path(local_fallback)
 
     mirror_paths = os.getenv('REFEREE_RATES_EXTRA_PATHS')
     if mirror_paths:
