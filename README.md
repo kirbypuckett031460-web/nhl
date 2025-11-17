@@ -32,6 +32,7 @@ Command-line options
 - --lineup-path: Path to `lineup_strength.csv` (team lineup strength)
 - --auto-populate: Auto-fetch MoneyPuck URLs and write normalized CSVs
 - --team-rates-url / --goalie-gsax-url / --penalties-url / --referees-url: Source URLs for auto-populate
+- --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
 
 Examples
 --------

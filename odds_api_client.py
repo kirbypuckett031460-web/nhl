@@ -46,12 +46,18 @@ class TheOddsAPIClient:
         """Fetch player prop markets for NHL.
 
         market: e.g., 'player_shots_on_goal'
-        regions: comma-separated region codes
+        regions: comma-separated region codes (forced to 'us' to comply with provider policy)
         """
         # Docs use sport key: 'icehockey_nhl'
         path = f"sports/icehockey_nhl/odds"
+        forced_regions = "us"
+        try:
+            if regions and str(regions).strip().lower() != forced_regions:
+                print(f"⚠️  Overriding The Odds API regions to '{forced_regions}' (requested '{regions}')")
+        except Exception:
+            pass
         params = {
-            "regions": regions,
+            "regions": forced_regions,
             "oddsFormat": odds_format,
             "markets": market,
             "dateFormat": "iso",
