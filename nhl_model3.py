@@ -3212,8 +3212,8 @@ class RealDataNHLModel:
 
         return odds
 
-    def get_betting_odds_realtime(self, todays_games: pd.DataFrame, api_key_env: str = 'ODDS_API_KEY', timeout_s: int = 25, retries: int = 3, dispersion_all: bool = False) -> Dict[str, Dict[str, float]]:
-        """Fetch realtime totals odds from The Odds API (or compatible) and map to our schema, restricting requests to the US region.
+    def get_betting_odds_realtime(self, todays_games: pd.DataFrame, api_key_env: str = 'ODDS_API_KEY', regions: str = 'us', timeout_s: int = 25, retries: int = 3, dispersion_all: bool = False) -> Dict[str, Dict[str, float]]:
+        """Fetch realtime totals odds from The Odds API (or compatible) and map to our schema, aggregating all US-region sportsbooks by default (override via `regions`).
 
         Requires an API key in environment variable specified by api_key_env. This example uses
         The Odds API v4 (https://the-odds-api.com/) for demonstration and may need adjustments to your provider.
@@ -3242,7 +3242,14 @@ class RealDataNHLModel:
             gid_to_matchup[str(g.get('game_id'))] = mk
 
         results: Dict[str, Dict[str, float]] = {}
-        regions_clean = 'us'
+        default_regions = 'us'
+        region_tokens = [seg.strip() for seg in str(regions or '').split(',') if seg.strip()]
+        if region_tokens and any(seg.lower() == 'all' for seg in region_tokens):
+            regions_clean = default_regions
+        else:
+            regions_clean = ",".join(region_tokens)
+        if not regions_clean:
+            regions_clean = default_regions
 
         # The Odds API parameters
         params = {
@@ -6076,6 +6083,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             if cli_args and getattr(cli_args, 'realtime_odds', False):
                 betting_odds = model.get_betting_odds_realtime(
                     todays_games,
+                    regions=getattr(cli_args, 'odds_regions', 'us'),
                     timeout_s=getattr(cli_args, 'odds_timeout', 25),
                     retries=getattr(cli_args, 'odds_retries', 3),
                     dispersion_all=bool(getattr(cli_args, 'odds_dispersion_all', False))
@@ -6952,7 +6960,8 @@ if __name__ == "__main__":
     parser.add_argument('--date', type=str, default=None, help='ISO date YYYY-MM-DD for which to fetch/predict games (default: today)')
     parser.add_argument('--today-games-path', type=str, default=None, help='Path to offline today games JSON to bypass API')
     parser.add_argument('--offline', action='store_true', help='Use offline today games if provided and skip API calls')
-    parser.add_argument('--realtime-odds', action='store_true', help='Fetch realtime totals odds from The Odds API (US region only, requires ODDS_API_KEY)')
+    parser.add_argument('--realtime-odds', action='store_true', help='Fetch realtime totals odds from an external API (requires ODDS_API_KEY)')
+    parser.add_argument('--odds-regions', type=str, default='us', help='Comma-separated odds regions (use "all" for every Odds API region)')
     parser.add_argument('--odds-timeout', type=int, default=25, help='Realtime odds request timeout in seconds')
     parser.add_argument('--odds-retries', type=int, default=3, help='Realtime odds fetch retries on failure')
     parser.add_argument('--odds-dispersion-all', action='store_true', help='Collect totals from all books for dispersion metrics (still pick prices from FD)')
