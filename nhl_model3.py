@@ -3729,6 +3729,42 @@ class RealDataNHLModel:
             return assignments
         try:
             alias_map = self._get_team_alias_map()
+
+            def extract_first_numeric(fragment: Any) -> Optional[float]:
+                if fragment is None:
+                    return None
+                try:
+                    candidates: List[str] = []
+                    if hasattr(fragment, 'get_text'):
+                        try:
+                            strong = fragment.find('strong')
+                        except Exception:
+                            strong = None
+                        if strong:
+                            candidates.append(strong.get_text(' ', strip=True))
+                        text = fragment.get_text(' ', strip=True)
+                        if text:
+                            candidates.append(text)
+                    else:
+                        html_text = html_parser.unescape(str(fragment))
+                        plain = re.sub(r'<[^>]+>', ' ', html_text)
+                        plain = plain.replace('\xa0', ' ')
+                        candidates.append(" ".join(plain.split()))
+                    for candidate in candidates:
+                        if not candidate:
+                            continue
+                        match = re.search(r'[-+]?\d+(?:\.\d+)?', candidate)
+                        if match:
+                            try:
+                                val = float(match.group(0))
+                                if np.isfinite(val):
+                                    return val
+                            except Exception:
+                                continue
+                except Exception:
+                    return None
+                return None
+
             soup = BeautifulSoup(html_blob, 'html.parser') if BEAUTIFULSOUP_AVAILABLE else None
             if soup:
                 entry = soup.find('div', class_='entry-content') or soup
@@ -3777,24 +3813,6 @@ class RealDataNHLModel:
                         classes = [str(c) for c in (node.get('class') or [])]
                         if not any(cls.lower() == 'totable' for cls in classes):
                             continue
-
-                        def extract_first_float(cell) -> Optional[float]:
-                            try:
-                                strong = cell.find('strong')
-                                candidates: List[str] = []
-                                if strong:
-                                    candidates.append(strong.get_text(' ', strip=True))
-                                candidates.append(cell.get_text(' ', strip=True))
-                                for candidate in candidates:
-                                    match = re.search(r'[-+]?\d+(?:\.\d+)?', candidate)
-                                    if match:
-                                        try:
-                                            return float(match.group(0))
-                                        except Exception:
-                                            continue
-                            except Exception:
-                                return None
-                            return None
 
                         def normalize_label(label: str) -> Optional[str]:
                             lbl = (label or '').strip().lower()
@@ -3848,7 +3866,7 @@ class RealDataNHLModel:
                             for idx, entry in enumerate(ref_entries):
                                 if idx >= len(value_cells):
                                     break
-                                val = extract_first_float(value_cells[idx])
+                                val = extract_first_numeric(value_cells[idx])
                                 if val is not None:
                                     entry_stats = entry.setdefault('stats', {})
                                     entry_stats[stat_key] = val
@@ -3890,12 +3908,29 @@ class RealDataNHLModel:
             if assignments:
                 return assignments
             # Fallback regex-based extraction if BeautifulSoup unavailable
-            header_table_pattern = re.compile(
-                r'(<h[12][^>]*>.*?</h[12]>)[\s\S]*?(<table[^>]*class="[^"]*TOTable[^"]*"[^>]*>[\s\S]*?</table>)',
+            goal_row_pattern = re.compile(
+                r'<tr[^>]*>\s*<td[^>]*class="[^"]*TOLabel[^"]*"[^>]*>\s*Goals[^<]*</td[\s\S]*?</tr>',
                 flags=re.IGNORECASE
             )
-            for head_html, table_html in header_table_pattern.findall(html_blob):
-                header_text = re.sub(r'<[^>]+>', ' ', head_html)
+            table_pattern = re.compile(
+                r'<table[^>]*class="[^"]*TOTable[^"]*"[^>]*>[\s\S]*?</table>',
+                flags=re.IGNORECASE
+            )
+            heading_pattern = re.compile(
+                r'<h[123][^>]*>.*?</h[123]>',
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            heading_matches = list(heading_pattern.finditer(html_blob))
+            heading_idx = -1
+            for table_match in table_pattern.finditer(html_blob):
+                table_html = table_match.group(0)
+                while (
+                    heading_idx + 1 < len(heading_matches)
+                    and heading_matches[heading_idx + 1].end() <= table_match.start()
+                ):
+                    heading_idx += 1
+                heading_html = heading_matches[heading_idx].group(0) if heading_idx >= 0 else ''
+                header_text = re.sub(r'<[^>]+>', ' ', heading_html)
                 match_info = self._extract_matchup_from_text(header_text, alias_map)
                 refs_block_match = re.search(
                     r'<h3[^>]*>\s*REFEREES\s*</h3>(.*?)(?:<h3[^>]*>\s*LINES|$)',
@@ -3909,13 +3944,40 @@ class RealDataNHLModel:
                     if nm:
                         refs.append(nm)
                     if len(refs) >= 2:
-                        # Referees are always two names; stop to avoid picking stats strong tags
                         break
-                if refs:
-                    assignment: Dict[str, Any] = {'referees': refs}
-                    if match_info:
-                        assignment.update(match_info)
-                    assignments.append(assignment)
+                if not refs:
+                    continue
+                assignment: Dict[str, Any] = {'referees': refs}
+                if match_info:
+                    assignment.update(match_info)
+                stats_map: Dict[str, Dict[str, Any]] = {}
+                goal_values: List[float] = []
+                goal_row_match = goal_row_pattern.search(table_html)
+                if goal_row_match:
+                    cells_html = re.findall(
+                        r'<td[^>]*>(.*?)</td>',
+                        goal_row_match.group(0),
+                        flags=re.IGNORECASE | re.DOTALL
+                    )
+                    value_cells = cells_html[1:] if len(cells_html) > 1 else []
+                    for idx, ref_name in enumerate(refs):
+                        if idx >= len(value_cells):
+                            break
+                        val = extract_first_numeric(value_cells[idx])
+                        if val is None:
+                            continue
+                        stats_entry = stats_map.setdefault(ref_name, {})
+                        stats_entry['goals_gm'] = val
+                        goal_values.append(val)
+                if stats_map:
+                    assignment['referee_stats'] = stats_map
+                if goal_values:
+                    trimmed = goal_values[:2] if len(goal_values) >= 2 else goal_values
+                    try:
+                        assignment['crew_goals_gm'] = round(float(np.mean(trimmed)), 3)
+                    except Exception:
+                        pass
+                assignments.append(assignment)
             return assignments
         except Exception:
             return []
