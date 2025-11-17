@@ -4650,6 +4650,7 @@ class RealDataNHLModel:
             target_date = datetime.now().strftime('%Y-%m-%d')
         today = target_date
         tomorrow = (datetime.strptime(today, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern')
         
         print(f"🏒 Looking for games on {today}...")
 
@@ -4695,16 +4696,19 @@ class RealDataNHLModel:
             for game in games:
                 status = game.get('status', {}).get('detailedState')
                 # Filter to target_date strictly
+                game_ts_local = None
                 try:
                     gd = pd.to_datetime(game.get('gameDate'), utc=True, errors='coerce')
                     if pd.isna(gd):
                         gdate = None
                     else:
                         try:
-                            gdate = gd.tz_convert(os.getenv('SCHEDULE_TZ', 'US/Eastern')).date()
+                            game_ts_local = gd.tz_convert(schedule_tz)
                         except Exception:
-                            gdate = gd.tz_convert(None).date()
+                            game_ts_local = gd
+                        gdate = game_ts_local.date()
                 except Exception:
+                    gd = None
                     gdate = None
                 # Keep all games on the date regardless of status to avoid missing late-added statuses
                 if gdate == datetime.strptime(today, '%Y-%m-%d').date():
@@ -4713,7 +4717,7 @@ class RealDataNHLModel:
                         away_team = game['teams']['away']['team']
                         game_data = {
                             'game_id': game['gamePk'],
-                            'date': pd.to_datetime(game['gameDate']),
+                            'date': game_ts_local if game_ts_local is not None else pd.to_datetime(game.get('gameDate')),
                             'home_team': home_team['abbreviation'],
                             'away_team': away_team['abbreviation'],
                             'venue': game.get('venue', {}).get('name', f"{home_team['abbreviation']} Arena"),
@@ -5841,7 +5845,23 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 if isinstance(todays_games, pd.DataFrame) and 'date' in todays_games.columns:
                     date_series = pd.to_datetime(todays_games['date'], errors='coerce')
                     if hasattr(date_series, 'dt'):
-                        date_series = date_series.dt.date
+                        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern')
+                        tz_info = None
+                        try:
+                            tz_info = getattr(date_series.dt, 'tz', None)
+                        except Exception:
+                            tz_info = None
+                        try:
+                            if tz_info is None:
+                                date_series = date_series.dt.tz_localize(schedule_tz, ambiguous='NaT', nonexistent='NaT')
+                            else:
+                                date_series = date_series.dt.tz_convert(schedule_tz)
+                        except Exception:
+                            pass
+                        try:
+                            date_series = date_series.dt.date
+                        except Exception:
+                            pass
                     date_series = date_series.dropna()
                     if len(date_series):
                         target_game_date = date_series.iloc[0]
