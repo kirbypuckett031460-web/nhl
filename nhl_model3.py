@@ -1306,6 +1306,7 @@ class RealDataNHLModel:
         self.data_fetcher = NHLDataFetcher()
         self.total_model = None
         self.scaler = StandardScaler()
+        self.goal_scaler = StandardScaler()
         self.feature_names = []
         # Store conformal quantiles for uncertainty intervals
         self.conformal_q80: Optional[float] = None
@@ -1979,7 +1980,8 @@ class RealDataNHLModel:
         try:
             df = enhanced_df.dropna(subset=['home_goals','away_goals']).copy()
             Xg = df[self.feature_names].copy()
-            Xg_scaled = self.scaler.fit_transform(Xg)
+            self.goal_scaler = StandardScaler()
+            Xg_scaled = self.goal_scaler.fit_transform(Xg)
             y_home = df['home_goals'].astype(float)
             y_away = df['away_goals'].astype(float)
             self.home_goal_mu_model = PoissonRegressor(alpha=0.5, max_iter=1000)
@@ -2793,7 +2795,15 @@ class RealDataNHLModel:
                 ref_goal_value = candidate_val
         
         # Scale features
-        features_scaled = self.scaler.transform(game_features.reshape(1, -1))
+        feature_row = game_features.reshape(1, -1)
+        features_scaled = self.scaler.transform(feature_row)
+        goal_features_scaled: Optional[np.ndarray] = None
+        goal_scaler = getattr(self, 'goal_scaler', None)
+        if goal_scaler is not None:
+            try:
+                goal_features_scaled = goal_scaler.transform(feature_row)
+            except Exception:
+                goal_features_scaled = None
         
         # Get predictions from ensemble
         models = self.total_model.get('models', {})
@@ -2893,10 +2903,10 @@ class RealDataNHLModel:
         # Prefer bivariate Poisson MC; else NB/Poisson totals; else Gaussian
         home_mu_model = (self.total_model or {}).get('home_goal_mu_model')
         away_mu_model = (self.total_model or {}).get('away_goal_mu_model')
-        if home_mu_model is not None and away_mu_model is not None:
+        if home_mu_model is not None and away_mu_model is not None and goal_features_scaled is not None:
             try:
-                hm = float(home_mu_model.predict(features_scaled)[0])
-                am = float(away_mu_model.predict(features_scaled)[0])
+                hm = float(home_mu_model.predict(goal_features_scaled)[0])
+                am = float(away_mu_model.predict(goal_features_scaled)[0])
                 # Empirical correlation if learned, otherwise small positive default
                 rho = float((self.total_model or {}).get('poisson_rho', 0.15))
                 # Monte Carlo
