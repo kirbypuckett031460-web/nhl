@@ -144,6 +144,16 @@ python run_player_props.py --props player_props.json --min-edge 0.55
 
 Outputs expected SOG and a Poisson-based recommendation with probability edge.
 
+Skater & Goalie Context
+-----------------------
+
+Daily predictions can now ingest player- and goalie-level context:
+
+- Point `--player-metrics-path` to a CSV/JSON with `team`, `player`, `position`, `status`, `prob_play`, `rapm_off`, `rapm_def`, `xgar`.  
+  The model aggregates forward/defense xGAR, elite availability, RAPM splits, and applies those covariates both as dashboard notes and as adjustments to the projected total (`skater_goalie_edge`).
+- Provide rolling goalie GSAx via `--goalie-gsax-path` (or URL). Expected starter quality is converted into `home_goalie_gsax` / `away_goalie_gsax` features and automatically debits/credits the total based on projected netminders.
+- Both inputs surface in the dashboard (`lineup_info`) so you can see which skaters are missing and which starters are driving goalie adjustments.
+
 Using NHL Stats & The Odds API
 ------------------------------
 
@@ -180,4 +190,5 @@ Implementation details
 - Rolling-origin cross-validation now drives the hyperparameter search inside `RealDataNHLModel.train_model`, ensuring each trial retrains on an expanding window and scores on a forward horizon.
 - Every ensemble member sits inside a locked `Pipeline(StandardScaler, model)` so feature transforms are refit only on the relevant training fold and the same pipeline object is reused at inference time.
 - A walk-forward retraining harness re-clones the tuned ensemble across sequential chunks, surfacing RMSE/MAE summaries that mirror real deployment where the model is continually refreshed.
+- Goal distribution modeling now stacks three layers: (1) classical Poisson regressors for home/away goals, (2) a neural "Poisson flow" MLP that learns non-linear intensities, and (3) a Gaussian-copula mixture simulator that blends the two regimes with dynamic weights/correlation derived from skater/goalie covariates. The mixture powers the over/under probabilities and keeps pace with bookmaker-style conditional totals.
 

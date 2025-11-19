@@ -24,6 +24,7 @@ import requests
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
@@ -1328,6 +1329,7 @@ class RealDataNHLModel:
         # Goal models for bivariate Poisson approximation
         self.home_goal_mu_model: Optional[PoissonRegressor] = None
         self.away_goal_mu_model: Optional[PoissonRegressor] = None
+        self.goal_flow_model: Optional[MLPRegressor] = None
         # Optional COM-Poisson/Generalized Poisson fallback control
         self.use_compoisson: bool = False
         # Kelly configuration
@@ -2100,7 +2102,13 @@ class RealDataNHLModel:
             'home_active_rapm_def', 'away_active_rapm_def',
             'home_top_line_xgar', 'away_top_line_xgar',
             'home_player_status_penalty', 'away_player_status_penalty',
-            'player_edge_total'
+            'player_edge_total',
+            'home_forward_xgar', 'away_forward_xgar',
+            'home_defense_xgar', 'away_defense_xgar',
+            'home_elite_prob', 'away_elite_prob',
+            'home_goalie_gsax', 'away_goalie_gsax',
+            'home_goalie_prob', 'away_goalie_prob',
+            'skater_goalie_edge'
         ]
         for col in player_feature_cols:
             if col not in features.columns:
@@ -2377,6 +2385,26 @@ class RealDataNHLModel:
                 pass
             self.total_model['poisson_rho'] = rho
             print("✅ Trained Poisson goal models (home and away)")
+            # Train conditional neural flow (multi-output MLP) for home/away goals
+            try:
+                flow_model = MLPRegressor(
+                    hidden_layer_sizes=(128, 64),
+                    activation='relu',
+                    solver='adam',
+                    alpha=1e-4,
+                    learning_rate_init=0.001,
+                    max_iter=500,
+                    random_state=42
+                )
+                y_targets = np.column_stack([y_home.values, y_away.values])
+                flow_model.fit(Xg_scaled, y_targets)
+                self.goal_flow_model = flow_model
+                if self.total_model is None:
+                    self.total_model = {}
+                self.total_model['goal_flow_model'] = flow_model
+                print("🤖 Trained neural Poisson flow head for joint goal intensities")
+            except Exception as flow_err:
+                print(f"⚠️  Neural Poisson flow skipped: {flow_err}")
         except Exception as e:
             print(f"⚠️  Failed to train goal models: {e}")
 
@@ -2655,6 +2683,9 @@ class RealDataNHLModel:
         df['position'] = df['position'].astype(str).str.upper().str.strip()
         df['status'] = df.get('status', 'ACTIVE').astype(str)
 
+        forward_positions = {'F', 'LW', 'RW', 'C', 'W', 'CF'}
+        defense_positions = {'D', 'LD', 'RD', 'DEF'}
+
         team_summary: Dict[str, Dict[str, Any]] = {}
         for team, grp in df.groupby('team'):
             weights = grp['prob_play']
@@ -2666,13 +2697,22 @@ class RealDataNHLModel:
             missing_names = [f"{row['player']} ({row['position']})" for _, row in missing.iterrows()]
             missing_value = float(missing['xgar'].clip(lower=0.0).sum())
             status_penalty = float(-0.04 * missing_value)
+            forward_mask = grp['position'].isin(forward_positions)
+            defense_mask = grp['position'].isin(defense_positions)
+            forward_xgar = float((grp.loc[forward_mask, 'xgar'] * weights.loc[forward_mask]).sum()) if forward_mask.any() else 0.0
+            defense_xgar = float((grp.loc[defense_mask, 'xgar'] * weights.loc[defense_mask]).sum()) if defense_mask.any() else 0.0
+            elite = grp.sort_values('xgar', ascending=False).head(4)
+            elite_availability = float((elite['xgar'].clip(lower=0.0) * elite['prob_play']).sum())
             team_summary[team] = {
                 'active_xgar': active_xgar,
                 'active_rapm_off': active_rapm_off,
                 'active_rapm_def': active_rapm_def,
                 'top_line_xgar': top_line_xgar,
                 'status_penalty': status_penalty,
-                'missing_names': missing_names
+                'missing_names': missing_names,
+                'forward_xgar': forward_xgar,
+                'defense_xgar': defense_xgar,
+                'elite_availability': elite_availability
             }
 
         if not team_summary:
@@ -2703,6 +2743,12 @@ class RealDataNHLModel:
             todays_features.at[idx, 'away_top_line_xgar'] = val(away_summary, 'top_line_xgar')
             todays_features.at[idx, 'home_player_status_penalty'] = val(home_summary, 'status_penalty')
             todays_features.at[idx, 'away_player_status_penalty'] = val(away_summary, 'status_penalty')
+            todays_features.at[idx, 'home_forward_xgar'] = val(home_summary, 'forward_xgar')
+            todays_features.at[idx, 'away_forward_xgar'] = val(away_summary, 'forward_xgar')
+            todays_features.at[idx, 'home_defense_xgar'] = val(home_summary, 'defense_xgar')
+            todays_features.at[idx, 'away_defense_xgar'] = val(away_summary, 'defense_xgar')
+            todays_features.at[idx, 'home_elite_prob'] = val(home_summary, 'elite_availability')
+            todays_features.at[idx, 'away_elite_prob'] = val(away_summary, 'elite_availability')
 
             player_adjustment = (
                 0.02 * (todays_features.at[idx, 'home_active_xgar'] - todays_features.at[idx, 'away_active_xgar']) +
@@ -2712,6 +2758,13 @@ class RealDataNHLModel:
                 todays_features.at[idx, 'home_player_status_penalty'] +
                 todays_features.at[idx, 'away_player_status_penalty']
             )
+            skater_edge = (
+                0.012 * (todays_features.at[idx, 'home_forward_xgar'] - todays_features.at[idx, 'away_forward_xgar']) +
+                0.008 * (todays_features.at[idx, 'home_defense_xgar'] - todays_features.at[idx, 'away_defense_xgar']) +
+                0.01 * (todays_features.at[idx, 'home_elite_prob'] - todays_features.at[idx, 'away_elite_prob'])
+            )
+            player_adjustment += skater_edge
+            todays_features.at[idx, 'skater_goalie_edge'] = todays_features.at[idx, 'skater_goalie_edge'] + skater_edge
             todays_features.at[idx, 'player_edge_total'] = player_adjustment
             todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + player_adjustment
             todays_features.at[idx, 'final_prediction_base'] = (
@@ -2730,6 +2783,89 @@ class RealDataNHLModel:
             if note_parts and gid:
                 notes[gid] = " | ".join(note_parts)
 
+        return notes
+    
+    def apply_goalie_context_features(
+        self,
+        todays_games: pd.DataFrame,
+        todays_features: pd.DataFrame,
+        goalie_df: Optional[pd.DataFrame]
+    ) -> Dict[str, str]:
+        """Map goalie rolling GSAx/prob_start into today's feature rows and return summary notes."""
+        notes: Dict[str, str] = {}
+        if goalie_df is None or todays_features is None or todays_games is None:
+            return notes
+        if goalie_df.empty or todays_features.empty:
+            return notes
+        df = goalie_df.copy()
+        df['team'] = df['team'].astype(str).str.upper().str.strip()
+        df['goalie'] = df.get('goalie', df.get('player', '')).astype(str).str.strip()
+        df['gsax_rolling'] = pd.to_numeric(df.get('gsax_rolling', 0.0), errors='coerce').fillna(0.0)
+        df['prob_start'] = pd.to_numeric(df.get('prob_start', 1.0), errors='coerce').fillna(1.0).clip(0.0, 1.0)
+        team_goalies: Dict[str, Dict[str, Any]] = {}
+        for team, grp in df.groupby('team'):
+            if grp.empty:
+                continue
+            total_prob = float(grp['prob_start'].sum())
+            weights = grp['prob_start'] / total_prob if total_prob > 0 else np.full(len(grp), 1.0 / len(grp))
+            exp_gsax = float((grp['gsax_rolling'] * weights).sum())
+            idx_max = grp['prob_start'].idxmax()
+            primary = grp.loc[idx_max]
+            starter_name = str(primary.get('goalie') or primary.get('player') or '')
+            starter_prob = float(primary.get('prob_start', 1.0))
+            starter_gsax = float(primary.get('gsax_rolling', exp_gsax))
+            team_goalies[team] = {
+                'expected_gsax': exp_gsax,
+                'starter': starter_name,
+                'starter_prob': starter_prob,
+                'starter_gsax': starter_gsax
+            }
+        if not team_goalies:
+            return notes
+
+        def clamp(val: float, low: float, high: float) -> float:
+            return max(low, min(high, val))
+
+        for idx in todays_features.index:
+            try:
+                home_team = str(todays_features.at[idx, 'home_team']).upper()
+                away_team = str(todays_features.at[idx, 'away_team']).upper()
+            except Exception:
+                continue
+            home_info = team_goalies.get(home_team)
+            away_info = team_goalies.get(away_team)
+            if home_info:
+                todays_features.at[idx, 'home_goalie_gsax'] = home_info['expected_gsax']
+                todays_features.at[idx, 'home_goalie_prob'] = home_info['starter_prob']
+            if away_info:
+                todays_features.at[idx, 'away_goalie_gsax'] = away_info['expected_gsax']
+                todays_features.at[idx, 'away_goalie_prob'] = away_info['starter_prob']
+            home_adj = -0.12 * float(home_info['expected_gsax']) if home_info else 0.0
+            away_adj = -0.12 * float(away_info['expected_gsax']) if away_info else 0.0
+            home_adj = clamp(home_adj, -0.45, 0.45)
+            away_adj = clamp(away_adj, -0.45, 0.45)
+            goalie_adjustment = home_adj + away_adj
+            todays_features.at[idx, 'home_goalie_adj'] = home_adj
+            todays_features.at[idx, 'away_goalie_adj'] = away_adj
+            todays_features.at[idx, 'skater_goalie_edge'] = todays_features.at[idx, 'skater_goalie_edge'] + goalie_adjustment
+            todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + goalie_adjustment
+            todays_features.at[idx, 'final_prediction_base'] = (
+                todays_features.at[idx, 'base_total_prediction'] + todays_features.at[idx, 'total_adjustments']
+            )
+            gid = None
+            if 'game_id' in todays_features.columns:
+                gid_raw = todays_features.at[idx, 'game_id']
+                gid = str(gid_raw) if pd.notna(gid_raw) else None
+            if gid:
+                home_note = None
+                away_note = None
+                if home_info and home_info.get('starter'):
+                    home_note = f"{home_team}: {home_info['starter']} ({home_info['expected_gsax']:+.2f} GSAx, {home_info['starter_prob']:.0%})"
+                if away_info and away_info.get('starter'):
+                    away_note = f"{away_team}: {away_info['starter']} ({away_info['expected_gsax']:+.2f} GSAx, {away_info['starter_prob']:.0%})"
+                note_bits = [bit for bit in [home_note, away_note] if bit]
+                if note_bits:
+                    notes[gid] = " vs ".join(note_bits)
         return notes
 
     def write_environment_template(self, todays_games: pd.DataFrame, out_path: str, overwrite_today: bool = False) -> None:
@@ -3072,9 +3208,20 @@ class RealDataNHLModel:
             'home_5v5_ewm', 'away_5v5_ewm', 'home_shoot_pct_l5', 'away_shoot_pct_l5',
             'home_save_pct_l5', 'away_save_pct_l5',
             # Shot quality/creation
-            'home_rush60','away_rush60','home_rebounds60','away_rebounds60','home_slot60','away_slot60',
-            'home_finish_delta','away_finish_delta',
-            'special_teams_index','special_teams_diff'
+            'home_rush60', 'away_rush60', 'home_rebounds60', 'away_rebounds60', 'home_slot60', 'away_slot60',
+            'home_finish_delta', 'away_finish_delta',
+            'special_teams_index', 'special_teams_diff',
+            # Skater/goalie context
+            'home_active_xgar', 'away_active_xgar',
+            'home_active_rapm_off', 'away_active_rapm_off',
+            'home_active_rapm_def', 'away_active_rapm_def',
+            'home_top_line_xgar', 'away_top_line_xgar',
+            'home_forward_xgar', 'away_forward_xgar',
+            'home_defense_xgar', 'away_defense_xgar',
+            'home_elite_prob', 'away_elite_prob',
+            'home_goalie_gsax', 'away_goalie_gsax',
+            'home_goalie_prob', 'away_goalie_prob',
+            'skater_goalie_edge'
         ]
         # Add rink bias proxy and penalties
         extra_optional = [
@@ -3448,6 +3595,23 @@ class RealDataNHLModel:
                 goal_features_scaled = goal_scaler.transform(feature_row)
             except Exception:
                 goal_features_scaled = None
+        hm_flow: Optional[float] = None
+        am_flow: Optional[float] = None
+        goal_flow_model = (self.total_model or {}).get('goal_flow_model')
+        if goal_flow_model is not None and goal_features_scaled is not None:
+            try:
+                flow_pred = goal_flow_model.predict(goal_features_scaled)
+                if isinstance(flow_pred, np.ndarray):
+                    if flow_pred.ndim == 1:
+                        flow_values = flow_pred.reshape(1, -1)
+                    else:
+                        flow_values = flow_pred
+                    hm_flow = float(max(0.05, flow_values[0][0]))
+                    second_idx = 1 if flow_values.shape[1] > 1 else 0
+                    am_flow = float(max(0.05, flow_values[0][second_idx]))
+            except Exception:
+                hm_flow = None
+                am_flow = None
         
         # Get predictions from ensemble
         models = self.total_model.get('models', {})
@@ -3498,6 +3662,10 @@ class RealDataNHLModel:
             predicted_total = 0.6 * ensemble_pred + 0.4 * poisson_mu
         else:
             predicted_total = ensemble_pred
+        if hm_flow is not None and am_flow is not None:
+            flow_total = hm_flow + am_flow
+            ref_total = poisson_mu if poisson_mu is not None else ensemble_pred
+            predicted_total = float(0.5 * predicted_total + 0.3 * flow_total + 0.2 * ref_total)
         
         if ref_goal_value is not None:
             baseline_val = getattr(self, 'ref_goal_baseline', None)
@@ -3544,23 +3712,69 @@ class RealDataNHLModel:
                 under_p = float(poisson.cdf(under_floor, mu))
                 return over_p, under_p, 0.0
 
-        # Prefer bivariate Poisson MC; else NB/Poisson totals; else Gaussian
+        # Prefer neural/ensemble copula mixture; else NB/Poisson totals; else Gaussian
         home_mu_model = (self.total_model or {}).get('home_goal_mu_model')
         away_mu_model = (self.total_model or {}).get('away_goal_mu_model')
+        hm_lr: Optional[float] = None
+        am_lr: Optional[float] = None
         if home_mu_model is not None and away_mu_model is not None and goal_features_scaled is not None:
             try:
-                hm = float(home_mu_model.predict(goal_features_scaled)[0])
-                am = float(away_mu_model.predict(goal_features_scaled)[0])
-                # Empirical correlation if learned, otherwise small positive default
-                rho = float((self.total_model or {}).get('poisson_rho', 0.15))
-                # Monte Carlo
-                sims = 50000
-                # Copula-based dependence approximation via Gaussian correlation on uniforms
-                z = np.random.multivariate_normal([0,0], [[1,rho],[rho,1]], size=sims)
-                u = norm.cdf(z)
-                home_goals = poisson.ppf(u[:,0], hm)
-                away_goals = poisson.ppf(u[:,1], am)
-                totals = home_goals + away_goals
+                hm_lr = float(home_mu_model.predict(goal_features_scaled)[0])
+                am_lr = float(away_mu_model.predict(goal_features_scaled)[0])
+            except Exception:
+                home_mu_model = None
+                away_mu_model = None
+                hm_lr = None
+                am_lr = None
+        component_mus: List[Tuple[float, float]] = []
+        component_rhos: List[float] = []
+        component_weights: List[float] = []
+        base_rho = float((self.total_model or {}).get('poisson_rho', 0.15))
+        if hm_lr is not None and am_lr is not None:
+            component_mus.append((hm_lr, am_lr))
+            component_rhos.append(float(np.clip(base_rho, 0.0, 0.5)))
+            component_weights.append(1.0)
+        sg_val = 0.0
+        try:
+            sg_idx = self.feature_names.index('skater_goalie_edge')
+            sg_val = float(game_features[sg_idx])
+        except Exception:
+            sg_val = 0.0
+        if hm_flow is not None and am_flow is not None:
+            if component_weights:
+                diff = (hm_flow + am_flow) - (hm_lr + am_lr if hm_lr is not None and am_lr is not None else 0.0)
+                flow_weight = float(np.clip(0.25 + 0.2 * np.tanh(diff / 1.5), 0.15, 0.65))
+                component_weights[0] = max(0.05, 1.0 - flow_weight)
+            else:
+                flow_weight = 1.0
+                diff = 0.0
+            rho_flow = float(np.clip(base_rho + 0.08 * np.tanh(diff / 2.0) + 0.03 * np.tanh(sg_val / 0.5), 0.05, 0.45))
+            component_mus.append((hm_flow, am_flow))
+            component_rhos.append(rho_flow)
+            component_weights.append(flow_weight)
+
+        over_prob = under_prob = push_prob = None
+        if component_mus:
+            total_w = float(sum(component_weights))
+            if not np.isfinite(total_w) or total_w <= 0:
+                component_weights = [1.0 / len(component_mus)] * len(component_mus)
+            else:
+                component_weights = [w / total_w for w in component_weights]
+            try:
+                sims = 60000
+                choices = np.random.choice(len(component_mus), size=sims, p=component_weights)
+                totals = np.zeros(sims)
+                for comp_idx, (mu_h, mu_a) in enumerate(component_mus):
+                    mask = choices == comp_idx
+                    if not mask.any():
+                        continue
+                    rho_use = component_rhos[comp_idx]
+                    cov = np.array([[1.0, rho_use], [rho_use, 1.0]])
+                    z = np.random.multivariate_normal([0, 0], cov, size=int(mask.sum()))
+                    u = norm.cdf(z)
+                    home_goals = poisson.ppf(u[:, 0], mu_h)
+                    away_goals = poisson.ppf(u[:, 1], mu_a)
+                    totals[mask] = home_goals + away_goals
                 is_integer_line = abs(betting_line - round(betting_line)) < 1e-9
                 if is_integer_line:
                     push_prob = float(np.mean(totals == round(betting_line)))
@@ -3571,19 +3785,15 @@ class RealDataNHLModel:
                     under_prob = float(np.mean(totals < betting_line))
                     over_prob = float(1.0 - under_prob)
             except Exception:
-                home_mu_model = None
-                away_mu_model = None
+                over_prob = under_prob = push_prob = None
 
-        if home_mu_model is None or away_mu_model is None:
+        if over_prob is None or under_prob is None or push_prob is None:
             if poisson_mu is not None and poisson_mu > 0:
-                # Negative binomial adjustment for overdispersion if available
                 nb = (self.total_model or {}).get('nb_params')
                 gp_model = (self.total_model or {}).get('gp_model')
                 if nb and isinstance(nb.get('k'), (int, float)) and nb['k'] > 0:
                     k = float(nb['k'])
-                    # Approximate NB tail by summing pmf up to floor(line)
                     L = int(np.floor(betting_line))
-                    # NB parameter p using mean mu = k*(1-p)/p => p = k/(k+mu)
                     p = k / (k + poisson_mu)
                     under_p = float(nbinom.cdf(L, k, p))
                     if abs(betting_line - round(betting_line)) < 1e-9:
@@ -3592,12 +3802,12 @@ class RealDataNHLModel:
                     else:
                         push_prob = 0.0
                         over_prob = float(1.0 - under_p)
+                    under_prob = under_p if push_prob == 0.0 else under_p
                 elif gp_model is not None:
                     try:
                         import statsmodels.api as sm
-                        Xg = sm.add_constant(features_scaled)
+                        Xg = sm.add_constant(poisson_features)
                         mu_gp = float(gp_model.predict(Xg)[0])
-                        # Use Poisson tail with mu_gp as proxy (GP pmf not directly used here)
                         over_prob, under_prob, push_prob = poisson_over_under_probs(max(1e-6, mu_gp), betting_line)
                     except Exception:
                         over_prob, under_prob, push_prob = poisson_over_under_probs(poisson_mu, betting_line)
@@ -7244,6 +7454,13 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             except Exception as e:
                 player_context_notes = {}
                 print(f"⚠️  Player context features skipped: {e}")
+            goalie_context_notes: Dict[str, str] = {}
+            try:
+                if goalie_rates is not None and isinstance(goalie_rates, pd.DataFrame) and not goalie_rates.empty:
+                    goalie_context_notes = model.apply_goalie_context_features(todays_games, todays_features, goalie_rates)
+            except Exception as e:
+                goalie_context_notes = {}
+                print(f"⚠️  Goalie context features skipped: {e}")
             try:
                 hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else 'odds_history.csv'
                 if hist_path and os.path.exists(hist_path):
@@ -7594,6 +7811,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         player_note = player_context_notes.get(game_id)
                         if player_note:
                             pred.lineup_info = f"{pred.lineup_info} | {player_note}" if pred.lineup_info else player_note
+                        goalie_note = goalie_context_notes.get(game_id)
+                        if goalie_note:
+                            pred.lineup_info = f"{pred.lineup_info} | {goalie_note}" if pred.lineup_info else goalie_note
                     except Exception:
                         pass
                     
