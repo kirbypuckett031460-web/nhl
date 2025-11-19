@@ -292,6 +292,8 @@ class OverUnderPrediction:
     # Optional American odds used for EV/Kelly
     over_american_odds: Optional[int] = None
     under_american_odds: Optional[int] = None
+    bet_month: Optional[str] = None
+    calibration_multiplier: Optional[float] = None
     # Added uncertainty interval (conformal) for display
     ci_lower: Optional[float] = None
     ci_upper: Optional[float] = None
@@ -1339,6 +1341,10 @@ class RealDataNHLModel:
             self.ref_goal_weight: float = float(os.getenv('REF_GOAL_WEIGHT', 0.05))
         except Exception:
             self.ref_goal_weight = 0.05
+        self.market_calibration_snapshot: Optional[Dict[str, Any]] = None
+        self.book_confidence_multipliers: Dict[str, float] = {}
+        self.month_confidence_multipliers: Dict[str, float] = {}
+        self.current_prediction_month: Optional[str] = None
 
     def _build_feature_pipeline(self) -> Pipeline:
         """Return a fresh feature transformation pipeline."""
@@ -1433,6 +1439,255 @@ class RealDataNHLModel:
             'mae': float(np.mean(np.abs(errors_arr))),
             'details': per_split
         }
+
+    @staticmethod
+    def _american_to_decimal(american: Optional[float]) -> Optional[float]:
+        try:
+            val = float(american)
+        except Exception:
+            return None
+        if val >= 100:
+            return 1.0 + (val / 100.0)
+        elif val <= -100:
+            return 1.0 + (100.0 / abs(val))
+        return None
+
+    @staticmethod
+    def _summarize_calibration_slice(df_slice: pd.DataFrame) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            'bets': int(len(df_slice)),
+            'resolved': 0,
+            'win_pct': None,
+            'avg_unit_profit': None,
+            'avg_edge_implied': None,
+            'avg_edge_realized': None,
+            'edge_gap': None,
+            'avg_clv': None,
+            'brier': None
+        }
+        if df_slice.empty:
+            return summary
+        resolved_mask = df_slice['bet_win_binary'].notna()
+        resolved = df_slice[resolved_mask]
+        summary['resolved'] = int(len(resolved))
+        if len(resolved):
+            wins = float(resolved['bet_win_binary'].sum())
+            summary['win_pct'] = float(wins / max(1.0, len(resolved)))
+        if 'unit_profit' in df_slice.columns:
+            prof = df_slice['unit_profit'].dropna()
+            if len(prof):
+                summary['avg_unit_profit'] = float(prof.mean())
+        if 'edge_signed' in df_slice.columns:
+            implied = df_slice['edge_signed'].dropna()
+            if len(implied):
+                summary['avg_edge_implied'] = float(implied.mean())
+        if 'realized_signed' in df_slice.columns:
+            realized = df_slice['realized_signed'].dropna()
+            if len(realized):
+                summary['avg_edge_realized'] = float(realized.mean())
+        if summary['avg_edge_implied'] is not None and summary['avg_edge_realized'] is not None:
+            summary['edge_gap'] = float(summary['avg_edge_realized'] - summary['avg_edge_implied'])
+        if 'clv_aligned' in df_slice.columns:
+            clv = df_slice['clv_aligned'].dropna()
+            if len(clv):
+                summary['avg_clv'] = float(clv.mean())
+        if 'model_prob' in df_slice.columns:
+            valid_prob = df_slice[['model_prob', 'bet_win_binary']].dropna()
+            if len(valid_prob):
+                diff = valid_prob['model_prob'] - valid_prob['bet_win_binary']
+                summary['brier'] = float(np.mean(np.square(diff)))
+        return summary
+
+    def _derive_calibration_multiplier(self, stats: Dict[str, Any]) -> float:
+        if not stats or stats.get('resolved', 0) < 5:
+            return 1.0
+        score = 0.0
+        edge_gap = stats.get('edge_gap')
+        if isinstance(edge_gap, (int, float)) and np.isfinite(edge_gap):
+            score += np.clip(edge_gap, -0.5, 0.5) * 0.6
+        clv = stats.get('avg_clv')
+        if isinstance(clv, (int, float)) and np.isfinite(clv):
+            score += np.clip(clv, -0.5, 0.5) * 0.4
+        roi = stats.get('avg_unit_profit')
+        if isinstance(roi, (int, float)) and np.isfinite(roi):
+            score += np.clip(roi, -0.5, 0.5) * 0.5
+        scale = 1.0 + score
+        return float(max(0.7, min(1.2, scale)))
+
+    def update_market_calibration(
+        self,
+        log_path: Optional[str],
+        historical_frame: Optional[pd.DataFrame],
+        closing_odds_path: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        self.market_calibration_snapshot = None
+        self.book_confidence_multipliers = {}
+        self.month_confidence_multipliers = {}
+        if not log_path or not os.path.exists(log_path):
+            return None
+        try:
+            logs = pd.read_csv(log_path)
+        except Exception as e:
+            print(f"⚠️  Market calibration skipped: unable to read {log_path}: {e}")
+            return None
+        if logs.empty:
+            return None
+        logs['date'] = pd.to_datetime(logs.get('date'), errors='coerce')
+        logs = logs.dropna(subset=['date'])
+        if logs.empty:
+            return None
+        logs['bet_month'] = logs['date'].dt.to_period('M').astype(str)
+        if 'game_id' in logs.columns:
+            logs['game_id'] = logs['game_id'].astype(str)
+        else:
+            logs['game_id'] = ''
+        if 'closing_total' not in logs.columns:
+            logs['closing_total'] = np.nan
+        logs['closing_total'] = pd.to_numeric(logs['closing_total'], errors='coerce')
+        logs['line'] = pd.to_numeric(logs.get('line'), errors='coerce')
+        logs['pred_total'] = pd.to_numeric(logs.get('pred_total'), errors='coerce')
+        logs['edge'] = pd.to_numeric(logs.get('edge'), errors='coerce')
+        logs['price'] = pd.to_numeric(logs['price'], errors='coerce') if 'price' in logs.columns else np.nan
+        logs['model_prob'] = pd.to_numeric(logs['model_prob'], errors='coerce') if 'model_prob' in logs.columns else np.nan
+        logs['market_prob_logged'] = pd.to_numeric(logs['market_prob'], errors='coerce') if 'market_prob' in logs.columns else np.nan
+        logs['fair_prob_logged'] = pd.to_numeric(logs['fair_prob'], errors='coerce') if 'fair_prob' in logs.columns else np.nan
+        logs['clv_vs_closing'] = pd.to_numeric(logs['clv_vs_closing'], errors='coerce') if 'clv_vs_closing' in logs.columns else np.nan
+        if 'best_book' not in logs.columns:
+            logs['best_book'] = ''
+        if 'matchup' not in logs.columns:
+            logs['matchup'] = ''
+
+        closing_lookup = None
+        if closing_odds_path and os.path.exists(closing_odds_path):
+            try:
+                with open(closing_odds_path, 'r') as f:
+                    closing_lookup = json.load(f)
+            except Exception:
+                closing_lookup = None
+        if closing_lookup:
+            close_total = []
+            close_over = []
+            close_under = []
+            for _, row in logs.iterrows():
+                gid = str(row.get('game_id', ''))
+                matchup = row.get('matchup')
+                rec = closing_lookup.get(gid) if gid in closing_lookup else closing_lookup.get(matchup)
+                if isinstance(rec, dict):
+                    close_total.append(rec.get('closing_total'))
+                    close_over.append(rec.get('closing_over'))
+                    close_under.append(rec.get('closing_under'))
+                else:
+                    close_total.append(np.nan)
+                    close_over.append(np.nan)
+                    close_under.append(np.nan)
+            logs['closing_total'] = logs['closing_total'].fillna(pd.to_numeric(pd.Series(close_total), errors='coerce'))
+            logs['closing_over_price'] = pd.to_numeric(pd.Series(close_over), errors='coerce')
+            logs['closing_under_price'] = pd.to_numeric(pd.Series(close_under), errors='coerce')
+        else:
+            logs['closing_over_price'] = np.nan
+            logs['closing_under_price'] = np.nan
+
+        logs['bet_date_only'] = logs['date'].dt.date
+        logs['final_total'] = np.nan
+        if historical_frame is not None and not historical_frame.empty:
+            hist = historical_frame[['game_id', 'date', 'home_team', 'away_team', 'total_goals']].copy()
+            hist['game_id'] = hist['game_id'].astype(str)
+            hist['matchup'] = hist['away_team'].astype(str).str.upper() + '@' + hist['home_team'].astype(str).str.upper()
+            hist['date_only'] = pd.to_datetime(hist['date'], errors='coerce').dt.date
+            logs = logs.merge(hist[['game_id', 'total_goals']], on='game_id', how='left')
+            logs = logs.rename(columns={'total_goals': 'final_total'})
+            missing = logs['final_total'].isna()
+            if missing.any():
+                match_hist = hist[['matchup', 'date_only', 'total_goals']].rename(columns={'total_goals': 'final_total_match'})
+                logs = logs.merge(match_hist, left_on=['matchup', 'bet_date_only'], right_on=['matchup', 'date_only'], how='left')
+                logs['final_total'] = logs['final_total'].fillna(logs['final_total_match'])
+                logs.drop(columns=[col for col in ['final_total_match', 'date_only'] if col in logs.columns], inplace=True, errors='ignore')
+        logs['final_total'] = pd.to_numeric(logs['final_total'], errors='coerce')
+
+        if 'side' in logs.columns:
+            side = logs['side'].astype(str).str.upper()
+        else:
+            side = pd.Series('', index=logs.index)
+        logs['edge_signed'] = np.where(side == 'OVER', logs['edge'], -logs['edge'])
+        logs['realized_signed'] = np.where(
+            side == 'OVER',
+            logs['final_total'] - logs['line'],
+            logs['line'] - logs['final_total']
+        )
+        logs['clv_aligned'] = np.where(
+            np.isnan(logs['closing_total']),
+            np.nan,
+            np.where(side == 'OVER', logs['closing_total'] - logs['line'], logs['line'] - logs['closing_total'])
+        )
+        logs['decimal_price'] = logs['price'].apply(self._american_to_decimal)
+        logs['outcome'] = None
+        can_score = logs['line'].notna() & logs['final_total'].notna()
+        logs.loc[can_score & (logs['final_total'] > logs['line']), 'outcome'] = 'OVER'
+        logs.loc[can_score & (logs['final_total'] < logs['line']), 'outcome'] = 'UNDER'
+        logs.loc[can_score & (logs['final_total'] == logs['line']), 'outcome'] = 'PUSH'
+        logs['bet_win_binary'] = np.where(
+            logs['outcome'].isin(['OVER', 'UNDER']),
+            (logs['outcome'] == side).astype(float),
+            np.nan
+        )
+        logs['unit_profit'] = np.nan
+        win_mask = logs['outcome'] == side
+        loss_mask = logs['outcome'].isin(['OVER', 'UNDER']) & (~win_mask)
+        push_mask = logs['outcome'] == 'PUSH'
+        logs.loc[win_mask, 'unit_profit'] = logs.loc[win_mask, 'decimal_price'] - 1.0
+        logs.loc[loss_mask, 'unit_profit'] = -1.0
+        logs.loc[push_mask, 'unit_profit'] = 0.0
+        logs['book_key'] = logs['best_book'].astype(str).str.upper().str.strip() if 'best_book' in logs.columns else ''
+
+        overall_summary = self._summarize_calibration_slice(logs)
+        month_summary: Dict[str, Dict[str, Any]] = {}
+        for month, grp in logs.groupby('bet_month'):
+            month_summary[month] = self._summarize_calibration_slice(grp)
+            self.month_confidence_multipliers[month] = self._derive_calibration_multiplier(month_summary[month])
+        book_summary: Dict[str, Dict[str, Any]] = {}
+        if 'book_key' in logs.columns:
+            for book, grp in logs.groupby('book_key'):
+                key = book or ''
+                if not key.strip():
+                    continue
+                book_summary[key] = self._summarize_calibration_slice(grp)
+                self.book_confidence_multipliers[key] = self._derive_calibration_multiplier(book_summary[key])
+
+        snapshot = {
+            'updated_at': datetime.utcnow().isoformat(),
+            'overall': overall_summary,
+            'by_month': month_summary,
+            'by_book': book_summary
+        }
+        self.market_calibration_snapshot = snapshot
+        return snapshot
+
+    def get_market_multiplier(self, book: Optional[str], bet_month: Optional[str]) -> float:
+        mult = 1.0
+        if bet_month:
+            mult *= self.month_confidence_multipliers.get(bet_month, 1.0)
+        if book:
+            key = str(book).upper().strip()
+            if key:
+                mult *= self.book_confidence_multipliers.get(key, 1.0)
+        return float(max(0.6, min(1.4, mult)))
+
+    def apply_market_calibration_adjustments(self, prediction: OverUnderPrediction, bet_month: Optional[str]) -> None:
+        book = prediction.best_over_book if prediction.recommendation == 'OVER' else prediction.best_under_book
+        mult = self.get_market_multiplier(book, bet_month)
+        prediction.calibration_multiplier = mult
+        if prediction.recommendation == 'No Bet':
+            return
+        try:
+            kelly_units = float(prediction.kelly_bet_size) / 100.0
+        except Exception:
+            kelly_units = None
+        if kelly_units is not None and kelly_units > 0:
+            adj = min(self.kelly_cap_pct / 100.0, max(0.0, kelly_units * mult))
+            prediction.kelly_bet_size = adj * 100.0
+        if isinstance(prediction.confidence, (int, float)):
+            prediction.confidence = float(min(0.97, max(0.05, prediction.confidence + (mult - 1.0) * 0.08)))
+
         
     def fetch_historical_games(self, days_back: int = 30) -> pd.DataFrame:
         """Fetch historical games data with robust error handling"""
@@ -2256,224 +2511,226 @@ class RealDataNHLModel:
         except Exception:
             return {}
         return team_strength
-  
-      def load_player_metrics(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
-          """Load player-level RAPM/xGAR/injury context from CSV or JSON.
-  
-          Expected columns (flexible, best effort):
-            team, player, position, status, prob_play, rapm_off, rapm_def, xgar, line_slot
-          """
-          if not path_or_url:
-              return None
-          source = str(path_or_url).strip()
-          if not source:
-              return None
-          try:
-              is_url = bool(re.match(r'^https?://', source, flags=re.IGNORECASE))
-              if is_url:
-                  resp = requests.get(source, timeout=25)
-                  resp.raise_for_status()
-                  text = resp.text
-                  if source.lower().endswith('.json') or text.lstrip().startswith(('{', '[')):
-                      raw = json.loads(text)
-                      payload = raw.get('players') if isinstance(raw, dict) and 'players' in raw else raw
-                      df = pd.DataFrame(payload)
-                  else:
-                      df = pd.read_csv(io.StringIO(text))
-              else:
-                  if not os.path.exists(source):
-                      print(f"⚠️  Player metrics path not found: {source}")
-                      return None
-                  if source.lower().endswith('.json'):
-                      with open(source, 'r') as f:
-                          raw = json.load(f)
-                      if isinstance(raw, dict) and 'players' in raw:
-                          raw = raw['players']
-                      df = pd.DataFrame(raw)
-                  else:
-                      df = pd.read_csv(source)
-          except Exception as e:
-              print(f"⚠️  Failed to load player metrics from {path_or_url}: {e}")
-              return None
-  
-          if df is None or df.empty:
-              return None
-  
-          rename_candidates = {
-              'Team': 'team', 'TEAM': 'team', 'Abbreviation': 'team', 'abbr': 'team', 'teamAbbrev': 'team',
-              'Player': 'player', 'player_name': 'player', 'Player Name': 'player', 'name': 'player',
-              'Pos': 'position', 'POS': 'position', 'role': 'position',
-              'status_text': 'status', 'availability': 'status',
-              'probability': 'prob_play', 'prob_start': 'prob_play', 'prob_playing': 'prob_play',
-              'likelihood': 'prob_play', 'chance': 'prob_play',
-              'rapm_offense': 'rapm_off', 'rapm_offensive': 'rapm_off',
-              'rapm_defense': 'rapm_def', 'rapm_defensive': 'rapm_def',
-              'xGAR': 'xgar', 'GAR': 'xgar', 'xgar_total': 'xgar',
-              'line': 'line_slot', 'line_assignment': 'line_slot'
-          }
-          for old_name, new_name in rename_candidates.items():
-              if old_name in df.columns and new_name not in df.columns:
-                  df = df.rename(columns={old_name: new_name})
-  
-          if 'team' not in df.columns:
-              for alt in ['Team', 'TEAM', 'Abbreviation', 'abbr', 'team_code']:
-                  if alt in df.columns:
-                      df = df.rename(columns={alt: 'team'})
-                      break
-          if 'player' not in df.columns:
-              for alt in ['Player', 'player_name', 'name']:
-                  if alt in df.columns:
-                      df = df.rename(columns={alt: 'player'})
-                      break
-  
-          if 'team' not in df.columns or 'player' not in df.columns:
-              print("⚠️  Player metrics missing team/player columns")
-              return None
-  
-          df['team'] = df['team'].astype(str).str.upper().str.strip()
-          df['player'] = df['player'].astype(str).str.strip()
-          if 'position' not in df.columns:
-              df['position'] = 'F'
-          df['position'] = df['position'].astype(str).str.upper().str.strip()
-          if 'status' not in df.columns:
-              df['status'] = 'ACTIVE'
-  
-          def status_to_prob(status: Any) -> float:
-              if status is None or (isinstance(status, float) and np.isnan(status)):
-                  return 1.0
-              s = str(status).strip().lower()
-              if not s:
-                  return 1.0
-              if any(tag in s for tag in ['out', 'ltir', 'ir', 'suspended']):
-                  return 0.0
-              if any(tag in s for tag in ['doubtful']):
-                  return 0.25
-              if any(tag in s for tag in ['questionable', 'day-to-day', 'day to day', 'gametime', 'game-time']):
-                  return 0.55
-              if any(tag in s for tag in ['probable', 'expected']):
-                  return 0.9
-              return 1.0
-  
-          if 'prob_play' in df.columns:
-              df['prob_play'] = pd.to_numeric(df['prob_play'], errors='coerce')
-          else:
-              df['prob_play'] = np.nan
-          df['prob_play'] = df['prob_play'].where(df['prob_play'].between(0.0, 1.0), np.nan)
-          df['prob_play'] = df.apply(
-              lambda row: float(status_to_prob(row.get('status'))) if np.isnan(row.get('prob_play', np.nan)) else float(row['prob_play']),
-              axis=1
-          )
-          df['prob_play'] = df['prob_play'].clip(0.0, 1.0)
-  
-          for col in ['rapm_off', 'rapm_def', 'xgar']:
-              df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0) if col in df.columns else 0.0
-          if 'line_slot' in df.columns:
-              df['line_slot'] = df['line_slot'].astype(str).str.upper().str.strip()
-          else:
-              df['line_slot'] = ''
-  
-          return df
-  
-      def apply_player_context_features(
-          self,
-          todays_games: pd.DataFrame,
-          todays_features: pd.DataFrame,
-          player_df: Optional[pd.DataFrame]
-      ) -> Dict[str, str]:
-          """Inject player-level aggregates into today's features and return display notes per game."""
-          notes: Dict[str, str] = {}
-          if player_df is None or todays_features is None or todays_games is None:
-              return notes
-          if player_df.empty or todays_features.empty:
-              return notes
-  
-          df = player_df.copy()
-          df['prob_play'] = pd.to_numeric(df.get('prob_play', 1.0), errors='coerce').fillna(1.0).clip(0.0, 1.0)
-          for col in ['rapm_off', 'rapm_def', 'xgar']:
-              if col in df.columns:
-                  df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-              else:
-                  df[col] = 0.0
-          df['team'] = df['team'].astype(str).str.upper().str.strip()
-          df['player'] = df['player'].astype(str).str.strip()
-          df['position'] = df.get('position', 'F')
-          df['position'] = df['position'].astype(str).str.upper().str.strip()
-          df['status'] = df.get('status', 'ACTIVE').astype(str)
-  
-          team_summary: Dict[str, Dict[str, Any]] = {}
-          for team, grp in df.groupby('team'):
-              weights = grp['prob_play']
-              active_xgar = float((grp['xgar'] * weights).sum())
-              active_rapm_off = float((grp['rapm_off'] * weights).sum())
-              active_rapm_def = float((grp['rapm_def'] * weights).sum())
-              top_line_xgar = float(grp.sort_values('xgar', ascending=False).head(6)['xgar'].sum())
-              missing = grp[weights < 0.5].sort_values('xgar', ascending=False)
-              missing_names = [f"{row['player']} ({row['position']})" for _, row in missing.iterrows()]
-              missing_value = float(missing['xgar'].clip(lower=0.0).sum())
-              status_penalty = float(-0.04 * missing_value)
-              team_summary[team] = {
-                  'active_xgar': active_xgar,
-                  'active_rapm_off': active_rapm_off,
-                  'active_rapm_def': active_rapm_def,
-                  'top_line_xgar': top_line_xgar,
-                  'status_penalty': status_penalty,
-                  'missing_names': missing_names
-              }
-  
-          if team_summary == {}:
-              return notes
-  
-          if 'player_edge_total' not in todays_features.columns:
-              todays_features['player_edge_total'] = 0.0
-  
-          for idx in todays_features.index:
-              try:
-                  home_team = str(todays_features.at[idx, 'home_team']).upper()
-                  away_team = str(todays_features.at[idx, 'away_team']).upper()
-              except Exception:
-                  continue
-              home_summary = team_summary.get(home_team, {})
-              away_summary = team_summary.get(away_team, {})
-  
-              def val(summary: Dict[str, Any], key: str) -> float:
-                  return float(summary.get(key, 0.0)) if summary else 0.0
-  
-              todays_features.at[idx, 'home_active_xgar'] = val(home_summary, 'active_xgar')
-              todays_features.at[idx, 'away_active_xgar'] = val(away_summary, 'active_xgar')
-              todays_features.at[idx, 'home_active_rapm_off'] = val(home_summary, 'active_rapm_off')
-              todays_features.at[idx, 'away_active_rapm_off'] = val(away_summary, 'active_rapm_off')
-              todays_features.at[idx, 'home_active_rapm_def'] = val(home_summary, 'active_rapm_def')
-              todays_features.at[idx, 'away_active_rapm_def'] = val(away_summary, 'active_rapm_def')
-              todays_features.at[idx, 'home_top_line_xgar'] = val(home_summary, 'top_line_xgar')
-              todays_features.at[idx, 'away_top_line_xgar'] = val(away_summary, 'top_line_xgar')
-              todays_features.at[idx, 'home_player_status_penalty'] = val(home_summary, 'status_penalty')
-              todays_features.at[idx, 'away_player_status_penalty'] = val(away_summary, 'status_penalty')
-  
-              player_adjustment = (
-                  0.02 * (todays_features.at[idx, 'home_active_xgar'] - todays_features.at[idx, 'away_active_xgar']) +
-                  0.015 * (todays_features.at[idx, 'home_active_rapm_off'] - todays_features.at[idx, 'away_active_rapm_off']) -
-                  0.015 * (todays_features.at[idx, 'home_active_rapm_def'] - todays_features.at[idx, 'away_active_rapm_def']) +
-                  0.01 * (todays_features.at[idx, 'home_top_line_xgar'] - todays_features.at[idx, 'away_top_line_xgar']) +
-                  todays_features.at[idx, 'home_player_status_penalty'] +
-                  todays_features.at[idx, 'away_player_status_penalty']
-              )
-              todays_features.at[idx, 'player_edge_total'] = player_adjustment
-              todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + player_adjustment
-              todays_features.at[idx, 'final_prediction_base'] = todays_features.at[idx, 'base_total_prediction'] + todays_features.at[idx, 'total_adjustments']
-  
-              gid = None
-              if 'game_id' in todays_features.columns:
-                  gid_raw = todays_features.at[idx, 'game_id']
-                  gid = str(gid_raw) if pd.notna(gid_raw) else None
-              note_parts: List[str] = []
-              if home_summary.get('missing_names'):
-                  note_parts.append(f"{home_team}: -" + ", ".join(home_summary['missing_names'][:3]))
-              if away_summary.get('missing_names'):
-                  note_parts.append(f"{away_team}: -" + ", ".join(away_summary['missing_names'][:3]))
-              if note_parts and gid:
-                  notes[gid] = " | ".join(note_parts)
-  
-          return notes
+    
+    def load_player_metrics(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
+        """Load player-level RAPM/xGAR/injury context from CSV or JSON.
+
+        Expected columns (flexible, best effort):
+          team, player, position, status, prob_play, rapm_off, rapm_def, xgar, line_slot
+        """
+        if not path_or_url:
+            return None
+        source = str(path_or_url).strip()
+        if not source:
+            return None
+        try:
+            is_url = bool(re.match(r'^https?://', source, flags=re.IGNORECASE))
+            if is_url:
+                resp = requests.get(source, timeout=25)
+                resp.raise_for_status()
+                text = resp.text
+                if source.lower().endswith('.json') or text.lstrip().startswith(('{', '[')):
+                    raw = json.loads(text)
+                    payload = raw.get('players') if isinstance(raw, dict) and 'players' in raw else raw
+                    df = pd.DataFrame(payload)
+                else:
+                    df = pd.read_csv(io.StringIO(text))
+            else:
+                if not os.path.exists(source):
+                    print(f"⚠️  Player metrics path not found: {source}")
+                    return None
+                if source.lower().endswith('.json'):
+                    with open(source, 'r') as f:
+                        raw = json.load(f)
+                    if isinstance(raw, dict) and 'players' in raw:
+                        raw = raw['players']
+                    df = pd.DataFrame(raw)
+                else:
+                    df = pd.read_csv(source)
+        except Exception as e:
+            print(f"⚠️  Failed to load player metrics from {path_or_url}: {e}")
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        rename_candidates = {
+            'Team': 'team', 'TEAM': 'team', 'Abbreviation': 'team', 'abbr': 'team', 'teamAbbrev': 'team',
+            'Player': 'player', 'player_name': 'player', 'Player Name': 'player', 'name': 'player',
+            'Pos': 'position', 'POS': 'position', 'role': 'position',
+            'status_text': 'status', 'availability': 'status',
+            'probability': 'prob_play', 'prob_start': 'prob_play', 'prob_playing': 'prob_play',
+            'likelihood': 'prob_play', 'chance': 'prob_play',
+            'rapm_offense': 'rapm_off', 'rapm_offensive': 'rapm_off',
+            'rapm_defense': 'rapm_def', 'rapm_defensive': 'rapm_def',
+            'xGAR': 'xgar', 'GAR': 'xgar', 'xgar_total': 'xgar',
+            'line': 'line_slot', 'line_assignment': 'line_slot'
+        }
+        for old_name, new_name in rename_candidates.items():
+            if old_name in df.columns and new_name not in df.columns:
+                df = df.rename(columns={old_name: new_name})
+
+        if 'team' not in df.columns:
+            for alt in ['Team', 'TEAM', 'Abbreviation', 'abbr', 'team_code']:
+                if alt in df.columns:
+                    df = df.rename(columns={alt: 'team'})
+                    break
+        if 'player' not in df.columns:
+            for alt in ['Player', 'player_name', 'name']:
+                if alt in df.columns:
+                    df = df.rename(columns={alt: 'player'})
+                    break
+
+        if 'team' not in df.columns or 'player' not in df.columns:
+            print("⚠️  Player metrics missing team/player columns")
+            return None
+
+        df['team'] = df['team'].astype(str).str.upper().str.strip()
+        df['player'] = df['player'].astype(str).str.strip()
+        if 'position' not in df.columns:
+            df['position'] = 'F'
+        df['position'] = df['position'].astype(str).str.upper().str.strip()
+        if 'status' not in df.columns:
+            df['status'] = 'ACTIVE'
+
+        def status_to_prob(status: Any) -> float:
+            if status is None or (isinstance(status, float) and np.isnan(status)):
+                return 1.0
+            s = str(status).strip().lower()
+            if not s:
+                return 1.0
+            if any(tag in s for tag in ['out', 'ltir', 'ir', 'suspended']):
+                return 0.0
+            if any(tag in s for tag in ['doubtful']):
+                return 0.25
+            if any(tag in s for tag in ['questionable', 'day-to-day', 'day to day', 'gametime', 'game-time']):
+                return 0.55
+            if any(tag in s for tag in ['probable', 'expected']):
+                return 0.9
+            return 1.0
+
+        if 'prob_play' in df.columns:
+            df['prob_play'] = pd.to_numeric(df['prob_play'], errors='coerce')
+        else:
+            df['prob_play'] = np.nan
+        df['prob_play'] = df['prob_play'].where(df['prob_play'].between(0.0, 1.0), np.nan)
+        df['prob_play'] = df.apply(
+            lambda row: float(status_to_prob(row.get('status'))) if np.isnan(row.get('prob_play', np.nan)) else float(row['prob_play']),
+            axis=1
+        )
+        df['prob_play'] = df['prob_play'].clip(0.0, 1.0)
+
+        for col in ['rapm_off', 'rapm_def', 'xgar']:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0) if col in df.columns else 0.0
+        if 'line_slot' in df.columns:
+            df['line_slot'] = df['line_slot'].astype(str).str.upper().str.strip()
+        else:
+            df['line_slot'] = ''
+
+        return df
+
+    def apply_player_context_features(
+        self,
+        todays_games: pd.DataFrame,
+        todays_features: pd.DataFrame,
+        player_df: Optional[pd.DataFrame]
+    ) -> Dict[str, str]:
+        """Inject player-level aggregates into today's features and return display notes per game."""
+        notes: Dict[str, str] = {}
+        if player_df is None or todays_features is None or todays_games is None:
+            return notes
+        if player_df.empty or todays_features.empty:
+            return notes
+
+        df = player_df.copy()
+        df['prob_play'] = pd.to_numeric(df.get('prob_play', 1.0), errors='coerce').fillna(1.0).clip(0.0, 1.0)
+        for col in ['rapm_off', 'rapm_def', 'xgar']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+            else:
+                df[col] = 0.0
+        df['team'] = df['team'].astype(str).str.upper().str.strip()
+        df['player'] = df['player'].astype(str).str.strip()
+        df['position'] = df.get('position', 'F')
+        df['position'] = df['position'].astype(str).str.upper().str.strip()
+        df['status'] = df.get('status', 'ACTIVE').astype(str)
+
+        team_summary: Dict[str, Dict[str, Any]] = {}
+        for team, grp in df.groupby('team'):
+            weights = grp['prob_play']
+            active_xgar = float((grp['xgar'] * weights).sum())
+            active_rapm_off = float((grp['rapm_off'] * weights).sum())
+            active_rapm_def = float((grp['rapm_def'] * weights).sum())
+            top_line_xgar = float(grp.sort_values('xgar', ascending=False).head(6)['xgar'].sum())
+            missing = grp[weights < 0.5].sort_values('xgar', ascending=False)
+            missing_names = [f"{row['player']} ({row['position']})" for _, row in missing.iterrows()]
+            missing_value = float(missing['xgar'].clip(lower=0.0).sum())
+            status_penalty = float(-0.04 * missing_value)
+            team_summary[team] = {
+                'active_xgar': active_xgar,
+                'active_rapm_off': active_rapm_off,
+                'active_rapm_def': active_rapm_def,
+                'top_line_xgar': top_line_xgar,
+                'status_penalty': status_penalty,
+                'missing_names': missing_names
+            }
+
+        if not team_summary:
+            return notes
+
+        if 'player_edge_total' not in todays_features.columns:
+            todays_features['player_edge_total'] = 0.0
+
+        for idx in todays_features.index:
+            try:
+                home_team = str(todays_features.at[idx, 'home_team']).upper()
+                away_team = str(todays_features.at[idx, 'away_team']).upper()
+            except Exception:
+                continue
+            home_summary = team_summary.get(home_team, {})
+            away_summary = team_summary.get(away_team, {})
+
+            def val(summary: Dict[str, Any], key: str) -> float:
+                return float(summary.get(key, 0.0)) if summary else 0.0
+
+            todays_features.at[idx, 'home_active_xgar'] = val(home_summary, 'active_xgar')
+            todays_features.at[idx, 'away_active_xgar'] = val(away_summary, 'active_xgar')
+            todays_features.at[idx, 'home_active_rapm_off'] = val(home_summary, 'active_rapm_off')
+            todays_features.at[idx, 'away_active_rapm_off'] = val(away_summary, 'active_rapm_off')
+            todays_features.at[idx, 'home_active_rapm_def'] = val(home_summary, 'active_rapm_def')
+            todays_features.at[idx, 'away_active_rapm_def'] = val(away_summary, 'active_rapm_def')
+            todays_features.at[idx, 'home_top_line_xgar'] = val(home_summary, 'top_line_xgar')
+            todays_features.at[idx, 'away_top_line_xgar'] = val(away_summary, 'top_line_xgar')
+            todays_features.at[idx, 'home_player_status_penalty'] = val(home_summary, 'status_penalty')
+            todays_features.at[idx, 'away_player_status_penalty'] = val(away_summary, 'status_penalty')
+
+            player_adjustment = (
+                0.02 * (todays_features.at[idx, 'home_active_xgar'] - todays_features.at[idx, 'away_active_xgar']) +
+                0.015 * (todays_features.at[idx, 'home_active_rapm_off'] - todays_features.at[idx, 'away_active_rapm_off']) -
+                0.015 * (todays_features.at[idx, 'home_active_rapm_def'] - todays_features.at[idx, 'away_active_rapm_def']) +
+                0.01 * (todays_features.at[idx, 'home_top_line_xgar'] - todays_features.at[idx, 'away_top_line_xgar']) +
+                todays_features.at[idx, 'home_player_status_penalty'] +
+                todays_features.at[idx, 'away_player_status_penalty']
+            )
+            todays_features.at[idx, 'player_edge_total'] = player_adjustment
+            todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + player_adjustment
+            todays_features.at[idx, 'final_prediction_base'] = (
+                todays_features.at[idx, 'base_total_prediction'] + todays_features.at[idx, 'total_adjustments']
+            )
+
+            gid = None
+            if 'game_id' in todays_features.columns:
+                gid_raw = todays_features.at[idx, 'game_id']
+                gid = str(gid_raw) if pd.notna(gid_raw) else None
+            note_parts: List[str] = []
+            if home_summary.get('missing_names'):
+                note_parts.append(f"{home_team}: -" + ", ".join(home_summary['missing_names'][:3]))
+            if away_summary.get('missing_names'):
+                note_parts.append(f"{away_team}: -" + ", ".join(away_summary['missing_names'][:3]))
+            if note_parts and gid:
+                notes[gid] = " | ".join(note_parts)
+
+        return notes
 
     def write_environment_template(self, todays_games: pd.DataFrame, out_path: str, overwrite_today: bool = False) -> None:
         """Write/merge an environment.json template for today's games.
@@ -5260,7 +5517,11 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         rec_side = p.recommendation
         my_line = p.betting_line
         close_total = None
+        closing_price = None
+        closing_source = None
         clv = None
+        closing_over_price = None
+        closing_under_price = None
         if isinstance(closing, dict):
             rec = closing.get(gid, closing.get(matchup))
             if isinstance(rec, dict):
@@ -5268,11 +5529,24 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
                     close_total = float(rec.get('closing_total'))
                 except Exception:
                     close_total = None
+                closing_source = rec.get('book') or rec.get('source')
+                try:
+                    closing_over_price = float(rec.get('closing_over'))
+                except Exception:
+                    closing_over_price = None
+                try:
+                    closing_under_price = float(rec.get('closing_under'))
+                except Exception:
+                    closing_under_price = None
         if close_total is not None:
             try:
                 clv = float((my_line - close_total) if rec_side == 'OVER' else (close_total - my_line))
             except Exception:
                 clv = None
+        if rec_side == 'OVER':
+            closing_price = closing_over_price
+        else:
+            closing_price = closing_under_price
         rows.append({
             'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'game_id': gid,
@@ -5284,14 +5558,22 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             'edge': p.edge,
             'confidence': p.confidence,
             'kelly_pct': p.kelly_bet_size,
+            'model_prob': p.over_probability if rec_side == 'OVER' else p.under_probability,
+            'market_prob': p.market_over_prob if rec_side == 'OVER' else p.market_under_prob,
+            'fair_prob': p.fair_over_prob if rec_side == 'OVER' else p.fair_under_prob,
             'ev_novig': p.ev_over_novig if rec_side == 'OVER' else p.ev_under_novig,
             'consensus_total': p.consensus_total,
             'line_diff_vs_consensus': p.line_diff,
             'best_book': p.best_over_book if rec_side == 'OVER' else p.best_under_book,
+            'bet_month': getattr(p, 'bet_month', None),
+            'calibration_multiplier': getattr(p, 'calibration_multiplier', None),
+            'market_velocity': getattr(p, 'market_velocity', None),
             'referee_info': p.referee_info,
             'referee_avg_goals': p.referee_avg_goals,
             'referee_home_bias': p.referee_home_bias,
             'closing_total': close_total,
+            'closing_price': closing_price,
+            'closing_source': closing_source,
             'clv_vs_closing': clv
         })
 
@@ -6282,6 +6564,27 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         print(f"   📊 RMSE: {training_results['rmse']:.3f}")
         print(f"   🎯 O/U Accuracy: {training_results['over_under_accuracy']:.1%}")
         print(f"   📈 Training samples: {training_results['train_size']}")
+
+        log_path_default = getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv'
+        calibration_snapshot = model.update_market_calibration(
+            log_path=log_path_default,
+            historical_frame=historical_data,
+            closing_odds_path=getattr(cli_args, 'closing_odds_path', None) if cli_args else None
+        )
+        if calibration_snapshot:
+            overall = calibration_snapshot.get('overall', {})
+            tracked = int(overall.get('bets', 0) or 0)
+            resolved = int(overall.get('resolved', 0) or 0)
+            avg_clv = overall.get('avg_clv')
+            edge_gap = overall.get('edge_gap')
+            print(f"\n📏 Market calibration monitor: {tracked} logged bets ({resolved} resolved).")
+            msg_bits = []
+            if isinstance(avg_clv, (int, float)) and np.isfinite(avg_clv):
+                msg_bits.append(f"CLV {avg_clv:+.2f}")
+            if isinstance(edge_gap, (int, float)) and np.isfinite(edge_gap):
+                msg_bits.append(f"Realized-Implied {edge_gap:+.2f}")
+            if msg_bits:
+                print("   " + " | ".join(msg_bits))
         
         print("\n🏒 Step 4: Fetching today's games...")
         todays_games = model.get_todays_games(
@@ -6329,6 +6632,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         if target_game_date is None:
             target_game_date = datetime.now().date()
         target_game_date_str = target_game_date.strftime('%Y-%m-%d') if target_game_date else None
+        if target_game_date is not None:
+            model.current_prediction_month = target_game_date.strftime('%Y-%m')
 
         def ensure_fresh_referees_url(preferred_url: Optional[str]) -> Tuple[Optional[str], Optional[date], bool]:
             resolved = preferred_url
@@ -7291,6 +7596,32 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             pred.lineup_info = f"{pred.lineup_info} | {player_note}" if pred.lineup_info else player_note
                     except Exception:
                         pass
+                    
+                    # Apply month/book-specific calibration adjustments
+                    bet_month: Optional[str] = None
+                    raw_game_date = game.get('date')
+                    if isinstance(raw_game_date, pd.Timestamp):
+                        try:
+                            bet_month = raw_game_date.strftime('%Y-%m')
+                        except Exception:
+                            bet_month = None
+                    elif isinstance(raw_game_date, datetime):
+                        try:
+                            bet_month = pd.Timestamp(raw_game_date).strftime('%Y-%m')
+                        except Exception:
+                            bet_month = None
+                    elif isinstance(raw_game_date, str):
+                        try:
+                            bet_month = pd.to_datetime(raw_game_date, errors='coerce').strftime('%Y-%m')
+                        except Exception:
+                            bet_month = None
+                    if not bet_month:
+                        bet_month = model.current_prediction_month
+                    pred.bet_month = bet_month
+                    try:
+                        model.apply_market_calibration_adjustments(pred, bet_month=bet_month)
+                    except Exception as cal_err:
+                        print(f"⚠️  Calibration adjustment skipped for {pred.game_id}: {cal_err}")
                     
                     # Open→close calibration: nudge confidence toward markets that moved in same direction
                     try:
