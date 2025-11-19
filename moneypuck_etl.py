@@ -335,7 +335,7 @@ def normalize_goalie_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
 def estimate_current_season(reference: Optional[datetime] = None) -> int:
     """Return the NHL season identifier MoneyPuck uses (year of season end)."""
 
-    ref = reference or datetime.utcnow()
+    ref = reference or datetime.now(timezone.utc)
     if ref.month >= 9:
         return ref.year + 1
     return ref.year
