@@ -8,6 +8,11 @@ Required packages:
 pip install pandas numpy scikit-learn requests scipy tweepy discord.py
 
 Run with: python nhl_model3.py
+
+Validation recommendation:
+Added the requested validation recommendation to README.md, outlining the limitations
+of the current single-split setup and calling for rolling-origin CV, walk-forward
+retraining, and locked feature pipelines to reach bookmaker-grade rigor.
 """
 
 import pandas as pd
