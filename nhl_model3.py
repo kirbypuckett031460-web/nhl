@@ -8,15 +8,22 @@ Required packages:
 pip install pandas numpy scikit-learn requests scipy tweepy discord.py
 
 Run with: python nhl_model3.py
+
+Validation recommendation:
+Added the requested validation recommendation to README.md, outlining the limitations
+of the current single-split setup and calling for rolling-origin CV, walk-forward
+retraining, and locked feature pipelines to reach bookmaker-grade rigor.
 """
 
 import pandas as pd
 import numpy as np
 import requests
-from sklearn.model_selection import train_test_split, TimeSeriesSplit, RandomizedSearchCV
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone
 from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss
 import warnings
 from datetime import datetime, timedelta, date
@@ -1305,7 +1312,7 @@ class RealDataNHLModel:
     def __init__(self):
         self.data_fetcher = NHLDataFetcher()
         self.total_model = None
-        self.scaler = StandardScaler()
+        self.locked_feature_pipeline: Optional[Pipeline] = None
         self.goal_scaler = StandardScaler()
         self.feature_names = []
         # Store conformal quantiles for uncertainty intervals
@@ -1329,6 +1336,100 @@ class RealDataNHLModel:
             self.ref_goal_weight: float = float(os.getenv('REF_GOAL_WEIGHT', 0.05))
         except Exception:
             self.ref_goal_weight = 0.05
+
+    def _build_feature_pipeline(self) -> Pipeline:
+        """Return a fresh feature transformation pipeline."""
+        return Pipeline([
+            ('scaler', StandardScaler())
+        ])
+
+    def _rolling_origin_splits(self, n_samples: int, min_train: int, horizon: int, step: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Generate rolling-origin splits for chronological data."""
+        splits: List[Tuple[np.ndarray, np.ndarray]] = []
+        if n_samples <= 0 or horizon <= 0:
+            return splits
+        min_train = max(1, min_train)
+        step = max(1, step)
+        start = min_train
+        while start + horizon <= n_samples:
+            train_idx = np.arange(start)
+            test_idx = np.arange(start, start + horizon)
+            if len(train_idx) and len(test_idx):
+                splits.append((train_idx, test_idx))
+            start += step
+        return splits
+
+    def _walk_forward_backtest(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model_defs: Dict[str, Pipeline],
+        weights: np.ndarray,
+        min_train: int,
+        horizon: int,
+        step: int
+    ) -> Dict[str, Any]:
+        """Evaluate ensemble via walk-forward retraining."""
+        splits = self._rolling_origin_splits(len(X), min_train, horizon, step)
+        if not splits:
+            return {}
+        aggregate_errors: List[float] = []
+        per_split: List[Dict[str, Any]] = []
+        for split_id, (train_idx, val_idx) in enumerate(splits):
+            try:
+                X_tr = X.iloc[train_idx]
+                y_tr = y.iloc[train_idx]
+                X_val = X.iloc[val_idx]
+                y_val = y.iloc[val_idx]
+            except Exception:
+                continue
+            fold_models: Dict[str, Pipeline] = {}
+            for name, estimator in model_defs.items():
+                try:
+                    est_fold = clone(estimator)
+                    est_fold.fit(X_tr, y_tr)
+                    fold_models[name] = est_fold
+                except Exception:
+                    continue
+            if not fold_models:
+                continue
+            fold_preds: List[np.ndarray] = []
+            fold_order = [name for name in model_defs.keys() if name in fold_models]
+            for name in fold_order:
+                try:
+                    fold_preds.append(fold_models[name].predict(X_val))
+                except Exception:
+                    fold_preds.append(np.zeros(len(X_val)))
+            if not fold_preds:
+                continue
+            fold_pred_mat = np.vstack(fold_preds)
+            fold_weights = weights[:len(fold_order)]
+            if len(fold_weights) != len(fold_order) or not np.isfinite(fold_weights).all() or fold_weights.sum() <= 0:
+                fold_weights = np.ones(len(fold_order), dtype=float) / max(1, len(fold_order))
+            else:
+                fold_weights = fold_weights / fold_weights.sum()
+            ensemble_vals = (fold_weights.reshape(-1, 1) * fold_pred_mat).sum(axis=0)
+            actual_vals = y_val.values
+            resid = actual_vals - ensemble_vals
+            aggregate_errors.extend(resid.tolist())
+            split_rmse = float(np.sqrt(np.mean(resid ** 2))) if len(resid) else float('nan')
+            split_mae = float(np.mean(np.abs(resid))) if len(resid) else float('nan')
+            per_split.append({
+                'split': split_id,
+                'train_count': int(len(train_idx)),
+                'test_count': int(len(val_idx)),
+                'rmse': split_rmse,
+                'mae': split_mae
+            })
+        if not aggregate_errors:
+            return {}
+        errors_arr = np.array(aggregate_errors, dtype=float)
+        return {
+            'splits_evaluated': len(per_split),
+            'rmse': float(np.sqrt(np.mean(np.square(errors_arr)))),
+            'mae': float(np.mean(np.abs(errors_arr))),
+            'details': per_split
+        }
         
     def fetch_historical_games(self, days_back: int = 30) -> pd.DataFrame:
         """Fetch historical games data with robust error handling"""
@@ -2767,75 +2868,99 @@ class RealDataNHLModel:
         if len(X) < 20:
             print("Warning: Very limited training data. Model performance may be poor.")
         
-        # Split data (time-series when dates available)
+        # Split data chronologically (time-series when dates available)
         if dates is not None and len(dates) == len(X):
             ordered_indices = dates.sort_values().index
-            X_sorted = X.loc[ordered_indices]
-            y_sorted = y.loc[ordered_indices]
-            split_index = int(len(X_sorted) * 0.75)
-            X_train, X_test = X_sorted.iloc[:split_index], X_sorted.iloc[split_index:]
-            y_train, y_test = y_sorted.iloc[:split_index], y_sorted.iloc[split_index:]
+            X_sorted = X.loc[ordered_indices].reset_index(drop=True)
+            y_sorted = y.loc[ordered_indices].reset_index(drop=True)
         else:
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
+            X_sorted = X.reset_index(drop=True)
+            y_sorted = y.reset_index(drop=True)
+        split_index = max(1, min(len(X_sorted) - 1, int(len(X_sorted) * 0.75)))
+        X_train = X_sorted.iloc[:split_index].reset_index(drop=True)
+        y_train = y_sorted.iloc[:split_index].reset_index(drop=True)
+        X_test = X_sorted.iloc[split_index:].reset_index(drop=True)
+        y_test = y_sorted.iloc[split_index:].reset_index(drop=True)
         
-        # Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+        # Lock feature pipeline for deploy-time inference & Poisson models
+        self.locked_feature_pipeline = self._build_feature_pipeline()
+        try:
+            X_train_scaled = self.locked_feature_pipeline.fit_transform(X_train)
+            X_test_scaled = self.locked_feature_pipeline.transform(X_test)
+        except Exception:
+            self.locked_feature_pipeline = None
+            X_train_scaled = X_train.values
+            X_test_scaled = X_test.values
         
-        # Time-series cross-validation setup for hyperparameter tuning
-        n_splits = 4 if len(X_train) >= 60 else 3
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        # Rolling-origin cross-validation setup for hyperparameter tuning
+        horizon_cv = max(6, min(40, len(X_train) // 6 if len(X_train) >= 36 else max(3, len(X_train) // 2)))
+        min_train_cv = max(horizon_cv * 2, int(len(X_train) * 0.4))
+        step_cv = max(2, horizon_cv // 2)
+        rolling_cv = self._rolling_origin_splits(len(X_train), min_train_cv, horizon_cv, step_cv)
+        if len(rolling_cv) >= 3:
+            cv_strategy: Any = rolling_cv
+            cv_label = f"rolling_origin_{len(rolling_cv)}"
+        else:
+            n_splits = 4 if len(X_train) >= 60 else 3
+            cv_strategy = TimeSeriesSplit(n_splits=n_splits)
+            cv_label = f"time_series_{n_splits}"
 
         # Hyperparameter spaces (kept compact for speed)
-        rf_base = RandomForestRegressor(random_state=42)
+        def make_model_pipeline(estimator):
+            return Pipeline([
+                ('scaler', StandardScaler()),
+                ('model', estimator)
+            ])
+
+        rf_pipeline = make_model_pipeline(RandomForestRegressor(random_state=42))
         rf_params = {
-            'n_estimators': [150, 250, 350],
-            'max_depth': [8, 12, 16, None],
-            'min_samples_leaf': [1, 2, 3]
+            'model__n_estimators': [150, 250, 350],
+            'model__max_depth': [8, 12, 16, None],
+            'model__min_samples_leaf': [1, 2, 3]
         }
         rf_search = RandomizedSearchCV(
-            rf_base, rf_params, n_iter=8, cv=tscv, random_state=42,
+            rf_pipeline, rf_params, n_iter=8, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
-        rf_search.fit(X_train_scaled, y_train)
+        rf_search.fit(X_train, y_train)
 
-        gb_base = GradientBoostingRegressor(random_state=42)
+        gb_pipeline = make_model_pipeline(GradientBoostingRegressor(random_state=42))
         gb_params = {
-            'n_estimators': [150, 250, 350],
-            'learning_rate': [0.03, 0.05, 0.08, 0.1],
-            'max_depth': [2, 3, 4]
+            'model__n_estimators': [150, 250, 350],
+            'model__learning_rate': [0.03, 0.05, 0.08, 0.1],
+            'model__max_depth': [2, 3, 4]
         }
         gb_search = RandomizedSearchCV(
-            gb_base, gb_params, n_iter=8, cv=tscv, random_state=42,
+            gb_pipeline, gb_params, n_iter=8, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
-        gb_search.fit(X_train_scaled, y_train)
+        gb_search.fit(X_train, y_train)
 
-        hgb_base = HistGradientBoostingRegressor(
+        hgb_pipeline = make_model_pipeline(HistGradientBoostingRegressor(
             random_state=42,
             early_stopping=True,
             loss='squared_error'
-        )
+        ))
         hgb_params = {
-            'learning_rate': [0.03, 0.05, 0.08, 0.1],
-            'max_iter': [225, 275, 325, 375],
-            'max_depth': [None, 3, 5, 7],
-            'min_samples_leaf': [10, 15, 20, 30],
-            'l2_regularization': [0.0, 0.1, 0.3, 0.6]
+            'model__learning_rate': [0.03, 0.05, 0.08, 0.1],
+            'model__max_iter': [225, 275, 325, 375],
+            'model__max_depth': [None, 3, 5, 7],
+            'model__min_samples_leaf': [10, 15, 20, 30],
+            'model__l2_regularization': [0.0, 0.1, 0.3, 0.6]
         }
         hgb_search = RandomizedSearchCV(
-            hgb_base, hgb_params, n_iter=8, cv=tscv, random_state=42,
+            hgb_pipeline, hgb_params, n_iter=8, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
-        hgb_search.fit(X_train_scaled, y_train)
+        hgb_search.fit(X_train, y_train)
 
-        ridge_base = Ridge()
-        ridge_params = {'alpha': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]}
+        ridge_pipeline = make_model_pipeline(Ridge())
+        ridge_params = {'model__alpha': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]}
         ridge_search = RandomizedSearchCV(
-            ridge_base, ridge_params, n_iter=min(6, len(ridge_params['alpha'])), cv=tscv, random_state=42,
+            ridge_pipeline, ridge_params, n_iter=min(6, len(ridge_params['model__alpha'])), cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
-        ridge_search.fit(X_train_scaled, y_train)
+        ridge_search.fit(X_train, y_train)
 
         # Collect tuned models
         model_order = ['rf', 'gb', 'ridge', 'hgb']
@@ -2856,14 +2981,18 @@ class RealDataNHLModel:
                 P = None
                 oof = {name: np.full(len(X_all), np.nan) for name in model_order}
                 for tr_idx, val_idx in tscv_w.split(X_all):
-                    scaler_fold = StandardScaler()
-                    X_tr_s = scaler_fold.fit_transform(X_all.iloc[tr_idx])
-                    X_val_s = scaler_fold.transform(X_all.iloc[val_idx])
+                    X_tr_fold = X_all.iloc[tr_idx]
+                    y_tr_fold = y_all.iloc[tr_idx]
+                    X_val_fold = X_all.iloc[val_idx]
                     for name in model_order:
                         est = models[name]
-                        est_fold = type(est)(**est.get_params())
-                        est_fold.fit(X_tr_s, y_all.iloc[tr_idx])
-                        oof[name][val_idx] = est_fold.predict(X_val_s)
+                        est_fold = clone(est)
+                        try:
+                            est_fold.fit(X_tr_fold, y_tr_fold)
+                            preds_fold = est_fold.predict(X_val_fold)
+                        except Exception:
+                            preds_fold = np.zeros(len(X_val_fold))
+                        oof[name][val_idx] = preds_fold
                 first_key = model_order[0]
                 valid = ~np.isnan(oof[first_key])
                 if valid.any():
@@ -2886,10 +3015,10 @@ class RealDataNHLModel:
         test_preds = []
         for name in model_order:
             est = models[name]
-            est_final = type(est)(**est.get_params())
-            est_final.fit(X_train_scaled, y_train)
+            est_final = clone(est)
+            est_final.fit(X_train, y_train)
             trained_models[name] = est_final
-            test_preds.append(est_final.predict(X_test_scaled))
+            test_preds.append(est_final.predict(X_test))
         test_preds = np.vstack(test_preds)  # shape (K, N)
         ensemble_pred = (weights_array.reshape(-1, 1) * test_preds).sum(axis=0)
 
@@ -2931,12 +3060,28 @@ class RealDataNHLModel:
             'models': trained_models,
             'model_order': model_order,
             'weights': weights_array.tolist(),
-            'scaler': self.scaler,
+            'feature_pipeline': self.locked_feature_pipeline,
             'feature_names': self.feature_names,
             'poisson_model': poisson_model,
             'nb_params': nb_params,
-            'gp_model': gp_model
+            'gp_model': gp_model,
+            'cv_strategy_used': cv_label
         }
+        walk_horizon = max(6, min(40, len(X_sorted) // 8 if len(X_sorted) >= 80 else max(4, len(X_sorted) // 4)))
+        walk_step = max(2, walk_horizon // 2)
+        walk_min_train = max(walk_horizon * 2, len(X_sorted) // 3)
+        walk_metrics = self._walk_forward_backtest(
+            X_sorted,
+            y_sorted,
+            trained_models,
+            weights_array,
+            walk_min_train,
+            walk_horizon,
+            walk_step
+        )
+        if walk_metrics:
+            self.total_model['walk_forward_metrics'] = walk_metrics
+            print(f"Walk-forward RMSE {walk_metrics['rmse']:.3f} (splits={walk_metrics.get('splits_evaluated', 0)})")
         
         # Calculate metrics and residual-based uncertainty (plus conformal radius)
         rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred))
@@ -3000,7 +3145,9 @@ class RealDataNHLModel:
             'features_used': len(self.feature_names),
             'residual_std': residual_std,
             'brier': brier,
-            'logloss': logloss
+            'logloss': logloss,
+            'cv_strategy': cv_label,
+            'walk_forward': walk_metrics
         }
     
     def predict_game(self, game_features: np.ndarray, betting_line: float = 6.5, over_american_odds: int = -110, under_american_odds: int = -110, odds_source: Optional[str] = None, consensus_total: Optional[float] = None) -> OverUnderPrediction:
@@ -3024,9 +3171,16 @@ class RealDataNHLModel:
             if np.isfinite(candidate_val):
                 ref_goal_value = candidate_val
         
-        # Scale features
+        # Prepare feature row & locked pipeline transforms
         feature_row = game_features.reshape(1, -1)
-        features_scaled = self.scaler.transform(feature_row)
+        feature_pipeline = (self.total_model or {}).get('feature_pipeline')
+        if feature_pipeline is not None:
+            try:
+                poisson_features = feature_pipeline.transform(feature_row)
+            except Exception:
+                poisson_features = feature_row
+        else:
+            poisson_features = feature_row
         goal_features_scaled: Optional[np.ndarray] = None
         goal_scaler = getattr(self, 'goal_scaler', None)
         if goal_scaler is not None:
@@ -3047,7 +3201,7 @@ class RealDataNHLModel:
                 preds.append(0.0)
                 continue
             try:
-                preds.append(float(estimator.predict(features_scaled)[0]))
+                preds.append(float(estimator.predict(feature_row)[0]))
             except Exception:
                 preds.append(0.0)
         if not preds:
@@ -3075,7 +3229,7 @@ class RealDataNHLModel:
         poisson_mu = None
         if poisson_model is not None:
             try:
-                poisson_mu = float(poisson_model.predict(features_scaled)[0])
+                poisson_mu = float(poisson_model.predict(poisson_features)[0])
             except Exception:
                 poisson_mu = None
 
