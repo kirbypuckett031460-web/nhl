@@ -13,6 +13,9 @@ Validation recommendation:
 Added the requested validation recommendation to README.md, outlining the limitations
 of the current single-split setup and calling for rolling-origin CV, walk-forward
 retraining, and locked feature pipelines to reach bookmaker-grade rigor.
+
+Probability calibration recommendation:
+Probability calibration limited to isotonic-once – outcome calibration derives from one holdout split and a Gaussian proxy, but there’s no tracking of live-market calibration (closing-line value, realized vs implied edges) or adaptive recalibration by month/book; that hampers long-term reliability.
 """
 
 import pandas as pd
