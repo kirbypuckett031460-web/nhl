@@ -1734,6 +1734,18 @@ class RealDataNHLModel:
         features['injury_penalty_adj'] = 0.0
         features['total_adjustments'] += (features['home_goalie_adj'] + features['away_goalie_adj'] + features['injury_penalty_adj'])
         features['final_prediction_base'] = features['base_total_prediction'] + features['total_adjustments']
+        # Player-level context placeholders (populated later if player metrics supplied)
+        player_feature_cols = [
+            'home_active_xgar', 'away_active_xgar',
+            'home_active_rapm_off', 'away_active_rapm_off',
+            'home_active_rapm_def', 'away_active_rapm_def',
+            'home_top_line_xgar', 'away_top_line_xgar',
+            'home_player_status_penalty', 'away_player_status_penalty',
+            'player_edge_total'
+        ]
+        for col in player_feature_cols:
+            if col not in features.columns:
+                features[col] = 0.0
 
         # ---------------- Advanced team stats: proxies and EWMAs ----------------
         # Proxies for 5v5 xGF/60 and HDCF/60 using available shots and goals (fallback when detailed feed not available)
@@ -2140,6 +2152,224 @@ class RealDataNHLModel:
         except Exception:
             return {}
         return team_strength
+  
+      def load_player_metrics(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
+          """Load player-level RAPM/xGAR/injury context from CSV or JSON.
+  
+          Expected columns (flexible, best effort):
+            team, player, position, status, prob_play, rapm_off, rapm_def, xgar, line_slot
+          """
+          if not path_or_url:
+              return None
+          source = str(path_or_url).strip()
+          if not source:
+              return None
+          try:
+              is_url = bool(re.match(r'^https?://', source, flags=re.IGNORECASE))
+              if is_url:
+                  resp = requests.get(source, timeout=25)
+                  resp.raise_for_status()
+                  text = resp.text
+                  if source.lower().endswith('.json') or text.lstrip().startswith(('{', '[')):
+                      raw = json.loads(text)
+                      payload = raw.get('players') if isinstance(raw, dict) and 'players' in raw else raw
+                      df = pd.DataFrame(payload)
+                  else:
+                      df = pd.read_csv(io.StringIO(text))
+              else:
+                  if not os.path.exists(source):
+                      print(f"⚠️  Player metrics path not found: {source}")
+                      return None
+                  if source.lower().endswith('.json'):
+                      with open(source, 'r') as f:
+                          raw = json.load(f)
+                      if isinstance(raw, dict) and 'players' in raw:
+                          raw = raw['players']
+                      df = pd.DataFrame(raw)
+                  else:
+                      df = pd.read_csv(source)
+          except Exception as e:
+              print(f"⚠️  Failed to load player metrics from {path_or_url}: {e}")
+              return None
+  
+          if df is None or df.empty:
+              return None
+  
+          rename_candidates = {
+              'Team': 'team', 'TEAM': 'team', 'Abbreviation': 'team', 'abbr': 'team', 'teamAbbrev': 'team',
+              'Player': 'player', 'player_name': 'player', 'Player Name': 'player', 'name': 'player',
+              'Pos': 'position', 'POS': 'position', 'role': 'position',
+              'status_text': 'status', 'availability': 'status',
+              'probability': 'prob_play', 'prob_start': 'prob_play', 'prob_playing': 'prob_play',
+              'likelihood': 'prob_play', 'chance': 'prob_play',
+              'rapm_offense': 'rapm_off', 'rapm_offensive': 'rapm_off',
+              'rapm_defense': 'rapm_def', 'rapm_defensive': 'rapm_def',
+              'xGAR': 'xgar', 'GAR': 'xgar', 'xgar_total': 'xgar',
+              'line': 'line_slot', 'line_assignment': 'line_slot'
+          }
+          for old_name, new_name in rename_candidates.items():
+              if old_name in df.columns and new_name not in df.columns:
+                  df = df.rename(columns={old_name: new_name})
+  
+          if 'team' not in df.columns:
+              for alt in ['Team', 'TEAM', 'Abbreviation', 'abbr', 'team_code']:
+                  if alt in df.columns:
+                      df = df.rename(columns={alt: 'team'})
+                      break
+          if 'player' not in df.columns:
+              for alt in ['Player', 'player_name', 'name']:
+                  if alt in df.columns:
+                      df = df.rename(columns={alt: 'player'})
+                      break
+  
+          if 'team' not in df.columns or 'player' not in df.columns:
+              print("⚠️  Player metrics missing team/player columns")
+              return None
+  
+          df['team'] = df['team'].astype(str).str.upper().str.strip()
+          df['player'] = df['player'].astype(str).str.strip()
+          if 'position' not in df.columns:
+              df['position'] = 'F'
+          df['position'] = df['position'].astype(str).str.upper().str.strip()
+          if 'status' not in df.columns:
+              df['status'] = 'ACTIVE'
+  
+          def status_to_prob(status: Any) -> float:
+              if status is None or (isinstance(status, float) and np.isnan(status)):
+                  return 1.0
+              s = str(status).strip().lower()
+              if not s:
+                  return 1.0
+              if any(tag in s for tag in ['out', 'ltir', 'ir', 'suspended']):
+                  return 0.0
+              if any(tag in s for tag in ['doubtful']):
+                  return 0.25
+              if any(tag in s for tag in ['questionable', 'day-to-day', 'day to day', 'gametime', 'game-time']):
+                  return 0.55
+              if any(tag in s for tag in ['probable', 'expected']):
+                  return 0.9
+              return 1.0
+  
+          if 'prob_play' in df.columns:
+              df['prob_play'] = pd.to_numeric(df['prob_play'], errors='coerce')
+          else:
+              df['prob_play'] = np.nan
+          df['prob_play'] = df['prob_play'].where(df['prob_play'].between(0.0, 1.0), np.nan)
+          df['prob_play'] = df.apply(
+              lambda row: float(status_to_prob(row.get('status'))) if np.isnan(row.get('prob_play', np.nan)) else float(row['prob_play']),
+              axis=1
+          )
+          df['prob_play'] = df['prob_play'].clip(0.0, 1.0)
+  
+          for col in ['rapm_off', 'rapm_def', 'xgar']:
+              df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0) if col in df.columns else 0.0
+          if 'line_slot' in df.columns:
+              df['line_slot'] = df['line_slot'].astype(str).str.upper().str.strip()
+          else:
+              df['line_slot'] = ''
+  
+          return df
+  
+      def apply_player_context_features(
+          self,
+          todays_games: pd.DataFrame,
+          todays_features: pd.DataFrame,
+          player_df: Optional[pd.DataFrame]
+      ) -> Dict[str, str]:
+          """Inject player-level aggregates into today's features and return display notes per game."""
+          notes: Dict[str, str] = {}
+          if player_df is None or todays_features is None or todays_games is None:
+              return notes
+          if player_df.empty or todays_features.empty:
+              return notes
+  
+          df = player_df.copy()
+          df['prob_play'] = pd.to_numeric(df.get('prob_play', 1.0), errors='coerce').fillna(1.0).clip(0.0, 1.0)
+          for col in ['rapm_off', 'rapm_def', 'xgar']:
+              if col in df.columns:
+                  df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+              else:
+                  df[col] = 0.0
+          df['team'] = df['team'].astype(str).str.upper().str.strip()
+          df['player'] = df['player'].astype(str).str.strip()
+          df['position'] = df.get('position', 'F')
+          df['position'] = df['position'].astype(str).str.upper().str.strip()
+          df['status'] = df.get('status', 'ACTIVE').astype(str)
+  
+          team_summary: Dict[str, Dict[str, Any]] = {}
+          for team, grp in df.groupby('team'):
+              weights = grp['prob_play']
+              active_xgar = float((grp['xgar'] * weights).sum())
+              active_rapm_off = float((grp['rapm_off'] * weights).sum())
+              active_rapm_def = float((grp['rapm_def'] * weights).sum())
+              top_line_xgar = float(grp.sort_values('xgar', ascending=False).head(6)['xgar'].sum())
+              missing = grp[weights < 0.5].sort_values('xgar', ascending=False)
+              missing_names = [f"{row['player']} ({row['position']})" for _, row in missing.iterrows()]
+              missing_value = float(missing['xgar'].clip(lower=0.0).sum())
+              status_penalty = float(-0.04 * missing_value)
+              team_summary[team] = {
+                  'active_xgar': active_xgar,
+                  'active_rapm_off': active_rapm_off,
+                  'active_rapm_def': active_rapm_def,
+                  'top_line_xgar': top_line_xgar,
+                  'status_penalty': status_penalty,
+                  'missing_names': missing_names
+              }
+  
+          if team_summary == {}:
+              return notes
+  
+          if 'player_edge_total' not in todays_features.columns:
+              todays_features['player_edge_total'] = 0.0
+  
+          for idx in todays_features.index:
+              try:
+                  home_team = str(todays_features.at[idx, 'home_team']).upper()
+                  away_team = str(todays_features.at[idx, 'away_team']).upper()
+              except Exception:
+                  continue
+              home_summary = team_summary.get(home_team, {})
+              away_summary = team_summary.get(away_team, {})
+  
+              def val(summary: Dict[str, Any], key: str) -> float:
+                  return float(summary.get(key, 0.0)) if summary else 0.0
+  
+              todays_features.at[idx, 'home_active_xgar'] = val(home_summary, 'active_xgar')
+              todays_features.at[idx, 'away_active_xgar'] = val(away_summary, 'active_xgar')
+              todays_features.at[idx, 'home_active_rapm_off'] = val(home_summary, 'active_rapm_off')
+              todays_features.at[idx, 'away_active_rapm_off'] = val(away_summary, 'active_rapm_off')
+              todays_features.at[idx, 'home_active_rapm_def'] = val(home_summary, 'active_rapm_def')
+              todays_features.at[idx, 'away_active_rapm_def'] = val(away_summary, 'active_rapm_def')
+              todays_features.at[idx, 'home_top_line_xgar'] = val(home_summary, 'top_line_xgar')
+              todays_features.at[idx, 'away_top_line_xgar'] = val(away_summary, 'top_line_xgar')
+              todays_features.at[idx, 'home_player_status_penalty'] = val(home_summary, 'status_penalty')
+              todays_features.at[idx, 'away_player_status_penalty'] = val(away_summary, 'status_penalty')
+  
+              player_adjustment = (
+                  0.02 * (todays_features.at[idx, 'home_active_xgar'] - todays_features.at[idx, 'away_active_xgar']) +
+                  0.015 * (todays_features.at[idx, 'home_active_rapm_off'] - todays_features.at[idx, 'away_active_rapm_off']) -
+                  0.015 * (todays_features.at[idx, 'home_active_rapm_def'] - todays_features.at[idx, 'away_active_rapm_def']) +
+                  0.01 * (todays_features.at[idx, 'home_top_line_xgar'] - todays_features.at[idx, 'away_top_line_xgar']) +
+                  todays_features.at[idx, 'home_player_status_penalty'] +
+                  todays_features.at[idx, 'away_player_status_penalty']
+              )
+              todays_features.at[idx, 'player_edge_total'] = player_adjustment
+              todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + player_adjustment
+              todays_features.at[idx, 'final_prediction_base'] = todays_features.at[idx, 'base_total_prediction'] + todays_features.at[idx, 'total_adjustments']
+  
+              gid = None
+              if 'game_id' in todays_features.columns:
+                  gid_raw = todays_features.at[idx, 'game_id']
+                  gid = str(gid_raw) if pd.notna(gid_raw) else None
+              note_parts: List[str] = []
+              if home_summary.get('missing_names'):
+                  note_parts.append(f"{home_team}: -" + ", ".join(home_summary['missing_names'][:3]))
+              if away_summary.get('missing_names'):
+                  note_parts.append(f"{away_team}: -" + ", ".join(away_summary['missing_names'][:3]))
+              if note_parts and gid:
+                  notes[gid] = " | ".join(note_parts)
+  
+          return notes
 
     def write_environment_template(self, todays_games: pd.DataFrame, out_path: str, overwrite_today: bool = False) -> None:
         """Write/merge an environment.json template for today's games.
@@ -6532,6 +6762,26 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     pass
             except Exception:
                 lineup_strength = {}
+            player_metrics_df: Optional[pd.DataFrame] = None
+            try:
+                player_metrics_path = getattr(cli_args, 'player_metrics_path', None) if cli_args else os.getenv('PLAYER_METRICS_PATH')
+                if player_metrics_path:
+                    player_metrics_df = model.load_player_metrics(player_metrics_path)
+                    if player_metrics_df is not None and not player_metrics_df.empty:
+                        try:
+                            print(f"🧍 Player metrics loaded: {len(player_metrics_df)} rows from {player_metrics_path}")
+                        except Exception:
+                            pass
+            except Exception as e:
+                player_metrics_df = None
+                print(f"⚠️  Player metrics not applied: {e}")
+            player_context_notes: Dict[str, str] = {}
+            try:
+                if player_metrics_df is not None and isinstance(player_metrics_df, pd.DataFrame) and not player_metrics_df.empty:
+                    player_context_notes = model.apply_player_context_features(todays_games, todays_features, player_metrics_df)
+            except Exception as e:
+                player_context_notes = {}
+                print(f"⚠️  Player context features skipped: {e}")
             try:
                 hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else 'odds_history.csv'
                 if hist_path and os.path.exists(hist_path):
@@ -6879,6 +7129,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         env_bits.append(f"{tempf}°F")
                         pred.env_info = ' '.join(env_bits)
                         pred.lineup_info = f"H:{hs:.2f}/A:{as_:.2f}"
+                        player_note = player_context_notes.get(game_id)
+                        if player_note:
+                            pred.lineup_info = f"{pred.lineup_info} | {player_note}" if pred.lineup_info else player_note
                     except Exception:
                         pass
                     
@@ -7071,6 +7324,7 @@ if __name__ == "__main__":
     parser.add_argument('--environment-path', type=str, default=os.getenv('ENVIRONMENT_JSON', None), help='Path to environment JSON (outdoor/start time/weather)')
     parser.add_argument('--env-refresh', action='store_true', help='Refresh/overwrite today entries in environment.json')
     parser.add_argument('--lineup-path', type=str, default=os.getenv('LINEUP_STRENGTH_CSV', None), help='Path to lineup strength CSV (team,lineup_strength)')
+    parser.add_argument('--player-metrics-path', type=str, default=os.getenv('PLAYER_METRICS_PATH', None), help='CSV/JSON with player-level RAPM/xGAR/injury context')
     parser.add_argument('--auto-populate', action='store_true', help='Auto-fetch team rates/goalie GSAx/penalties/referees from URLs and write CSVs')
     parser.add_argument('--team-rates-url', type=str, default=os.getenv('TEAM_RATES_URL', None), help='URL to fetch team rates CSV')
     parser.add_argument('--goalie-gsax-url', type=str, default=os.getenv('GOALIE_GSAX_URL', None), help='URL to fetch goalie GSAx CSV')
