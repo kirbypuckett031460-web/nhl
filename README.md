@@ -169,3 +169,8 @@ python run_today_sog.py --use-api --use-stats --use-odds --min-edge 0.55
 open bets_dashboard.html  # or your OS equivalent
 ```
 
+Schedule-aware validation recommendation
+----------------------------------------
+
+Schedule-aware validation is currently shallow: `train_model` relies on a single 75/25 chronological split plus RandomizedSearch, which means full seasons are never rolled forward and out-of-time leakage from feature engineering can persist. To approach bookmaker-grade robustness, implement rolling-origin cross-validation with explicit season/era splits, walk-forward retraining, and locked feature-generation pipelines so every evaluation reflects a true out-of-sample workflow.
+
