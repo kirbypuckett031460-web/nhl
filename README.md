@@ -35,6 +35,36 @@ Command-line options
 - --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
 - --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
 
+Automated MoneyPuck ETL
+-----------------------
+
+Use `moneypuck_etl.py` to keep the MoneyPuck-derived inputs fresh without manual downloads.
+
+- Discovers the newest MoneyPuck CSVs for teams and goalies (current and prior season fallbacks)
+- Normalizes to the schema expected by `nhl_model3.py`
+- Runs anomaly detection for data drift, stale seasons, and entity gaps
+- Versions every refresh beneath `data/history/` (`versions.json`, dated CSVs, and `anomalies/*.json`)
+
+Examples:
+
+```bash
+# Basic refresh (writes team_rates.csv & goalie_gsax.csv in the repo root)
+python moneypuck_etl.py
+
+# Custom output paths, history directory, and explicit seasons/stages
+python moneypuck_etl.py \
+  --team-output data/latest/team_rates.csv \
+  --goalie-output data/latest/goalie_gsax.csv \
+  --history-dir data/history \
+  --seasons 2025 2024 \
+  --stages regular playoffs
+```
+
+To run the ETL automatically before generating predictions, add `--refresh-moneypuck` when
+calling `nhl_model3.py`. You can further tune the inline run with `--moneypuck-history-dir`,
+`--moneypuck-stages`, `--moneypuck-seasons`, `--moneypuck-dry-run`, `--fail-on-moneypuck-anomaly`,
+and `--moneypuck-request-timeout`.
+
 Examples
 --------
 
