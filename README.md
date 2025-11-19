@@ -172,5 +172,12 @@ open bets_dashboard.html  # or your OS equivalent
 Schedule-aware validation recommendation
 ----------------------------------------
 
-Schedule-aware validation is currently shallow: `train_model` relies on a single 75/25 chronological split plus RandomizedSearch, which means full seasons are never rolled forward and out-of-time leakage from feature engineering can persist. To approach bookmaker-grade robustness, implement rolling-origin cross-validation with explicit season/era splits, walk-forward retraining, and locked feature-generation pipelines so every evaluation reflects a true out-of-sample workflow.
+Schedule-aware validation used to rely on a single 75/25 chronological split plus RandomizedSearch, which meant full seasons were never rolled forward and out-of-time leakage from feature engineering could persist. To approach bookmaker-grade robustness, the codebase now uses rolling-origin cross-validation with explicit season/era-style horizons, walk-forward retraining, and locked feature-generation pipelines so every evaluation reflects a true out-of-sample workflow.
+
+Implementation details
+----------------------
+
+- Rolling-origin cross-validation now drives the hyperparameter search inside `RealDataNHLModel.train_model`, ensuring each trial retrains on an expanding window and scores on a forward horizon.
+- Every ensemble member sits inside a locked `Pipeline(StandardScaler, model)` so feature transforms are refit only on the relevant training fold and the same pipeline object is reused at inference time.
+- A walk-forward retraining harness re-clones the tuned ensemble across sequential chunks, surfacing RMSE/MAE summaries that mirror real deployment where the model is continually refreshed.
 
