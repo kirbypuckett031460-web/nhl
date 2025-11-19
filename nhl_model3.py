@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 import html as html_parser
 import errno
 import unicodedata
+from pathlib import Path
 from scipy.stats import norm, poisson, nbinom
 from sklearn.isotonic import IsotonicRegression
 try:
@@ -6735,6 +6736,49 @@ def main(cli_args: Optional[argparse.Namespace] = None):
     
     try:
         model = RealDataNHLModel()
+
+        if cli_args and getattr(cli_args, 'refresh_moneypuck', False):
+            print("\n🧰 Refreshing MoneyPuck data before loading rate tables...")
+            try:
+                from moneypuck_etl import MoneyPuckETLPipeline
+            except Exception as etl_import_error:
+                print(f"⚠️  MoneyPuck ETL module unavailable: {etl_import_error}")
+            else:
+                team_out = getattr(cli_args, 'team_rates_path', None) or 'team_rates.csv'
+                goalie_out = getattr(cli_args, 'goalie_gsax_path', None) or 'goalie_gsax.csv'
+                setattr(cli_args, 'team_rates_path', team_out)
+                setattr(cli_args, 'goalie_gsax_path', goalie_out)
+                history_dir = getattr(cli_args, 'moneypuck_history_dir', 'data/history') or 'data/history'
+                stages = getattr(cli_args, 'moneypuck_stages', None)
+                seasons = getattr(cli_args, 'moneypuck_seasons', None)
+                timeout = float(getattr(cli_args, 'moneypuck_request_timeout', 25.0) or 25.0)
+                pipeline = MoneyPuckETLPipeline(
+                    team_output_path=team_out,
+                    goalie_output_path=goalie_out,
+                    history_dir=Path(history_dir),
+                    stages=stages,
+                    seasons=seasons,
+                    team_override_url=getattr(cli_args, 'team_rates_url', None),
+                    goalie_override_url=getattr(cli_args, 'goalie_gsax_url', None),
+                    dry_run=bool(getattr(cli_args, 'moneypuck_dry_run', False)),
+                    fail_on_anomaly=bool(getattr(cli_args, 'fail_on_moneypuck_anomaly', False)),
+                    request_timeout=timeout,
+                )
+                try:
+                    etl_summaries = pipeline.run()
+                    for summary in etl_summaries:
+                        src = summary.source_url or "MoneyPuck auto-discovery"
+                        if summary.anomalies:
+                            print(
+                                f"⚠️  {summary.dataset}: anomalies recorded ({len(summary.anomalies)} issues). "
+                                f"Check {history_dir}/anomalies/{summary.dataset}.json for details."
+                            )
+                        else:
+                            print(f"ℹ️  {summary.dataset}: refreshed from {src}")
+                except Exception as etl_run_error:
+                    print(f"⚠️  MoneyPuck ETL failed: {etl_run_error}")
+                    if getattr(cli_args, 'fail_on_moneypuck_anomaly', False):
+                        raise
         
         print("\n📊 Step 1: Fetching historical NHL data...")
         print("🔄 Trying multiple data sources...")
@@ -8038,6 +8082,13 @@ if __name__ == "__main__":
     parser.add_argument('--goalie-gsax-url', type=str, default=os.getenv('GOALIE_GSAX_URL', None), help='URL to fetch goalie GSAx CSV')
     parser.add_argument('--penalties-url', type=str, default=os.getenv('PENALTIES_URL', None), help='URL to fetch team penalties CSV')
     parser.add_argument('--referees-url', type=str, default=os.getenv('REFEREES_URL', None), help='URL to fetch referee rates CSV')
+    parser.add_argument('--refresh-moneypuck', action='store_true', help='Run the MoneyPuck ETL pipeline before predictions')
+    parser.add_argument('--moneypuck-history-dir', type=str, default=os.getenv('MONEYPUCK_HISTORY_DIR', 'data/history'), help='History directory for MoneyPuck ETL snapshots')
+    parser.add_argument('--moneypuck-stages', nargs='+', default=os.getenv('MONEYPUCK_STAGES', 'regular').split(','), help='MoneyPuck stages to query (default: regular)')
+    parser.add_argument('--moneypuck-seasons', nargs='+', type=int, default=None, help='Explicit MoneyPuck season identifiers (overrides auto-detection)')
+    parser.add_argument('--moneypuck-dry-run', action='store_true', help='Run MoneyPuck ETL without writing to disk')
+    parser.add_argument('--fail-on-moneypuck-anomaly', action='store_true', help='Abort if the MoneyPuck ETL surfaces anomalies')
+    parser.add_argument('--moneypuck-request-timeout', type=float, default=float(os.getenv('MONEYPUCK_REQUEST_TIMEOUT', 25.0)), help='HTTP timeout (seconds) for MoneyPuck ETL requests')
     # Deployment options
     parser.add_argument('--deploy', action='store_true', help='Deploy dashboard HTML to www.thepointou.com')
     parser.add_argument('--deploy-method', type=str, default=os.getenv('DEPLOY_METHOD', None), help='Deploy method: http|s3|sftp')
