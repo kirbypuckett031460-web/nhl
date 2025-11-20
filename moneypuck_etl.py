@@ -250,6 +250,10 @@ def normalize_goalie_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Reduce MoneyPuck goalies CSV to the columns used by the model."""
 
     df = flatten_columns(raw_df.copy())
+
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
     goalie_col = None
     for alt in ["goalie", "goaliename", "player", "playername", "name"]:
         if alt in df.columns:
@@ -285,32 +289,79 @@ def normalize_goalie_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["team"] = df["team"].apply(to_team_abbr)
     df = df[(df["goalie"] != "") & (df["team"] != "")]
 
-    gsax_col = None
-    for candidate in [
-        "gsax_rolling",
-        "gsax",
-        "goals_saved_above_expected",
-        "goals saved above expected",
-        "goalssavedaboveexpected",
-        "goals_saved_above_expected_all",
-    ]:
-        for col in df.columns:
-            if candidate == col or candidate.replace(" ", "") == col.lower().replace(
-                " ", ""
-            ):
-                gsax_col = col
-                break
-        if gsax_col:
+    situation_col = None
+    for col in df.columns:
+        lc = str(col).lower()
+        if any(keyword in lc for keyword in ("situation", "strength", "state")):
+            situation_col = col
             break
-    if gsax_col is None:
-        for col in df.columns:
-            lc = col.lower()
-            if "saved" in lc and "expected" in lc:
-                gsax_col = col
-                break
-    if gsax_col is None:
-        raise ValueError("Could not locate a GSAx column in MoneyPuck goalies dataset")
-    df["gsax_rolling"] = pd.to_numeric(df[gsax_col], errors="coerce").fillna(0.0)
+    if situation_col:
+        situation = df[situation_col].astype(str).str.strip().str.lower()
+        mask = situation == "all"
+        if not mask.any():
+            mask = situation.str.contains("all", case=False, na=False)
+        if not mask.any():
+            mask = situation.str.contains("overall", case=False, na=False)
+        if mask.any():
+            df = df[mask].copy()
+
+    normalized_cols: Dict[str, str] = {}
+    for col in df.columns:
+        normalized_cols.setdefault(_norm(col), col)
+
+    def find_exact(candidates: Sequence[str]) -> Optional[str]:
+        for candidate in candidates:
+            key = _norm(candidate)
+            if key in normalized_cols:
+                return normalized_cols[key]
+        return None
+
+    def find_by_terms(*terms: str) -> Optional[str]:
+        lowered = [_norm(term) for term in terms if term]
+        for norm_name, original in normalized_cols.items():
+            if all(term in norm_name for term in lowered):
+                return original
+        return None
+
+    gsax_series: Optional[pd.Series] = None
+    gsax_col = find_exact(
+        [
+            "gsax_rolling",
+            "gsax",
+            "goals_saved_above_expected",
+            "goals saved above expected",
+            "goalssavedaboveexpected",
+            "goals_saved_above_expected_all",
+        ]
+    ) or find_by_terms("saved", "expected")
+
+    if gsax_col is not None:
+        gsax_series = pd.to_numeric(df[gsax_col], errors="coerce")
+    else:
+        xg_col = find_exact(
+            [
+                "xga",
+                "x_goals_against",
+                "xgoalsagainst",
+                "expected_goals_against",
+                "expectedgoalsagainst",
+                "xGoals",
+                "x_goals",
+            ]
+        ) or find_by_terms("x", "goal")
+        goals_col = find_exact(
+            ["ga", "goals_against", "goalsagainst", "goals_allowed", "goals"]
+        ) or find_by_terms("goal", "against")
+
+        if xg_col and goals_col:
+            expected = pd.to_numeric(df[xg_col], errors="coerce")
+            actual = pd.to_numeric(df[goals_col], errors="coerce")
+            gsax_series = expected - actual
+
+    if gsax_series is None:
+        raise ValueError("Could not locate or derive a GSAx column in MoneyPuck goalies dataset")
+
+    df["gsax_rolling"] = gsax_series.fillna(0.0)
 
     if "prob_start" not in df.columns:
         starts_col = None
@@ -334,11 +385,32 @@ def normalize_goalie_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
             ratio = (starts / games).clip(0.0, 1.0).fillna(0.5)
             df["prob_start"] = ratio
         else:
-            df["prob_start"] = 0.5
-    else:
+            usage_col = find_exact(
+                [
+                    "icetime",
+                    "ice_time",
+                    "time_on_ice",
+                    "toi",
+                    "minutes_played",
+                    "minutes",
+                    "games_played",
+                    "games",
+                ]
+            )
+            if usage_col:
+                usage = pd.to_numeric(df[usage_col], errors="coerce").clip(lower=0.0)
+                team_totals = usage.groupby(df["team"]).transform("sum").replace(0, np.nan)
+                share = (usage / team_totals).clip(0.0, 1.0).fillna(0.0)
+                df["prob_start"] = share
+            else:
+                df["prob_start"] = 0.5
+
+    if "prob_start" in df.columns:
         df["prob_start"] = (
             pd.to_numeric(df["prob_start"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
         )
+    else:
+        df["prob_start"] = 0.5
 
     grouped = (
         df[["goalie", "team", "gsax_rolling", "prob_start"]]
