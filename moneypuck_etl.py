@@ -31,6 +31,7 @@ import requests
 MONEYPUCK_BASE_URL = "https://moneypuck.com/moneypuck/playerData/seasonSummary/{season}/{stage}/{dataset}.csv"
 DEFAULT_HISTORY_DIR = Path("data/history")
 DEFAULT_ANOMALY_DIRNAME = "anomalies"
+WINDOWS_DRIVE_PATTERN = re.compile(r"^[a-zA-Z]:[\\/]")
 
 TEAM_NAME_MAP: Dict[str, str] = {
     "ANAHEIM DUCKS": "ANA",
@@ -119,6 +120,19 @@ def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df.columns = [str(col).strip() for col in df.columns]
     return df
+
+
+def _maybe_windows_path(value: str) -> Optional[Path]:
+    """Return a Path for Windows drive-style inputs."""
+
+    if not value:
+        return None
+    if WINDOWS_DRIVE_PATTERN.match(value):
+        normalized = value.replace("\\", "/")
+        return Path(normalized)
+    if value.startswith("\\\\"):
+        return Path(value)
+    return None
 
 
 def _find_column(df: pd.DataFrame, patterns: Sequence[str]) -> Optional[str]:
@@ -407,23 +421,35 @@ class MoneyPuckDownloader:
                 local_path: Optional[Path] = None
                 parsed = urlparse(url)
 
+                windows_path = _maybe_windows_path(url)
+                if windows_path is not None:
+                    local_path = windows_path
                 if parsed.scheme == "file":
                     local_path = Path(url2pathname(parsed.path))
                     if parsed.netloc and parsed.netloc not in ("", "localhost"):
                         local_path = Path(f"//{parsed.netloc}") / local_path
-                elif parsed.scheme == "" and Path(url).expanduser().exists():
+                elif (
+                    local_path is None
+                    and parsed.scheme == ""
+                    and Path(url).expanduser().exists()
+                ):
                     local_path = Path(url).expanduser()
 
-                if local_path is not None and local_path.exists():
-                    df = pd.read_csv(local_path)
-                    if df.empty:
-                        continue
-                    return df, {
-                        "season": season,
-                        "stage": stage,
-                        "source_url": str(local_path),
-                        "dataset": dataset,
-                    }
+                if local_path is not None:
+                    if local_path.exists():
+                        df = pd.read_csv(local_path)
+                        if df.empty:
+                            continue
+                        return df, {
+                            "season": season,
+                            "stage": stage,
+                            "source_url": str(local_path),
+                            "dataset": dataset,
+                        }
+                    errors.append(
+                        f"{url}: Local path {local_path} does not exist on this host."
+                    )
+                    continue
 
                 response = self.session.get(url, timeout=self.timeout)
                 response.raise_for_status()
