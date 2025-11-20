@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import numpy as np
 import pandas as pd
@@ -402,6 +404,27 @@ class MoneyPuckDownloader:
         errors: List[str] = []
         for season, stage, url in candidates:
             try:
+                local_path: Optional[Path] = None
+                parsed = urlparse(url)
+
+                if parsed.scheme == "file":
+                    local_path = Path(url2pathname(parsed.path))
+                    if parsed.netloc and parsed.netloc not in ("", "localhost"):
+                        local_path = Path(f"//{parsed.netloc}") / local_path
+                elif parsed.scheme == "" and Path(url).expanduser().exists():
+                    local_path = Path(url).expanduser()
+
+                if local_path is not None and local_path.exists():
+                    df = pd.read_csv(local_path)
+                    if df.empty:
+                        continue
+                    return df, {
+                        "season": season,
+                        "stage": stage,
+                        "source_url": str(local_path),
+                        "dataset": dataset,
+                    }
+
                 response = self.session.get(url, timeout=self.timeout)
                 response.raise_for_status()
                 text = response.text.strip()
