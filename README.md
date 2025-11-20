@@ -35,6 +35,16 @@ Command-line options
 - --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
 - --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
 
+Risk/edge feedback loop
+-----------------------
+
+`nhl_model3.py` now treats the bet log as a self-correcting safety valve:
+
+- Every run, the model ingests `bets_log.csv`, compares implied vs. realized edge, unit ROI, CLV, and live loss streaks, then updates the thresholds it will accept.
+- If performance cools, the minimum required edge/probability rises, Kelly stakes are downscaled, and the slate-level exposure cap tightens; when results improve, the loop slowly relaxes those constraints.
+- A short status line (e.g., `🛡️ Risk feedback loop: edge≥0.26; prob≥0.58; Kelly×0.78; exposure≤4.8%; loss streak 3`) prints after the calibration summary so you know why recommendations throttled up or down.
+- No special flag is required—just keep `--log-bets` enabled so the loop has fresh data. If you disable logging, the system automatically falls back to the static 0.22 edge / 0.56 probability guardrails.
+
 Automated MoneyPuck ETL
 -----------------------
 
