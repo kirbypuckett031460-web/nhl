@@ -1348,6 +1348,14 @@ class RealDataNHLModel:
         self.book_confidence_multipliers: Dict[str, float] = {}
         self.month_confidence_multipliers: Dict[str, float] = {}
         self.current_prediction_month: Optional[str] = None
+        # Dynamic risk/edge feedback controls (populated from bet logs)
+        self.risk_edge_floor: float = 0.22
+        self.risk_prob_floor: float = 0.56
+        self.risk_kelly_multiplier: float = 1.0
+        self.risk_confidence_shift: float = 0.0
+        self.risk_exposure_cap_pct: float = self.daily_exposure_cap_pct
+        self.risk_feedback_snapshot: Optional[Dict[str, Any]] = None
+        self.risk_budget_last_scale: float = 1.0
 
     def _build_feature_pipeline(self) -> Pipeline:
         """Return a fresh feature transformation pipeline."""
@@ -1517,6 +1525,104 @@ class RealDataNHLModel:
         scale = 1.0 + score
         return float(max(0.7, min(1.2, scale)))
 
+    def _update_risk_feedback_state(self, logs: Optional[pd.DataFrame]) -> None:
+        """Derive dynamic risk controls from recent bet performance."""
+        base_edge = 0.22
+        base_prob = 0.56
+        self.risk_edge_floor = base_edge
+        self.risk_prob_floor = base_prob
+        self.risk_kelly_multiplier = 1.0
+        self.risk_confidence_shift = 0.0
+        self.risk_exposure_cap_pct = self.daily_exposure_cap_pct
+        self.risk_feedback_snapshot = None
+        if logs is None or logs.empty:
+            return
+        eval_logs = logs.copy()
+        if 'date' in eval_logs.columns:
+            eval_logs['date'] = pd.to_datetime(eval_logs['date'], errors='coerce')
+            eval_logs = eval_logs.dropna(subset=['date'])
+            eval_logs = eval_logs.sort_values('date')
+        recent = eval_logs.tail(40)
+        if recent.empty:
+            return
+        resolved = recent
+        if 'bet_win_binary' in recent.columns:
+            resolved = recent[recent['bet_win_binary'].notna()]
+        if resolved.empty:
+            return
+        recent_window = resolved.tail(25)
+        loss_streak = 0
+        trailing_loss = 0
+        outcomes = recent_window['bet_win_binary'].dropna().tolist()
+        current = 0
+        for outcome in outcomes:
+            if outcome < 0.5:
+                current += 1
+                loss_streak = max(loss_streak, current)
+            else:
+                current = 0
+        current = 0
+        for outcome in reversed(outcomes):
+            if outcome < 0.5:
+                current += 1
+            else:
+                break
+        trailing_loss = current
+        edge_gap = None
+        avg_profit = None
+        avg_clv = None
+        try:
+            implied = recent_window['edge_signed'].dropna().tail(20)
+            realized = recent_window['realized_signed'].dropna().tail(20)
+            if len(implied) and len(realized):
+                edge_gap = float(realized.mean() - implied.mean())
+        except Exception:
+            edge_gap = None
+        try:
+            prof = recent_window['unit_profit'].dropna().tail(20)
+            if len(prof):
+                avg_profit = float(prof.mean())
+        except Exception:
+            avg_profit = None
+        try:
+            clv = recent_window['clv_aligned'].dropna().tail(20)
+            if len(clv):
+                avg_clv = float(clv.mean())
+        except Exception:
+            avg_clv = None
+        signal = 0.0
+        if edge_gap is not None and np.isfinite(edge_gap):
+            signal += np.clip(edge_gap, -0.5, 0.5) * 0.6
+        if avg_profit is not None and np.isfinite(avg_profit):
+            signal += np.clip(avg_profit, -0.5, 0.5) * 0.5
+        if avg_clv is not None and np.isfinite(avg_clv):
+            signal += np.clip(avg_clv, -0.5, 0.5) * 0.4
+        signal -= min(loss_streak, 5) * 0.12
+        signal -= min(trailing_loss, 5) * 0.08
+        edge_floor = float(np.clip(base_edge - signal * 0.08, 0.18, 0.32))
+        prob_floor = float(np.clip(base_prob - signal * 0.05, 0.54, 0.62))
+        kelly_mult = float(np.clip(1.0 + signal * 0.5, 0.45, 1.3))
+        confidence_shift = float(np.clip(signal * 0.05, -0.08, 0.08))
+        exposure_cap = float(np.clip(self.daily_exposure_cap_pct * (1.0 + signal * 0.4), 2.5, self.daily_exposure_cap_pct * 1.3))
+        self.risk_edge_floor = edge_floor
+        self.risk_prob_floor = prob_floor
+        self.risk_kelly_multiplier = kelly_mult
+        self.risk_confidence_shift = confidence_shift
+        self.risk_exposure_cap_pct = exposure_cap
+        self.risk_feedback_snapshot = {
+            'signal': signal,
+            'loss_streak': loss_streak,
+            'trailing_loss': trailing_loss,
+            'avg_unit_profit': avg_profit,
+            'edge_gap': edge_gap,
+            'avg_clv': avg_clv,
+            'edge_floor': edge_floor,
+            'prob_floor': prob_floor,
+            'kelly_multiplier': kelly_mult,
+            'confidence_shift': confidence_shift,
+            'exposure_cap_pct': exposure_cap
+        }
+
     def update_market_calibration(
         self,
         log_path: Optional[str],
@@ -1663,6 +1769,10 @@ class RealDataNHLModel:
             'by_book': book_summary
         }
         self.market_calibration_snapshot = snapshot
+        try:
+            self._update_risk_feedback_state(logs)
+        except Exception as risk_err:
+            print(f"⚠️  Risk feedback update failed: {risk_err}")
         return snapshot
 
     def get_market_multiplier(self, book: Optional[str], bet_month: Optional[str]) -> float:
@@ -1690,6 +1800,28 @@ class RealDataNHLModel:
             prediction.kelly_bet_size = adj * 100.0
         if isinstance(prediction.confidence, (int, float)):
             prediction.confidence = float(min(0.97, max(0.05, prediction.confidence + (mult - 1.0) * 0.08)))
+
+    def apply_risk_budget(self, predictions: List[OverUnderPrediction]) -> None:
+        """Ensure aggregate Kelly exposure stays within the dynamic cap."""
+        exposure_cap = float(getattr(self, 'risk_exposure_cap_pct', self.daily_exposure_cap_pct))
+        if exposure_cap <= 0:
+            return
+        recs: List[OverUnderPrediction] = [
+            p for p in predictions
+            if p.recommendation != 'No Bet' and isinstance(getattr(p, 'kelly_bet_size', None), (int, float))
+        ]
+        if not recs:
+            self.risk_budget_last_scale = 1.0
+            return
+        total = float(sum(max(0.0, float(p.kelly_bet_size)) for p in recs))
+        if total <= exposure_cap or total <= 0:
+            self.risk_budget_last_scale = 1.0
+            return
+        scale = float(max(0.2, exposure_cap / total))
+        for p in recs:
+            p.kelly_bet_size = float(max(0.0, p.kelly_bet_size * scale))
+        self.risk_budget_last_scale = scale
+        print(f"🛡️  Risk budget enforced: scaled Kelly stakes by {scale:.2f} to cap exposure at {exposure_cap:.1f}% (was {total:.1f}%).")
 
         
     def fetch_historical_games(self, days_back: int = 30) -> pd.DataFrame:
@@ -3872,8 +4004,8 @@ class RealDataNHLModel:
             pass
 
         # Betting recommendation thresholds (tuned slightly post-calibration)
-        min_edge = 0.22
-        min_prob = 0.56
+        min_edge = float(getattr(self, 'risk_edge_floor', 0.22))
+        min_prob = float(getattr(self, 'risk_prob_floor', 0.56))
         
         if abs(edge) < min_edge or max(over_prob, under_prob) < min_prob:
             recommendation = 'No Bet'
@@ -3895,7 +4027,8 @@ class RealDataNHLModel:
             except Exception:
                 stale_factor = 1.0
             kelly_raw = float(max(0.0, k))
-            kelly_scaled = kelly_raw * float(getattr(self, 'kelly_mult', 0.5)) * dispersion_factor * stale_factor
+            risk_mult = float(getattr(self, 'risk_kelly_multiplier', 1.0))
+            kelly_scaled = kelly_raw * float(getattr(self, 'kelly_mult', 0.5)) * dispersion_factor * stale_factor * risk_mult
             kelly_size = float(min(float(getattr(self, 'kelly_cap_pct', 2.0))/100.0, kelly_scaled)) * 100.0
         elif edge < -min_edge and under_prob > min_prob:
             recommendation = 'UNDER'
@@ -3912,7 +4045,8 @@ class RealDataNHLModel:
             except Exception:
                 stale_factor = 1.0
             kelly_raw = float(max(0.0, k))
-            kelly_scaled = kelly_raw * float(getattr(self, 'kelly_mult', 0.5)) * dispersion_factor * stale_factor
+            risk_mult = float(getattr(self, 'risk_kelly_multiplier', 1.0))
+            kelly_scaled = kelly_raw * float(getattr(self, 'kelly_mult', 0.5)) * dispersion_factor * stale_factor * risk_mult
             kelly_size = float(min(float(getattr(self, 'kelly_cap_pct', 2.0))/100.0, kelly_scaled)) * 100.0
         else:
             recommendation = 'No Bet'
@@ -3925,6 +4059,9 @@ class RealDataNHLModel:
         if self.conformal_q90 is not None:
             interval_penalty = min(0.15, self.conformal_q90 / 10.0)
         confidence = float(min(0.95, max(0.05, conf_base - interval_penalty)))
+        risk_shift = float(getattr(self, 'risk_confidence_shift', 0.0))
+        if risk_shift:
+            confidence = float(min(0.95, max(0.05, confidence + risk_shift)))
         
         # Conformal confidence interval around predicted total
         qrad = self.total_model.get('conformal_radius') or self.total_model.get('conformal_q90')
@@ -6839,6 +6976,29 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 msg_bits.append(f"Realized-Implied {edge_gap:+.2f}")
             if msg_bits:
                 print("   " + " | ".join(msg_bits))
+            risk_feedback = getattr(model, 'risk_feedback_snapshot', None)
+            if isinstance(risk_feedback, dict):
+                try:
+                    edge_floor = risk_feedback.get('edge_floor')
+                    prob_floor = risk_feedback.get('prob_floor')
+                    kelly_mult = risk_feedback.get('kelly_multiplier')
+                    exposure_cap = risk_feedback.get('exposure_cap_pct')
+                    loss_streak = risk_feedback.get('loss_streak')
+                    parts = []
+                    if isinstance(edge_floor, (int, float)):
+                        parts.append(f"edge≥{edge_floor:.2f}")
+                    if isinstance(prob_floor, (int, float)):
+                        parts.append(f"prob≥{prob_floor:.2f}")
+                    if isinstance(kelly_mult, (int, float)):
+                        parts.append(f"Kelly×{kelly_mult:.2f}")
+                    if isinstance(exposure_cap, (int, float)):
+                        parts.append(f"exposure≤{exposure_cap:.1f}%")
+                    if isinstance(loss_streak, (int, float)) and loss_streak > 0:
+                        parts.append(f"loss streak {int(loss_streak)}")
+                    if parts:
+                        print("🛡️  Risk feedback loop: " + "; ".join(parts))
+                except Exception:
+                    pass
         
         print("\n🏒 Step 4: Fetching today's games...")
         todays_games = model.get_todays_games(
@@ -7908,13 +8068,18 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         pass
 
                     predictions.append(pred)
-                    
+
                 except Exception as e:
                     print(f"⚠️  Error predicting game {idx}: {e}")
                     continue
-            
-            print(f"✅ Generated {len(predictions)} predictions")
-            
+
+              try:
+                  model.apply_risk_budget(predictions)
+              except Exception as e:
+                  print(f"⚠️  Risk budget enforcement skipped: {e}")
+
+              print(f"✅ Generated {len(predictions)} predictions")
+
             betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
             if betting_preds:
                 print(f"\n💰 Recommended bets ({len(betting_preds)}):")
