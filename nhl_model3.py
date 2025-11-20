@@ -2241,6 +2241,19 @@ class RealDataNHLModel:
             'home_elite_prob', 'away_elite_prob',
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
+            'home_line1_xgar', 'away_line1_xgar',
+            'home_line2_xgar', 'away_line2_xgar',
+            'home_line3_xgar', 'away_line3_xgar',
+            'home_line4_xgar', 'away_line4_xgar',
+            'home_pair1_xgar', 'away_pair1_xgar',
+            'home_pair2_xgar', 'away_pair2_xgar',
+            'home_pair3_xgar', 'away_pair3_xgar',
+            'home_pp1_xgar', 'away_pp1_xgar',
+            'home_pk1_xgar', 'away_pk1_xgar',
+            'home_roster_rapm', 'away_roster_rapm',
+            'home_scratched_xgar', 'away_scratched_xgar',
+            'home_scratch_count', 'away_scratch_count',
+            'line_match_edge', 'scratch_edge', 'roster_rapm_diff',
             'skater_goalie_edge'
         ]
         for col in player_feature_cols:
@@ -2818,6 +2831,68 @@ class RealDataNHLModel:
 
         forward_positions = {'F', 'LW', 'RW', 'C', 'W', 'CF'}
         defense_positions = {'D', 'LD', 'RD', 'DEF'}
+        line_categories = ['L1', 'L2', 'L3', 'L4']
+        pair_categories = ['D1', 'D2', 'D3']
+        pp_categories = ['PP1', 'PP2']
+        pk_categories = ['PK1', 'PK2']
+        all_line_buckets = line_categories + pair_categories + pp_categories + pk_categories
+
+        def normalize_line_slot(slot: Any) -> str:
+            if slot is None or (isinstance(slot, float) and np.isnan(slot)):
+                return ''
+            s = str(slot).strip().upper()
+            if not s:
+                return ''
+            replacements = {
+                'LINE': 'L',
+                'FORWARD': 'L',
+                'FWD': 'L',
+                'PAIRING': 'D',
+                'PAIR': 'D',
+                'DEFENCE': 'D',
+                'DEFENSE': 'D',
+                'DEF': 'D',
+                'POWERPLAY': 'PP',
+                'PPLAY': 'PP',
+                'POWERPLAYUNIT': 'PP',
+                'PENALTYKILL': 'PK',
+                'PKILL': 'PK',
+                'PKUNIT': 'PK',
+                'UNIT': ''
+            }
+            for old, new in replacements.items():
+                s = s.replace(old, new)
+            s = s.replace('-', '').replace(' ', '')
+            s = re.sub(r'(ST|ND|RD|TH)', '', s)
+            s = re.sub(r'[^A-Z0-9]', '', s)
+            alias_map = {
+                'TOPL': 'L1',
+                'SECONDL': 'L2',
+                'THIRDL': 'L3',
+                'FOURTHL': 'L4',
+                'TOPD': 'D1',
+                'SECONDD': 'D2',
+                'THIRDD': 'D3',
+                'FIRSTD': 'D1'
+            }
+            for key, val in alias_map.items():
+                if key in s:
+                    return val
+            match = re.match(r'(PP|PK|L|F|D)(\d)', s)
+            if match:
+                prefix = match.group(1)
+                if prefix == 'F':
+                    prefix = 'L'
+                return f"{prefix}{match.group(2)}"
+            match = re.match(r'(\d)(PP|PK|L|F|D)', s)
+            if match:
+                prefix = match.group(2)
+                if prefix == 'F':
+                    prefix = 'L'
+                return f"{prefix}{match.group(1)}"
+            return ''
+
+        df['line_bucket'] = df['line_slot'].apply(normalize_line_slot)
 
         team_summary: Dict[str, Dict[str, Any]] = {}
         for team, grp in df.groupby('team'):
@@ -2836,6 +2911,36 @@ class RealDataNHLModel:
             defense_xgar = float((grp.loc[defense_mask, 'xgar'] * weights.loc[defense_mask]).sum()) if defense_mask.any() else 0.0
             elite = grp.sort_values('xgar', ascending=False).head(4)
             elite_availability = float((elite['xgar'].clip(lower=0.0) * elite['prob_play']).sum())
+            bucket_totals: Dict[str, float] = {}
+            for bucket in all_line_buckets:
+                mask = grp['line_bucket'] == bucket
+                if mask.any():
+                    bucket_totals[bucket] = float((grp.loc[mask, 'xgar'] * weights.loc[mask]).sum())
+            line_summary = [
+                f"{bucket}:{bucket_totals[bucket]:+.1f}"
+                for bucket in line_categories
+                if bucket in bucket_totals and abs(bucket_totals[bucket]) >= 0.1
+            ]
+            status_lower = grp['status'].astype(str).str.lower()
+            scratch_mask = (
+                (weights < 0.2) |
+                status_lower.str.contains(r'scratch|inactive|out|ltir|ir|susp', regex=True, na=False)
+            )
+            scratch_value = 0.0
+            scratch_count = 0
+            scratch_names: List[str] = []
+            if scratch_mask.any():
+                scratch_weights = (1.0 - weights.loc[scratch_mask]).clip(0.0, 1.0)
+                scratch_rows = grp.loc[scratch_mask].copy().sort_values('xgar', ascending=False)
+                scratch_value = float(
+                    (
+                        scratch_rows['xgar'].clip(lower=0.0) *
+                        scratch_weights.reindex(scratch_rows.index).fillna(1.0)
+                    ).sum()
+                )
+                scratch_count = int(scratch_mask.sum())
+                scratch_names = [f"{row['player']} ({row['position']})" for _, row in scratch_rows.iterrows()]
+            roster_rapm_total = float(((grp['rapm_off'] + grp['rapm_def']) * weights).sum())
             team_summary[team] = {
                 'active_xgar': active_xgar,
                 'active_rapm_off': active_rapm_off,
@@ -2845,7 +2950,16 @@ class RealDataNHLModel:
                 'missing_names': missing_names,
                 'forward_xgar': forward_xgar,
                 'defense_xgar': defense_xgar,
-                'elite_availability': elite_availability
+                'elite_availability': elite_availability,
+                'line_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in line_categories},
+                'pair_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in pair_categories},
+                'pp_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in pp_categories},
+                'pk_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in pk_categories},
+                'line_summary': line_summary,
+                'scratch_value': scratch_value,
+                'scratch_count': scratch_count,
+                'scratch_names': scratch_names,
+                'roster_rapm_total': roster_rapm_total
             }
 
         if not team_summary:
@@ -2864,7 +2978,34 @@ class RealDataNHLModel:
             away_summary = team_summary.get(away_team, {})
 
             def val(summary: Dict[str, Any], key: str) -> float:
-                return float(summary.get(key, 0.0)) if summary else 0.0
+                try:
+                    return float(summary.get(key, 0.0)) if summary else 0.0
+                except Exception:
+                    return 0.0
+
+            def bucket_val(summary: Dict[str, Any], bucket_key: str, bucket: str) -> float:
+                if not summary:
+                    return 0.0
+                data = summary.get(bucket_key)
+                if not isinstance(data, dict):
+                    return 0.0
+                try:
+                    val_raw = float(data.get(bucket, 0.0))
+                    return val_raw if np.isfinite(val_raw) else 0.0
+                except Exception:
+                    return 0.0
+
+            def dict_diff(home_dict: Dict[str, Any], away_dict: Dict[str, Any], bucket: str) -> float:
+                try:
+                    hv = float(home_dict.get(bucket, 0.0)) if isinstance(home_dict, dict) else 0.0
+                except Exception:
+                    hv = 0.0
+                try:
+                    av = float(away_dict.get(bucket, 0.0)) if isinstance(away_dict, dict) else 0.0
+                except Exception:
+                    av = 0.0
+                diff_val = hv - av
+                return diff_val if np.isfinite(diff_val) else 0.0
 
             todays_features.at[idx, 'home_active_xgar'] = val(home_summary, 'active_xgar')
             todays_features.at[idx, 'away_active_xgar'] = val(away_summary, 'active_xgar')
@@ -2882,6 +3023,25 @@ class RealDataNHLModel:
             todays_features.at[idx, 'away_defense_xgar'] = val(away_summary, 'defense_xgar')
             todays_features.at[idx, 'home_elite_prob'] = val(home_summary, 'elite_availability')
             todays_features.at[idx, 'away_elite_prob'] = val(away_summary, 'elite_availability')
+            for pos, bucket in enumerate(line_categories, start=1):
+                todays_features.at[idx, f'home_line{pos}_xgar'] = bucket_val(home_summary, 'line_xgar', bucket)
+                todays_features.at[idx, f'away_line{pos}_xgar'] = bucket_val(away_summary, 'line_xgar', bucket)
+            for pos, bucket in enumerate(pair_categories, start=1):
+                todays_features.at[idx, f'home_pair{pos}_xgar'] = bucket_val(home_summary, 'pair_xgar', bucket)
+                todays_features.at[idx, f'away_pair{pos}_xgar'] = bucket_val(away_summary, 'pair_xgar', bucket)
+            todays_features.at[idx, 'home_pp1_xgar'] = bucket_val(home_summary, 'pp_xgar', 'PP1')
+            todays_features.at[idx, 'away_pp1_xgar'] = bucket_val(away_summary, 'pp_xgar', 'PP1')
+            todays_features.at[idx, 'home_pk1_xgar'] = bucket_val(home_summary, 'pk_xgar', 'PK1')
+            todays_features.at[idx, 'away_pk1_xgar'] = bucket_val(away_summary, 'pk_xgar', 'PK1')
+            todays_features.at[idx, 'home_roster_rapm'] = val(home_summary, 'roster_rapm_total')
+            todays_features.at[idx, 'away_roster_rapm'] = val(away_summary, 'roster_rapm_total')
+            todays_features.at[idx, 'roster_rapm_diff'] = (
+                todays_features.at[idx, 'home_roster_rapm'] - todays_features.at[idx, 'away_roster_rapm']
+            )
+            todays_features.at[idx, 'home_scratched_xgar'] = val(home_summary, 'scratch_value')
+            todays_features.at[idx, 'away_scratched_xgar'] = val(away_summary, 'scratch_value')
+            todays_features.at[idx, 'home_scratch_count'] = val(home_summary, 'scratch_count')
+            todays_features.at[idx, 'away_scratch_count'] = val(away_summary, 'scratch_count')
 
             player_adjustment = (
                 0.02 * (todays_features.at[idx, 'home_active_xgar'] - todays_features.at[idx, 'away_active_xgar']) +
@@ -2897,7 +3057,46 @@ class RealDataNHLModel:
                 0.01 * (todays_features.at[idx, 'home_elite_prob'] - todays_features.at[idx, 'away_elite_prob'])
             )
             player_adjustment += skater_edge
-            todays_features.at[idx, 'skater_goalie_edge'] = todays_features.at[idx, 'skater_goalie_edge'] + skater_edge
+            home_lines = home_summary.get('line_xgar', {}) if home_summary else {}
+            away_lines = away_summary.get('line_xgar', {}) if away_summary else {}
+            home_pairs = home_summary.get('pair_xgar', {}) if home_summary else {}
+            away_pairs = away_summary.get('pair_xgar', {}) if away_summary else {}
+            home_pp_units = home_summary.get('pp_xgar', {}) if home_summary else {}
+            away_pp_units = away_summary.get('pp_xgar', {}) if away_summary else {}
+            home_pk_units = home_summary.get('pk_xgar', {}) if home_summary else {}
+            away_pk_units = away_summary.get('pk_xgar', {}) if away_summary else {}
+
+            l1_diff = dict_diff(home_lines, away_lines, 'L1')
+            l2_diff = dict_diff(home_lines, away_lines, 'L2')
+            l3_diff = dict_diff(home_lines, away_lines, 'L3')
+            l4_diff = dict_diff(home_lines, away_lines, 'L4')
+            pair1_diff = dict_diff(home_pairs, away_pairs, 'D1')
+            pair2_diff = dict_diff(home_pairs, away_pairs, 'D2')
+            pp_edge = (
+                bucket_val(home_summary, 'pp_xgar', 'PP1') - bucket_val(away_summary, 'pk_xgar', 'PK1') -
+                (bucket_val(away_summary, 'pp_xgar', 'PP1') - bucket_val(home_summary, 'pk_xgar', 'PK1'))
+            )
+            line_match_adj = (
+                0.012 * l1_diff +
+                0.008 * l2_diff +
+                0.004 * l3_diff +
+                0.002 * l4_diff +
+                0.006 * pair1_diff +
+                0.004 * pair2_diff +
+                0.003 * pp_edge
+            )
+            line_match_adj = float(max(-0.35, min(0.35, line_match_adj)))
+            scratch_diff = todays_features.at[idx, 'home_scratched_xgar'] - todays_features.at[idx, 'away_scratched_xgar']
+            scratch_count_diff = todays_features.at[idx, 'home_scratch_count'] - todays_features.at[idx, 'away_scratch_count']
+            scratch_penalty = -0.008 * scratch_diff - 0.01 * scratch_count_diff
+            scratch_penalty = float(max(-0.25, min(0.25, scratch_penalty)))
+            todays_features.at[idx, 'line_match_edge'] = line_match_adj
+            todays_features.at[idx, 'scratch_edge'] = scratch_penalty
+            player_adjustment += (line_match_adj + scratch_penalty)
+            skater_goalie_increment = skater_edge + line_match_adj + scratch_penalty
+            todays_features.at[idx, 'skater_goalie_edge'] = (
+                todays_features.at[idx, 'skater_goalie_edge'] + skater_goalie_increment
+            )
             todays_features.at[idx, 'player_edge_total'] = player_adjustment
             todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + player_adjustment
             todays_features.at[idx, 'final_prediction_base'] = (
@@ -2909,10 +3108,30 @@ class RealDataNHLModel:
                 gid_raw = todays_features.at[idx, 'game_id']
                 gid = str(gid_raw) if pd.notna(gid_raw) else None
             note_parts: List[str] = []
-            if home_summary.get('missing_names'):
-                note_parts.append(f"{home_team}: -" + ", ".join(home_summary['missing_names'][:3]))
-            if away_summary.get('missing_names'):
-                note_parts.append(f"{away_team}: -" + ", ".join(away_summary['missing_names'][:3]))
+            missing_home = home_summary.get('missing_names', []) if home_summary else []
+            missing_away = away_summary.get('missing_names', []) if away_summary else []
+            scratch_home = home_summary.get('scratch_names', []) if home_summary else []
+            scratch_away = away_summary.get('scratch_names', []) if away_summary else []
+            if missing_home:
+                note_parts.append(f"{home_team}: -" + ", ".join(missing_home[:3]))
+            if missing_away:
+                note_parts.append(f"{away_team}: -" + ", ".join(missing_away[:3]))
+            missing_home_set = set(missing_home)
+            missing_away_set = set(missing_away)
+            scratch_home_filtered = [name for name in scratch_home if name not in missing_home_set]
+            scratch_away_filtered = [name for name in scratch_away if name not in missing_away_set]
+            if scratch_home_filtered:
+                note_parts.append(f"{home_team} SCR: " + ", ".join(scratch_home_filtered[:2]))
+            if scratch_away_filtered:
+                note_parts.append(f"{away_team} SCR: " + ", ".join(scratch_away_filtered[:2]))
+            line_desc_home = home_summary.get('line_summary', []) if home_summary else []
+            line_desc_away = away_summary.get('line_summary', []) if away_summary else []
+            if line_desc_home:
+                note_parts.append(f"{home_team} {line_desc_home[0]}")
+            if line_desc_away:
+                note_parts.append(f"{away_team} {line_desc_away[0]}")
+            if np.isfinite(line_match_adj) and abs(line_match_adj) >= 0.01:
+                note_parts.append(f"LM {line_match_adj:+.2f}")
             if note_parts and gid:
                 notes[gid] = " | ".join(note_parts)
 
@@ -3354,6 +3573,20 @@ class RealDataNHLModel:
             'home_elite_prob', 'away_elite_prob',
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
+            'home_line1_xgar', 'away_line1_xgar',
+            'home_line2_xgar', 'away_line2_xgar',
+            'home_line3_xgar', 'away_line3_xgar',
+            'home_line4_xgar', 'away_line4_xgar',
+            'home_pair1_xgar', 'away_pair1_xgar',
+            'home_pair2_xgar', 'away_pair2_xgar',
+            'home_pair3_xgar', 'away_pair3_xgar',
+            'home_pp1_xgar', 'away_pp1_xgar',
+            'home_pk1_xgar', 'away_pk1_xgar',
+            'home_roster_rapm', 'away_roster_rapm',
+            'roster_rapm_diff',
+            'home_scratched_xgar', 'away_scratched_xgar',
+            'home_scratch_count', 'away_scratch_count',
+            'line_match_edge', 'scratch_edge',
             'skater_goalie_edge'
         ]
         # Add rink bias proxy and penalties
