@@ -54,6 +54,7 @@ Use `moneypuck_etl.py` to keep the MoneyPuck-derived inputs fresh without manual
 - Normalizes to the schema expected by `nhl_model3.py`
 - Runs anomaly detection for data drift, stale seasons, and entity gaps
 - Versions every refresh beneath `data/history/` (`versions.json`, dated CSVs, and `anomalies/*.json`)
+- NEW: Generates `player_metrics.csv` (skater RAPM/xGAR proxies, lineup buckets, probabilities) directly from MoneyPuck skater summaries
 
 Examples:
 
@@ -65,13 +66,15 @@ python moneypuck_etl.py
 python moneypuck_etl.py \
   --team-output data/latest/team_rates.csv \
   --goalie-output data/latest/goalie_gsax.csv \
+  --player-output data/latest/player_metrics.csv \
   --history-dir data/history \
   --seasons 2025 2024 \
   --stages regular playoffs
 ```
 
 To run the ETL automatically before generating predictions, add `--refresh-moneypuck` when
-calling `nhl_model3.py`. You can further tune the inline run with `--moneypuck-history-dir`,
+calling `nhl_model3.py`. The inline run now refreshes `team_rates.csv`, `goalie_gsax.csv`, **and**
+`player_metrics.csv`. You can further tune the inline run with `--moneypuck-history-dir`,
 `--moneypuck-stages`, `--moneypuck-seasons`, `--moneypuck-dry-run`, `--fail-on-moneypuck-anomaly`,
 and `--moneypuck-request-timeout`.
 
@@ -98,7 +101,8 @@ python nhl_model3.py \
   --team-rates-url https://moneypuck.com/teams.htm \
   --team-rates-path team_rates.csv \
   --goalie-gsax-url https://moneypuck.com/goalies.htm \
-  --goalie-gsax-path goalie_gsax.csv
+  --goalie-gsax-path goalie_gsax.csv \
+  --player-metrics-path player_metrics.csv
 ```
 
 4) Use environment and lineup inputs:

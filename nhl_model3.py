@@ -2759,6 +2759,21 @@ class RealDataNHLModel:
         if df is None or df.empty:
             return None
 
+        mp_signature = {
+            'OnIce_F_scoreVenueAdjustedxGoals',
+            'OnIce_A_scoreVenueAdjustedxGoals',
+            'gameScore'
+        }
+        needs_enrichment = any(col not in df.columns for col in ['rapm_off', 'rapm_def', 'xgar'])
+        if needs_enrichment and mp_signature.issubset(set(df.columns)):
+            try:
+                from moneypuck_etl import normalize_player_metrics  # type: ignore
+                normalized_df = normalize_player_metrics(df)
+                if normalized_df is not None and not normalized_df.empty:
+                    df = normalized_df
+            except Exception as mp_err:
+                print(f"⚠️  Could not auto-normalize MoneyPuck player data: {mp_err}")
+
         rename_candidates = {
             'Team': 'team', 'TEAM': 'team', 'Abbreviation': 'team', 'abbr': 'team', 'teamAbbrev': 'team',
             'Player': 'player', 'player_name': 'player', 'Player Name': 'player', 'name': 'player',
@@ -7257,8 +7272,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             else:
                 team_out = getattr(cli_args, 'team_rates_path', None) or 'team_rates.csv'
                 goalie_out = getattr(cli_args, 'goalie_gsax_path', None) or 'goalie_gsax.csv'
+                player_out = getattr(cli_args, 'player_metrics_path', None) or 'player_metrics.csv'
                 setattr(cli_args, 'team_rates_path', team_out)
                 setattr(cli_args, 'goalie_gsax_path', goalie_out)
+                setattr(cli_args, 'player_metrics_path', player_out)
                 history_dir = getattr(cli_args, 'moneypuck_history_dir', 'data/history') or 'data/history'
                 stages = getattr(cli_args, 'moneypuck_stages', None)
                 seasons = getattr(cli_args, 'moneypuck_seasons', None)
@@ -7266,11 +7283,13 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 pipeline = MoneyPuckETLPipeline(
                     team_output_path=team_out,
                     goalie_output_path=goalie_out,
+                    player_output_path=player_out,
                     history_dir=Path(history_dir),
                     stages=stages,
                     seasons=seasons,
                     team_override_url=getattr(cli_args, 'team_rates_url', None),
                     goalie_override_url=getattr(cli_args, 'goalie_gsax_url', None),
+                    player_override_url=getattr(cli_args, 'player_metrics_url', None),
                     dry_run=bool(getattr(cli_args, 'moneypuck_dry_run', False)),
                     fail_on_anomaly=bool(getattr(cli_args, 'fail_on_moneypuck_anomaly', False)),
                     request_timeout=timeout,
@@ -7491,6 +7510,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 print(f"⚠️  Team rates fetched but could not write to {target_path}: {e}")
                         else:
                             print(f"⚠️  Team rates fetched but could not determine local path for {cli_args.team_rates_path}")
+
                 if cli_args.goalie_gsax_url and cli_args.goalie_gsax_path:
                     gg = None
                     try:
@@ -7511,6 +7531,28 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 print(f"⚠️  Goalie GSAx fetched but could not write to {target_path}: {e}")
                         else:
                             print(f"⚠️  Goalie GSAx fetched but could not determine local path for {cli_args.goalie_gsax_path}")
+
+                if cli_args.player_metrics_url and cli_args.player_metrics_path:
+                    pm = None
+                    try:
+                        pm = model.load_player_metrics(cli_args.player_metrics_url)
+                    except Exception:
+                        time.sleep(1.0)
+                        try:
+                            pm = model.load_player_metrics(cli_args.player_metrics_url)
+                        except Exception:
+                            pm = None
+                    if pm is not None and isinstance(pm, pd.DataFrame) and not pm.empty:
+                        target_path = ensure_local_write_path(cli_args.player_metrics_path)
+                        if target_path:
+                            try:
+                                pm.to_csv(target_path, index=False)
+                                print(f"✅ Wrote player metrics to {target_path}")
+                            except Exception as e:
+                                print(f"⚠️  Player metrics fetched but could not write to {target_path}: {e}")
+                        else:
+                            print(f"⚠️  Player metrics fetched but could not determine local path for {cli_args.player_metrics_path}")
+
                 if cli_args.penalties_url and cli_args.penalty_rates_path:
                     pr = model.load_penalty_rates(cli_args.penalties_url)
                     if pr is not None:
@@ -8619,6 +8661,7 @@ if __name__ == "__main__":
     parser.add_argument('--auto-populate', action='store_true', help='Auto-fetch team rates/goalie GSAx/penalties/referees from URLs and write CSVs')
     parser.add_argument('--team-rates-url', type=str, default=os.getenv('TEAM_RATES_URL', None), help='URL to fetch team rates CSV')
     parser.add_argument('--goalie-gsax-url', type=str, default=os.getenv('GOALIE_GSAX_URL', None), help='URL to fetch goalie GSAx CSV')
+    parser.add_argument('--player-metrics-url', type=str, default=os.getenv('PLAYER_METRICS_URL', None), help='URL to fetch player metrics (MoneyPuck skaters) CSV')
     parser.add_argument('--penalties-url', type=str, default=os.getenv('PENALTIES_URL', None), help='URL to fetch team penalties CSV')
     parser.add_argument('--referees-url', type=str, default=os.getenv('REFEREES_URL', None), help='URL to fetch referee rates CSV')
     parser.add_argument('--refresh-moneypuck', action='store_true', help='Run the MoneyPuck ETL pipeline before predictions')
