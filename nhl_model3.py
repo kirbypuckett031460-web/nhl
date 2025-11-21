@@ -8306,12 +8306,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     print(f"⚠️  Error predicting game {idx}: {e}")
                     continue
 
-              try:
-                  model.apply_risk_budget(predictions)
-              except Exception as e:
-                  print(f"⚠️  Risk budget enforcement skipped: {e}")
+            try:
+                model.apply_risk_budget(predictions)
+            except Exception as e:
+                print(f"⚠️  Risk budget enforcement skipped: {e}")
 
-              print(f"✅ Generated {len(predictions)} predictions")
+            print(f"✅ Generated {len(predictions)} predictions")
 
             betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
             if betting_preds:
