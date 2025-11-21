@@ -47,6 +47,7 @@ import html as html_parser
 import errno
 import unicodedata
 from pathlib import Path
+import inspect
 from scipy.stats import norm, poisson, nbinom
 from sklearn.isotonic import IsotonicRegression
 try:
@@ -7269,31 +7270,60 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 from moneypuck_etl import MoneyPuckETLPipeline
             except Exception as etl_import_error:
                 print(f"⚠️  MoneyPuck ETL module unavailable: {etl_import_error}")
-            else:
-                team_out = getattr(cli_args, 'team_rates_path', None) or 'team_rates.csv'
-                goalie_out = getattr(cli_args, 'goalie_gsax_path', None) or 'goalie_gsax.csv'
-                player_out = getattr(cli_args, 'player_metrics_path', None) or 'player_metrics.csv'
-                setattr(cli_args, 'team_rates_path', team_out)
-                setattr(cli_args, 'goalie_gsax_path', goalie_out)
-                setattr(cli_args, 'player_metrics_path', player_out)
-                history_dir = getattr(cli_args, 'moneypuck_history_dir', 'data/history') or 'data/history'
-                stages = getattr(cli_args, 'moneypuck_stages', None)
-                seasons = getattr(cli_args, 'moneypuck_seasons', None)
-                timeout = float(getattr(cli_args, 'moneypuck_request_timeout', 25.0) or 25.0)
-                pipeline = MoneyPuckETLPipeline(
-                    team_output_path=team_out,
-                    goalie_output_path=goalie_out,
-                    player_output_path=player_out,
-                    history_dir=Path(history_dir),
-                    stages=stages,
-                    seasons=seasons,
-                    team_override_url=getattr(cli_args, 'team_rates_url', None),
-                    goalie_override_url=getattr(cli_args, 'goalie_gsax_url', None),
-                    player_override_url=getattr(cli_args, 'player_metrics_url', None),
-                    dry_run=bool(getattr(cli_args, 'moneypuck_dry_run', False)),
-                    fail_on_anomaly=bool(getattr(cli_args, 'fail_on_moneypuck_anomaly', False)),
-                    request_timeout=timeout,
-                )
+                else:
+                    team_out = getattr(cli_args, 'team_rates_path', None) or 'team_rates.csv'
+                    goalie_out = getattr(cli_args, 'goalie_gsax_path', None) or 'goalie_gsax.csv'
+                    player_out = getattr(cli_args, 'player_metrics_path', None) or 'player_metrics.csv'
+                    setattr(cli_args, 'team_rates_path', team_out)
+                    setattr(cli_args, 'goalie_gsax_path', goalie_out)
+                    setattr(cli_args, 'player_metrics_path', player_out)
+                    history_dir = getattr(cli_args, 'moneypuck_history_dir', 'data/history') or 'data/history'
+                    stages = getattr(cli_args, 'moneypuck_stages', None)
+                    seasons = getattr(cli_args, 'moneypuck_seasons', None)
+                    timeout = float(getattr(cli_args, 'moneypuck_request_timeout', 25.0) or 25.0)
+                    pipeline_kwargs = {
+                        'team_output_path': team_out,
+                        'goalie_output_path': goalie_out,
+                        'player_output_path': player_out,
+                        'history_dir': Path(history_dir),
+                        'stages': stages,
+                        'seasons': seasons,
+                        'team_override_url': getattr(cli_args, 'team_rates_url', None),
+                        'goalie_override_url': getattr(cli_args, 'goalie_gsax_url', None),
+                        'player_override_url': getattr(cli_args, 'player_metrics_url', None),
+                        'dry_run': bool(getattr(cli_args, 'moneypuck_dry_run', False)),
+                        'fail_on_anomaly': bool(getattr(cli_args, 'fail_on_moneypuck_anomaly', False)),
+                        'request_timeout': timeout,
+                    }
+                    try:
+                        pipeline_signature = inspect.signature(MoneyPuckETLPipeline)
+                    except (TypeError, ValueError):
+                        pipeline_signature = None
+                    supports_var_kwargs = False
+                    supported_params: Set[str] = set()
+                    if pipeline_signature is not None:
+                        for name, param in pipeline_signature.parameters.items():
+                            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                                supports_var_kwargs = True
+                                break
+                            supported_params.add(name)
+                    else:
+                        supported_params = set(pipeline_kwargs.keys())
+                    if supports_var_kwargs:
+                        filtered_kwargs = pipeline_kwargs
+                        unsupported_params: List[str] = []
+                    else:
+                        filtered_kwargs = {
+                            key: value for key, value in pipeline_kwargs.items() if key in supported_params
+                        }
+                        unsupported_params = [key for key in pipeline_kwargs.keys() if key not in supported_params]
+                    if unsupported_params:
+                        print(
+                            "ℹ️  MoneyPuck ETL pipeline version does not support the arguments: "
+                            + ", ".join(unsupported_params)
+                            + ". Continuing without them."
+                        )
+                    pipeline = MoneyPuckETLPipeline(**filtered_kwargs)
                 try:
                     etl_summaries = pipeline.run()
                     for summary in etl_summaries:
