@@ -33,11 +33,13 @@ import warnings
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Optional, Set, Any
 import io
+import csv
 import re
 from dataclasses import dataclass, field
 import webbrowser
 import argparse
 import os
+import shutil
 import time
 import json
 from urllib.parse import urlparse
@@ -112,6 +114,36 @@ except Exception:
     BEAUTIFULSOUP_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
+
+BET_LOG_COLUMNS: List[str] = [
+    'date',
+    'game_id',
+    'matchup',
+    'side',
+    'line',
+    'price',
+    'pred_total',
+    'edge',
+    'confidence',
+    'kelly_pct',
+    'model_prob',
+    'market_prob',
+    'fair_prob',
+    'ev_novig',
+    'consensus_total',
+    'line_diff_vs_consensus',
+    'best_book',
+    'bet_month',
+    'calibration_multiplier',
+    'market_velocity',
+    'referee_info',
+    'referee_avg_goals',
+    'referee_home_bias',
+    'closing_total',
+    'closing_price',
+    'closing_source',
+    'clv_vs_closing'
+]
 
 def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
     """Ensure the parent directory exists before writing to a local file path.
@@ -1634,10 +1666,9 @@ class RealDataNHLModel:
         self.month_confidence_multipliers = {}
         if not log_path or not os.path.exists(log_path):
             return None
-        try:
-            logs = pd.read_csv(log_path)
-        except Exception as e:
-            print(f"⚠️  Market calibration skipped: unable to read {log_path}: {e}")
+        logs = _read_bets_log_dataframe(log_path)
+        if logs is None:
+            print(f"⚠️  Market calibration skipped: unable to read {log_path}.")
             return None
         if logs.empty:
             return None
@@ -6072,6 +6103,96 @@ class RealDataNHLModel:
         print(f"✅ Prepared {len(todays_games)} games for prediction")
         return pd.DataFrame(todays_games)
 
+def _repair_bets_log_file(log_path: str, parse_err: Exception) -> Optional[pd.DataFrame]:
+    """Attempt to repair a bets log CSV that has inconsistent field counts."""
+
+    if not log_path or not os.path.exists(log_path):
+        return None
+
+    mismatch = re.search(r'Expected\s+(\d+)\s+fields?.*saw\s+(\d+)', str(parse_err))
+    if mismatch:
+        expected_fields, saw_fields = mismatch.groups()
+        print(f"⚠️  Detected schema drift in {log_path}: expected {expected_fields} columns but found {saw_fields}. Attempting repair...")
+    else:
+        print(f"⚠️  Detected unreadable rows in {log_path}: {parse_err}. Attempting repair...")
+
+    try:
+        with open(log_path, newline='', encoding='utf-8') as handle:
+            raw_rows = list(csv.reader(handle))
+    except Exception as raw_err:
+        print(f"❌  Failed to inspect {log_path} for repair: {raw_err}")
+        return None
+
+    if not raw_rows:
+        return None
+
+    header = raw_rows[0]
+    overlap = sum(1 for col in header if col in BET_LOG_COLUMNS)
+    if overlap < max(5, len(header) // 2):
+        print(f"⚠️  {log_path} does not resemble the bets log schema (only {overlap} shared columns). Unable to repair automatically.")
+        return None
+    data_rows = raw_rows[1:]
+    max_row_len = max([len(header)] + [len(row) for row in data_rows if row]) if data_rows else len(header)
+    target_len = max(len(BET_LOG_COLUMNS), max_row_len)
+
+    normalized_columns = header[:]
+    seen = {col for col in normalized_columns if col}
+    if len(normalized_columns) < target_len:
+        for col in BET_LOG_COLUMNS:
+            if len(normalized_columns) >= target_len:
+                break
+            if col not in seen:
+                normalized_columns.append(col)
+                seen.add(col)
+    while len(normalized_columns) < target_len:
+        normalized_columns.append(f'extra_{len(normalized_columns) - len(header) + 1}')
+
+    normalized_rows: List[List[str]] = []
+    for row in data_rows:
+        if not row:
+            continue
+        if len(row) < len(normalized_columns):
+            row = row + [''] * (len(normalized_columns) - len(row))
+        elif len(row) > len(normalized_columns):
+            row = row[:len(normalized_columns)]
+        normalized_rows.append(row)
+
+    df = pd.DataFrame(normalized_rows, columns=normalized_columns)
+
+    try:
+        backup_path = f"{log_path}.bak"
+        if not os.path.exists(backup_path):
+            shutil.copyfile(log_path, backup_path)
+        df.to_csv(log_path, index=False)
+        print(f"✅  Rebuilt {log_path} with a unified {len(normalized_columns)}-column schema (backup at {backup_path}).")
+    except Exception as write_err:
+        print(f"⚠️  Repaired bets log dataframe created but failed to rewrite {log_path}: {write_err}")
+
+    return df
+
+
+def _read_bets_log_dataframe(log_path: Optional[str]) -> Optional[pd.DataFrame]:
+    """Read the bets log, repairing schema drift automatically when detected."""
+
+    if not log_path:
+        return None
+    if not os.path.exists(log_path):
+        return None
+    try:
+        if os.path.getsize(log_path) == 0:
+            return None
+    except OSError:
+        return None
+
+    try:
+        return pd.read_csv(log_path)
+    except pd.errors.ParserError as parse_err:
+        return _repair_bets_log_file(log_path, parse_err)
+    except Exception as err:
+        print(f"⚠️  Unable to read {log_path}: {err}")
+        return None
+
+
 def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.csv', closing_odds_path: Optional[str] = None) -> None:
     """Append recommended bets to a CSV and compute simple CLV if closing totals provided.
 
@@ -6159,19 +6280,37 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         })
 
     df = pd.DataFrame(rows)
+    for col in BET_LOG_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    df = df[BET_LOG_COLUMNS]
+
     header = not os.path.exists(logfile)
+    if not header:
+        try:
+            with open(logfile, newline='', encoding='utf-8') as handle:
+                existing_header = next(csv.reader(handle))
+        except Exception:
+            existing_header = None
+        if not existing_header or existing_header != BET_LOG_COLUMNS:
+            _repair_bets_log_file(logfile, ValueError("bets log schema mismatch"))
+
     df.to_csv(logfile, mode='a', header=header, index=False)
     print(f"✅ Logged {len(rows)} bets to {logfile}")
 
     # Daily summary
     try:
-        recent = pd.read_csv(logfile)
+        recent = _read_bets_log_dataframe(logfile)
+        if recent is None or recent.empty or 'date' not in recent.columns:
+            return
         today = datetime.now().strftime('%Y-%m-%d')
-        today_df = recent[recent['date'].str.startswith(today)]
+        today_df = recent[recent['date'].astype(str).str.startswith(today)]
         if len(today_df) > 0:
             avg_clv = today_df['clv_vs_closing'].dropna().mean() if 'clv_vs_closing' in today_df else None
             avg_ev = today_df['ev_novig'].dropna().mean() if 'ev_novig' in today_df else None
-            print(f"📈 Daily log: {len(today_df)} bets | avg no-vig EV {avg_ev:+.2f} | avg CLV {avg_clv:+.2f} (goals)")
+            clv_txt = f"{avg_clv:+.2f}" if isinstance(avg_clv, (int, float, np.floating)) and not pd.isna(avg_clv) else "n/a"
+            ev_txt = f"{avg_ev:+.2f}" if isinstance(avg_ev, (int, float, np.floating)) and not pd.isna(avg_ev) else "n/a"
+            print(f"📈 Daily log: {len(today_df)} bets | avg no-vig EV {ev_txt} | avg CLV {clv_txt} (goals)")
     except Exception:
         pass
 
@@ -6365,10 +6504,12 @@ def save_predictions_image(
                 continue
             if not os.path.exists(path) or os.path.getsize(path) == 0:
                 continue
-            try:
-                df_log = pd.read_csv(path)
-            except Exception:
-                continue
+            df_log = _read_bets_log_dataframe(path)
+            if df_log is None:
+                try:
+                    df_log = pd.read_csv(path)
+                except Exception:
+                    continue
             if df_log.empty:
                 continue
 
