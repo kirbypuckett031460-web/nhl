@@ -321,7 +321,7 @@ class OverUnderPrediction:
     confidence: float
     expected_value_over: float
     expected_value_under: float
-    recommendation: str  # 'OVER', 'UNDER', 'No Bet'
+    recommendation: str  # 'OVER' or 'UNDER' (forced if edge/conf thresholds fail)
     edge: float
     kelly_bet_size: float
     # Optional American odds used for EV/Kelly
@@ -361,6 +361,9 @@ class OverUnderPrediction:
     ref_goal_adjustment: Optional[float] = None
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
+    # Whether the pick was forced after an initial "No Bet"
+    forced_recommendation: bool = False
+    forced_reason: Optional[str] = None
 
 TEAM_ABBREV_TO_NAME: Dict[str, str] = {
     'ANA': 'Anaheim Ducks',
@@ -3867,8 +3870,11 @@ class RealDataNHLModel:
         # Betting recommendation thresholds (tuned slightly post-calibration)
         min_edge = float(getattr(self, 'risk_edge_floor', 0.22))
         min_prob = float(getattr(self, 'risk_prob_floor', 0.56))
+        max_prob_side = max(over_prob, under_prob)
+        forced_pick = False
+        forced_reason = None
         
-        if abs(edge) < min_edge or max(over_prob, under_prob) < min_prob:
+        if abs(edge) < min_edge or max_prob_side < min_prob:
             recommendation = 'No Bet'
             kelly_size = 0.0
         elif edge > min_edge and over_prob > min_prob:
@@ -3912,6 +3918,26 @@ class RealDataNHLModel:
         else:
             recommendation = 'No Bet'
             kelly_size = 0.0
+
+        if recommendation == 'No Bet':
+            forced_pick = True
+            if abs(edge) < min_edge:
+                forced_reason = 'low_edge'
+            elif max_prob_side < min_prob:
+                forced_reason = 'low_confidence'
+            else:
+                forced_reason = 'model_conflict'
+            if ev_over > ev_under:
+                recommendation = 'OVER'
+            elif ev_under > ev_over:
+                recommendation = 'UNDER'
+            else:
+                prob_delta = over_prob - under_prob
+                if abs(prob_delta) > 1e-4:
+                    recommendation = 'OVER' if prob_delta > 0 else 'UNDER'
+                else:
+                    recommendation = 'OVER' if edge >= 0 else 'UNDER'
+            kelly_size = 0.0
         
         # Confidence score
         conf_base = 0.5 + abs(edge) * 0.15 + (max(over_prob, under_prob) - 0.5) * 0.8
@@ -3923,6 +3949,9 @@ class RealDataNHLModel:
         risk_shift = float(getattr(self, 'risk_confidence_shift', 0.0))
         if risk_shift:
             confidence = float(min(0.95, max(0.05, confidence + risk_shift)))
+        if forced_pick:
+            forced_cap = float(getattr(self, 'forced_pick_conf_cap', 0.58))
+            confidence = float(min(confidence, forced_cap))
         
         # Conformal confidence interval around predicted total
         qrad = self.total_model.get('conformal_radius') or self.total_model.get('conformal_q90')
@@ -3950,7 +3979,8 @@ class RealDataNHLModel:
             odds_source=odds_source,
             ev_over_novig=ev_over_novig, ev_under_novig=ev_under_novig,
             consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff,
-            ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment
+            ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment,
+            forced_recommendation=forced_pick, forced_reason=forced_reason
         )
 
     def get_betting_lines(self, todays_games: pd.DataFrame) -> Dict[str, float]:
