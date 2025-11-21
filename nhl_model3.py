@@ -1729,16 +1729,19 @@ class RealDataNHLModel:
             logs['closing_under_price'] = np.nan
 
         logs['bet_date_only'] = logs['date'].dt.date
-        logs['final_total'] = np.nan
+        if 'final_total' not in logs.columns:
+            logs['final_total'] = np.nan
         if historical_frame is not None and not historical_frame.empty:
             hist = historical_frame[['game_id', 'date', 'home_team', 'away_team', 'total_goals']].copy()
             hist['game_id'] = hist['game_id'].astype(str)
             hist['matchup'] = hist['away_team'].astype(str).str.upper() + '@' + hist['home_team'].astype(str).str.upper()
             hist['date_only'] = pd.to_datetime(hist['date'], errors='coerce').dt.date
             logs = logs.merge(hist[['game_id', 'total_goals']], on='game_id', how='left')
-            logs = logs.rename(columns={'total_goals': 'final_total'})
+            if 'total_goals' in logs.columns:
+                merged_totals = pd.to_numeric(logs.pop('total_goals'), errors='coerce')
+                logs['final_total'] = logs['final_total'].fillna(merged_totals)
             missing = logs['final_total'].isna()
-            if missing.any():
+            if bool(missing.any()):
                 match_hist = hist[['matchup', 'date_only', 'total_goals']].rename(columns={'total_goals': 'final_total_match'})
                 logs = logs.merge(match_hist, left_on=['matchup', 'bet_date_only'], right_on=['matchup', 'date_only'], how='left')
                 logs['final_total'] = logs['final_total'].fillna(logs['final_total_match'])
