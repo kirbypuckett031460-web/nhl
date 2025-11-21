@@ -324,42 +324,73 @@ def normalize_goalie_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
         return None
 
     gsax_series: Optional[pd.Series] = None
-    gsax_col = find_exact(
-        [
-            "gsax_rolling",
-            "gsax",
-            "goals_saved_above_expected",
-            "goals saved above expected",
-            "goalssavedaboveexpected",
-            "goals_saved_above_expected_all",
-        ]
-    ) or find_by_terms("saved", "expected")
+    direct_gsax_candidates = [
+        "gsax_rolling",
+        "gsax",
+        "gsaa",
+        "gsaa_all",
+        "goals_saved_above_expected",
+        "goals saved above expected",
+        "goalssavedaboveexpected",
+        "goals_saved_above_expected_all",
+        "goals_saved_above_expected_shots",
+        "goals_saved_above_expected_fenwick",
+        "goals_saved_above_expected_all_situations",
+    ]
+    gsax_col = find_exact(direct_gsax_candidates) or find_by_terms("saved", "expected")
 
     if gsax_col is not None:
         gsax_series = pd.to_numeric(df[gsax_col], errors="coerce")
     else:
-        xg_col = find_exact(
-            [
-                "xga",
-                "x_goals_against",
-                "xgoalsagainst",
-                "expected_goals_against",
-                "expectedgoalsagainst",
-                "xGoals",
-                "x_goals",
-            ]
-        ) or find_by_terms("x", "goal")
-        goals_col = find_exact(
-            ["ga", "goals_against", "goalsagainst", "goals_allowed", "goals"]
-        ) or find_by_terms("goal", "against")
-
-        if xg_col and goals_col:
-            expected = pd.to_numeric(df[xg_col], errors="coerce")
-            actual = pd.to_numeric(df[goals_col], errors="coerce")
-            gsax_series = expected - actual
+        derivation_pairs = [
+            (
+                [
+                    "xga",
+                    "x_goals_against",
+                    "xgoalsagainst",
+                    "expected_goals_against",
+                    "expectedgoalsagainst",
+                    "xGoalsAgainst",
+                    "x_goals_against_all",
+                ],
+                ["ga", "goals_against", "goalsagainst", "goals_allowed", "goals"],
+            ),
+            (
+                [
+                    "xGoals",
+                    "x_goals",
+                    "expected_goals",
+                    "expectedgoals",
+                    "flurryAdjustedxGoals",
+                    "xOnGoal",
+                    "expected_shots_on_goal",
+                ],
+                [
+                    "goals",
+                    "goals_allowed",
+                    "goalsagainst",
+                    "ongoal",
+                    "shots_on_goal",
+                ],
+            ),
+        ]
+        for expected_candidates, actual_candidates in derivation_pairs:
+            xg_col = find_exact(expected_candidates) or find_by_terms("x", "goal")
+            goals_col = find_exact(actual_candidates) or find_by_terms("goal", "against")
+            if xg_col and goals_col:
+                expected = pd.to_numeric(df[xg_col], errors="coerce")
+                actual = pd.to_numeric(df[goals_col], errors="coerce")
+                derived = expected - actual
+                if not derived.dropna().empty:
+                    gsax_series = derived
+                    break
 
     if gsax_series is None:
-        raise ValueError("Could not locate or derive a GSAx column in MoneyPuck goalies dataset")
+        sample_cols = ", ".join(list(df.columns[:15]))
+        raise ValueError(
+            "Could not locate or derive a GSAx column in MoneyPuck goalies dataset. "
+            f"Sample columns: {sample_cols}"
+        )
 
     df["gsax_rolling"] = gsax_series.fillna(0.0)
 
