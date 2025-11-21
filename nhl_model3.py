@@ -362,6 +362,91 @@ class OverUnderPrediction:
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
 
+TEAM_ABBREV_TO_NAME: Dict[str, str] = {
+    'ANA': 'Anaheim Ducks',
+    'ARI': 'Arizona Coyotes',
+    'BOS': 'Boston Bruins',
+    'BUF': 'Buffalo Sabres',
+    'CAR': 'Carolina Hurricanes',
+    'CBJ': 'Columbus Blue Jackets',
+    'CGY': 'Calgary Flames',
+    'CHI': 'Chicago Blackhawks',
+    'COL': 'Colorado Avalanche',
+    'DAL': 'Dallas Stars',
+    'DET': 'Detroit Red Wings',
+    'EDM': 'Edmonton Oilers',
+    'FLA': 'Florida Panthers',
+    'LAK': 'Los Angeles Kings',
+    'MIN': 'Minnesota Wild',
+    'MTL': 'Montreal Canadiens',
+    'NJD': 'New Jersey Devils',
+    'NSH': 'Nashville Predators',
+    'NYI': 'New York Islanders',
+    'NYR': 'New York Rangers',
+    'OTT': 'Ottawa Senators',
+    'PHI': 'Philadelphia Flyers',
+    'PIT': 'Pittsburgh Penguins',
+    'SEA': 'Seattle Kraken',
+    'SJS': 'San Jose Sharks',
+    'STL': 'St. Louis Blues',
+    'TBL': 'Tampa Bay Lightning',
+    'TOR': 'Toronto Maple Leafs',
+    'VAN': 'Vancouver Canucks',
+    'VGK': 'Vegas Golden Knights',
+    'WPG': 'Winnipeg Jets',
+    'WSH': 'Washington Capitals'
+}
+
+TEAM_NAME_TO_ABBREV: Dict[str, str] = {name.upper(): abbr for abbr, name in TEAM_ABBREV_TO_NAME.items()}
+
+def _normalize_team_abbreviation(team: Optional[str]) -> str:
+    raw = str(team or '').strip()
+    if not raw:
+        return ''
+    upper = raw.upper()
+    if upper in TEAM_ABBREV_TO_NAME:
+        return upper
+    return TEAM_NAME_TO_ABBREV.get(upper, '')
+
+def get_team_full_name(team: Optional[str]) -> str:
+    abbr = _normalize_team_abbreviation(team)
+    if abbr:
+        return TEAM_ABBREV_TO_NAME[abbr]
+    raw = str(team or '').strip()
+    return raw or 'TBD'
+
+def get_team_abbreviation(team: Optional[str]) -> str:
+    return _normalize_team_abbreviation(team)
+
+def format_team_display(team: Optional[str]) -> str:
+    return get_team_full_name(team)
+
+def format_matchup_display(away_team: Optional[str], home_team: Optional[str]) -> str:
+    away_name = get_team_full_name(away_team)
+    home_name = get_team_full_name(home_team)
+    if away_name and home_name:
+        return f"{away_name} @ {home_name}"
+    if away_name:
+        return away_name
+    if home_name:
+        return home_name
+    return 'TBD'
+
+def format_matchup_code(away_team: Optional[str], home_team: Optional[str]) -> str:
+    away_code = get_team_abbreviation(away_team) or str(away_team or '').strip() or 'AWAY'
+    home_code = get_team_abbreviation(home_team) or str(home_team or '').strip() or 'HOME'
+    return f"{away_code}@{home_code}"
+
+def format_matchup_search_blob(away_team: Optional[str], home_team: Optional[str]) -> str:
+    display = format_matchup_display(away_team, home_team)
+    code = format_matchup_code(away_team, home_team)
+    parts: List[str] = []
+    for value in (display, code):
+        val = (value or '').strip()
+        if val and val not in parts:
+            parts.append(val)
+    return " | ".join(parts)
+
 class NHLDataFetcher:
     """Fetches real NHL data from multiple sources with fallbacks"""
     
@@ -753,7 +838,7 @@ class SocialMediaPoster:
                     "fields": []
                 }
                 for p in chunk:
-                    name = f"{p.away_team} @ {p.home_team}"
+                    name = format_matchup_display(p.away_team, p.home_team)
                     val_bits = []
                     try:
                         val_bits.append(f"Line {p.betting_line:.1f} | Pred {p.predicted_total:.2f}")
@@ -1101,15 +1186,16 @@ class SocialMediaPoster:
                 if tweet_text:
                     break
 
-            if not tweet_text:
-                if not betting_preds:
-                    tweet_text = tweet_caption
-                else:
-                    top = betting_preds[0]
-                    tweet_text = (
-                        f"{tweet_caption} Top: {top.away_team} @ {top.home_team} — "
-                        f"{top.recommendation} {top.betting_line} (edge {float(getattr(top, 'edge', 0.0)):+.1f})."
-                    )
+                if not tweet_text:
+                    if not betting_preds:
+                        tweet_text = tweet_caption
+                    else:
+                        top = betting_preds[0]
+                        matchup_display = format_matchup_display(top.away_team, top.home_team)
+                        tweet_text = (
+                            f"{tweet_caption} Top: {matchup_display} — "
+                            f"{top.recommendation} {top.betting_line} (edge {float(getattr(top, 'edge', 0.0)):+.1f})."
+                        )
 
             try:
                 response = self.twitter_api.create_tweet(text=tweet_text)
@@ -1150,7 +1236,8 @@ class SocialMediaPoster:
             })
             
             for pred in betting_preds[:6]:
-                field_name = f"🏒 {pred.away_team} @ {pred.home_team}"
+                matchup_display = format_matchup_display(pred.away_team, pred.home_team)
+                field_name = f"🏒 {matchup_display}"
                 field_value = f"**Line:** {pred.betting_line} | **Pred:** {pred.predicted_total:.1f}\n"
                 field_value += f"**Rec:** {pred.recommendation} ({pred.edge:+.2f})\n"
                 field_value += f"**Conf:** {pred.confidence:.0%}"
@@ -5829,11 +5916,20 @@ def save_predictions_excel(predictions: List[OverUnderPrediction], out_path: str
     try:
         rows = []
         for p in predictions:
+            matchup_display = format_matchup_display(p.away_team, p.home_team)
+            matchup_code = format_matchup_code(p.away_team, p.home_team)
+            home_name = format_team_display(p.home_team)
+            away_name = format_team_display(p.away_team)
+            home_code = get_team_abbreviation(p.home_team) or str(p.home_team or '').strip().upper() or 'HOME'
+            away_code = get_team_abbreviation(p.away_team) or str(p.away_team or '').strip().upper() or 'AWAY'
             rows.append({
                 'game_id': p.game_id,
-                'matchup': f"{p.away_team}@{p.home_team}",
-                'home_team': p.home_team,
-                'away_team': p.away_team,
+                'matchup': matchup_display,
+                'matchup_code': matchup_code,
+                'home_team': home_name,
+                'home_team_code': home_code,
+                'away_team': away_name,
+                'away_team_code': away_code,
                 'line': p.betting_line,
                 'predicted_total': p.predicted_total,
                 'over_prob': p.over_probability,
@@ -5942,9 +6038,12 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         lineup_txt = getattr(p, 'lineup_info', '') or ''
         kelly_val = getattr(p, 'kelly_bet_size', None)
         kelly_txt = f"{kelly_val:.1f}%" if isinstance(kelly_val, (int, float)) else ''
+        matchup_display = format_matchup_display(p.away_team, p.home_team)
+        matchup_code = format_matchup_code(p.away_team, p.home_team)
+        matchup_title = html_parser.escape(matchup_code, quote=True)
         rows_html.append(
             f"<tr>"
-            f"<td>{p.away_team}@{p.home_team}</td>"
+            f"<td title=\"{matchup_title}\">{matchup_display}</td>"
             f"<td>{p.betting_line}</td>"
             f"<td>{pred_txt}</td>"
             f"<td>{edge_txt}</td>"
@@ -6137,10 +6236,12 @@ def save_predictions_image(
         else:
             pick_txt = str(recommendation)
 
+        away_display = format_team_display(getattr(pred, 'away_team', None))
+        home_display = format_team_display(getattr(pred, 'home_team', None))
         rows.append({
             'Time': display_time,
-            'Away': str(getattr(pred, 'away_team', '')),
-            'Home': str(getattr(pred, 'home_team', '')),
+            'Away': away_display,
+            'Home': home_display,
             'Line': _fmt_float(getattr(pred, 'betting_line', None)),
             'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
             'Pick': pick_txt,
@@ -6269,14 +6370,16 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
             else ''
         )
 
+        matchup_display = format_matchup_display(pred.away_team, pred.home_team)
+        matchup_search = attr_escape(format_matchup_search_blob(pred.away_team, pred.home_team))
         row = f"""
-        <tr data-gid="{pred.game_id}" data-rec="{pred.recommendation}" data-matchup="{pred.away_team} @ {pred.home_team}"
+        <tr data-gid="{pred.game_id}" data-rec="{pred.recommendation}" data-matchup="{matchup_search}"
             data-ref-crew="{attr_escape(ref_crew_attr)}"
             data-ref-avg="{attr_escape(ref_avg_attr)}"
             data-ref-bias="{attr_escape(ref_bias_attr)}"
             data-ref-source="{attr_escape(ref_source_attr)}"
             data-ref-adjust="{attr_escape(ref_goal_adjust_attr)}">
-            <td><strong>{pred.away_team} @ {pred.home_team}</strong></td>
+            <td><strong>{matchup_display}</strong></td>
             <td>{pred.betting_line:.1f}</td>
             <td><strong style="color: #2c3e50;">{pred.predicted_total:.2f}</strong>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: {'' if pred.ci_lower is None else f'{pred.ci_lower:.1f}–{pred.ci_upper:.1f}'} </div>
@@ -7977,8 +8080,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 print(f"\n💰 Recommended bets ({len(betting_preds)}):")
                 for pred in betting_preds:
                     price = pred.over_american_odds if pred.recommendation == 'OVER' else pred.under_american_odds
+                    matchup_display = format_matchup_display(pred.away_team, pred.home_team)
                     print(
-                        f"   {pred.away_team} @ {pred.home_team}: {pred.recommendation} {pred.betting_line} @ {price} "
+                        f"   {matchup_display}: {pred.recommendation} {pred.betting_line} @ {price} "
                         f"(Pred: {pred.predicted_total:.1f}, Edge: {pred.edge:+.2f}, Conf: {pred.confidence:.0%}, Kelly: {pred.kelly_bet_size:.1f}%)"
                     )
             else:
