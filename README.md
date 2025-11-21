@@ -54,7 +54,6 @@ Use `moneypuck_etl.py` to keep the MoneyPuck-derived inputs fresh without manual
 - Normalizes to the schema expected by `nhl_model3.py`
 - Runs anomaly detection for data drift, stale seasons, and entity gaps
 - Versions every refresh beneath `data/history/` (`versions.json`, dated CSVs, and `anomalies/*.json`)
-- NEW: Generates `player_metrics.csv` (skater RAPM/xGAR proxies, lineup buckets, probabilities) directly from MoneyPuck skater summaries
 
 Examples:
 
@@ -66,16 +65,15 @@ python moneypuck_etl.py
 python moneypuck_etl.py \
   --team-output data/latest/team_rates.csv \
   --goalie-output data/latest/goalie_gsax.csv \
-  --player-output data/latest/player_metrics.csv \
   --history-dir data/history \
   --seasons 2025 2024 \
   --stages regular playoffs
 ```
 
 To run the ETL automatically before generating predictions, add `--refresh-moneypuck` when
-calling `nhl_model3.py`. The inline run now refreshes `team_rates.csv`, `goalie_gsax.csv`, **and**
-`player_metrics.csv`. You can further tune the inline run with `--moneypuck-history-dir`,
-`--moneypuck-stages`, `--moneypuck-seasons`, `--moneypuck-dry-run`, `--fail-on-moneypuck-anomaly`,
+calling `nhl_model3.py`. The inline run now refreshes `team_rates.csv` and `goalie_gsax.csv`.
+You can further tune the inline run with `--moneypuck-history-dir`, `--moneypuck-stages`,
+`--moneypuck-seasons`, `--moneypuck-dry-run`, `--fail-on-moneypuck-anomaly`,
 and `--moneypuck-request-timeout`.
 
 Examples
@@ -101,8 +99,7 @@ python nhl_model3.py \
   --team-rates-url https://moneypuck.com/teams.htm \
   --team-rates-path team_rates.csv \
   --goalie-gsax-url https://moneypuck.com/goalies.htm \
-  --goalie-gsax-path goalie_gsax.csv \
-  --player-metrics-path player_metrics.csv
+  --goalie-gsax-path goalie_gsax.csv
 ```
 
 4) Use environment and lineup inputs:
@@ -188,15 +185,13 @@ python run_player_props.py --props player_props.json --min-edge 0.55
 
 Outputs expected SOG and a Poisson-based recommendation with probability edge.
 
-Skater & Goalie Context
------------------------
+Goalie Context
+--------------
 
-Daily predictions can now ingest player- and goalie-level context:
+Daily predictions ingest goalie-level context:
 
-- Point `--player-metrics-path` to a CSV/JSON with `team`, `player`, `position`, `status`, `prob_play`, `rapm_off`, `rapm_def`, `xgar`.  
-  The model aggregates forward/defense xGAR, elite availability, RAPM splits, and applies those covariates both as dashboard notes and as adjustments to the projected total (`skater_goalie_edge`).
 - Provide rolling goalie GSAx via `--goalie-gsax-path` (or URL). Expected starter quality is converted into `home_goalie_gsax` / `away_goalie_gsax` features and automatically debits/credits the total based on projected netminders.
-- Both inputs surface in the dashboard (`lineup_info`) so you can see which skaters are missing and which starters are driving goalie adjustments.
+- Goalie availability also surfaces in the dashboard (`lineup_info`) so you can see which starters are driving adjustments.
 
 Using NHL Stats & The Odds API
 ------------------------------
@@ -234,5 +229,5 @@ Implementation details
 - Rolling-origin cross-validation now drives the hyperparameter search inside `RealDataNHLModel.train_model`, ensuring each trial retrains on an expanding window and scores on a forward horizon.
 - Every ensemble member sits inside a locked `Pipeline(StandardScaler, model)` so feature transforms are refit only on the relevant training fold and the same pipeline object is reused at inference time.
 - A walk-forward retraining harness re-clones the tuned ensemble across sequential chunks, surfacing RMSE/MAE summaries that mirror real deployment where the model is continually refreshed.
-- Goal distribution modeling now stacks three layers: (1) classical Poisson regressors for home/away goals, (2) a neural "Poisson flow" MLP that learns non-linear intensities, and (3) a Gaussian-copula mixture simulator that blends the two regimes with dynamic weights/correlation derived from skater/goalie covariates. The mixture powers the over/under probabilities and keeps pace with bookmaker-style conditional totals.
+- Goal distribution modeling now stacks three layers: (1) classical Poisson regressors for home/away goals, (2) a neural "Poisson flow" MLP that learns non-linear intensities, and (3) a Gaussian-copula mixture simulator that blends the two regimes with dynamic weights/correlation derived from team and goalie covariates. The mixture powers the over/under probabilities and keeps pace with bookmaker-style conditional totals.
 

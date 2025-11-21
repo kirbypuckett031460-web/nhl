@@ -2263,35 +2263,13 @@ class RealDataNHLModel:
         features['injury_penalty_adj'] = 0.0
         features['total_adjustments'] += (features['home_goalie_adj'] + features['away_goalie_adj'] + features['injury_penalty_adj'])
         features['final_prediction_base'] = features['base_total_prediction'] + features['total_adjustments']
-        # Player-level context placeholders (populated later if player metrics supplied)
-        player_feature_cols = [
-            'home_active_xgar', 'away_active_xgar',
-            'home_active_rapm_off', 'away_active_rapm_off',
-            'home_active_rapm_def', 'away_active_rapm_def',
-            'home_top_line_xgar', 'away_top_line_xgar',
-            'home_player_status_penalty', 'away_player_status_penalty',
-            'player_edge_total',
-            'home_forward_xgar', 'away_forward_xgar',
-            'home_defense_xgar', 'away_defense_xgar',
-            'home_elite_prob', 'away_elite_prob',
+        # Goalie context placeholders (populated later if goalie metrics supplied)
+        goalie_feature_cols = [
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
-            'home_line1_xgar', 'away_line1_xgar',
-            'home_line2_xgar', 'away_line2_xgar',
-            'home_line3_xgar', 'away_line3_xgar',
-            'home_line4_xgar', 'away_line4_xgar',
-            'home_pair1_xgar', 'away_pair1_xgar',
-            'home_pair2_xgar', 'away_pair2_xgar',
-            'home_pair3_xgar', 'away_pair3_xgar',
-            'home_pp1_xgar', 'away_pp1_xgar',
-            'home_pk1_xgar', 'away_pk1_xgar',
-            'home_roster_rapm', 'away_roster_rapm',
-            'home_scratched_xgar', 'away_scratched_xgar',
-            'home_scratch_count', 'away_scratch_count',
-            'line_match_edge', 'scratch_edge', 'roster_rapm_diff',
             'skater_goalie_edge'
         ]
-        for col in player_feature_cols:
+        for col in goalie_feature_cols:
             if col not in features.columns:
                 features[col] = 0.0
 
@@ -2721,472 +2699,6 @@ class RealDataNHLModel:
             return {}
         return team_strength
     
-    def load_player_metrics(self, path_or_url: Optional[str]) -> Optional[pd.DataFrame]:
-        """Load player-level RAPM/xGAR/injury context from CSV or JSON.
-
-        Expected columns (flexible, best effort):
-          team, player, position, status, prob_play, rapm_off, rapm_def, xgar, line_slot
-        """
-        if not path_or_url:
-            return None
-        source = str(path_or_url).strip()
-        if not source:
-            return None
-        try:
-            is_url = bool(re.match(r'^https?://', source, flags=re.IGNORECASE))
-            if is_url:
-                resp = requests.get(source, timeout=25)
-                resp.raise_for_status()
-                text = resp.text
-                if source.lower().endswith('.json') or text.lstrip().startswith(('{', '[')):
-                    raw = json.loads(text)
-                    payload = raw.get('players') if isinstance(raw, dict) and 'players' in raw else raw
-                    df = pd.DataFrame(payload)
-                else:
-                    df = pd.read_csv(io.StringIO(text))
-            else:
-                if not os.path.exists(source):
-                    print(f"⚠️  Player metrics path not found: {source}")
-                    return None
-                if source.lower().endswith('.json'):
-                    with open(source, 'r') as f:
-                        raw = json.load(f)
-                    if isinstance(raw, dict) and 'players' in raw:
-                        raw = raw['players']
-                    df = pd.DataFrame(raw)
-                else:
-                    df = pd.read_csv(source)
-        except Exception as e:
-            print(f"⚠️  Failed to load player metrics from {path_or_url}: {e}")
-            return None
-
-        if df is None or df.empty:
-            return None
-
-        mp_signature = {
-            'OnIce_F_scoreVenueAdjustedxGoals',
-            'OnIce_A_scoreVenueAdjustedxGoals',
-            'gameScore'
-        }
-        needs_enrichment = any(col not in df.columns for col in ['rapm_off', 'rapm_def', 'xgar'])
-        if needs_enrichment and mp_signature.issubset(set(df.columns)):
-            try:
-                from moneypuck_etl import normalize_player_metrics  # type: ignore
-                normalized_df = normalize_player_metrics(df)
-                if normalized_df is not None and not normalized_df.empty:
-                    df = normalized_df
-            except Exception as mp_err:
-                print(f"⚠️  Could not auto-normalize MoneyPuck player data: {mp_err}")
-
-        rename_candidates = {
-            'Team': 'team', 'TEAM': 'team', 'Abbreviation': 'team', 'abbr': 'team', 'teamAbbrev': 'team',
-            'Player': 'player', 'player_name': 'player', 'Player Name': 'player', 'name': 'player',
-            'Pos': 'position', 'POS': 'position', 'role': 'position',
-            'status_text': 'status', 'availability': 'status',
-            'probability': 'prob_play', 'prob_start': 'prob_play', 'prob_playing': 'prob_play',
-            'likelihood': 'prob_play', 'chance': 'prob_play',
-            'rapm_offense': 'rapm_off', 'rapm_offensive': 'rapm_off',
-            'rapm_defense': 'rapm_def', 'rapm_defensive': 'rapm_def',
-            'xGAR': 'xgar', 'GAR': 'xgar', 'xgar_total': 'xgar',
-            'line': 'line_slot', 'line_assignment': 'line_slot'
-        }
-        for old_name, new_name in rename_candidates.items():
-            if old_name in df.columns and new_name not in df.columns:
-                df = df.rename(columns={old_name: new_name})
-
-        if 'team' not in df.columns:
-            for alt in ['Team', 'TEAM', 'Abbreviation', 'abbr', 'team_code']:
-                if alt in df.columns:
-                    df = df.rename(columns={alt: 'team'})
-                    break
-        if 'player' not in df.columns:
-            for alt in ['Player', 'player_name', 'name']:
-                if alt in df.columns:
-                    df = df.rename(columns={alt: 'player'})
-                    break
-
-        if 'team' not in df.columns or 'player' not in df.columns:
-            print("⚠️  Player metrics missing team/player columns")
-            return None
-
-        df['team'] = df['team'].astype(str).str.upper().str.strip()
-        df['player'] = df['player'].astype(str).str.strip()
-        if 'position' not in df.columns:
-            df['position'] = 'F'
-        df['position'] = df['position'].astype(str).str.upper().str.strip()
-        if 'status' not in df.columns:
-            df['status'] = 'ACTIVE'
-
-        def status_to_prob(status: Any) -> float:
-            if status is None or (isinstance(status, float) and np.isnan(status)):
-                return 1.0
-            s = str(status).strip().lower()
-            if not s:
-                return 1.0
-            if any(tag in s for tag in ['out', 'ltir', 'ir', 'suspended']):
-                return 0.0
-            if any(tag in s for tag in ['doubtful']):
-                return 0.25
-            if any(tag in s for tag in ['questionable', 'day-to-day', 'day to day', 'gametime', 'game-time']):
-                return 0.55
-            if any(tag in s for tag in ['probable', 'expected']):
-                return 0.9
-            return 1.0
-
-        if 'prob_play' in df.columns:
-            df['prob_play'] = pd.to_numeric(df['prob_play'], errors='coerce')
-        else:
-            df['prob_play'] = np.nan
-        df['prob_play'] = df['prob_play'].where(df['prob_play'].between(0.0, 1.0), np.nan)
-        df['prob_play'] = df.apply(
-            lambda row: float(status_to_prob(row.get('status'))) if np.isnan(row.get('prob_play', np.nan)) else float(row['prob_play']),
-            axis=1
-        )
-        df['prob_play'] = df['prob_play'].clip(0.0, 1.0)
-
-        for col in ['rapm_off', 'rapm_def', 'xgar']:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0) if col in df.columns else 0.0
-        if 'line_slot' in df.columns:
-            df['line_slot'] = df['line_slot'].astype(str).str.upper().str.strip()
-        else:
-            df['line_slot'] = ''
-
-        return df
-
-    def apply_player_context_features(
-        self,
-        todays_games: pd.DataFrame,
-        todays_features: pd.DataFrame,
-        player_df: Optional[pd.DataFrame]
-    ) -> Dict[str, str]:
-        """Inject player-level aggregates into today's features and return display notes per game."""
-        notes: Dict[str, str] = {}
-        if player_df is None or todays_features is None or todays_games is None:
-            return notes
-        if player_df.empty or todays_features.empty:
-            return notes
-
-        df = player_df.copy()
-        df['prob_play'] = pd.to_numeric(df.get('prob_play', 1.0), errors='coerce').fillna(1.0).clip(0.0, 1.0)
-        for col in ['rapm_off', 'rapm_def', 'xgar']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-            else:
-                df[col] = 0.0
-        df['team'] = df['team'].astype(str).str.upper().str.strip()
-        df['player'] = df['player'].astype(str).str.strip()
-        df['position'] = df.get('position', 'F')
-        df['position'] = df['position'].astype(str).str.upper().str.strip()
-        df['status'] = df.get('status', 'ACTIVE').astype(str)
-
-        forward_positions = {'F', 'LW', 'RW', 'C', 'W', 'CF'}
-        defense_positions = {'D', 'LD', 'RD', 'DEF'}
-        line_categories = ['L1', 'L2', 'L3', 'L4']
-        pair_categories = ['D1', 'D2', 'D3']
-        pp_categories = ['PP1', 'PP2']
-        pk_categories = ['PK1', 'PK2']
-        all_line_buckets = line_categories + pair_categories + pp_categories + pk_categories
-
-        def normalize_line_slot(slot: Any) -> str:
-            if slot is None or (isinstance(slot, float) and np.isnan(slot)):
-                return ''
-            s = str(slot).strip().upper()
-            if not s:
-                return ''
-            replacements = {
-                'LINE': 'L',
-                'FORWARD': 'L',
-                'FWD': 'L',
-                'PAIRING': 'D',
-                'PAIR': 'D',
-                'DEFENCE': 'D',
-                'DEFENSE': 'D',
-                'DEF': 'D',
-                'POWERPLAY': 'PP',
-                'PPLAY': 'PP',
-                'POWERPLAYUNIT': 'PP',
-                'PENALTYKILL': 'PK',
-                'PKILL': 'PK',
-                'PKUNIT': 'PK',
-                'UNIT': ''
-            }
-            for old, new in replacements.items():
-                s = s.replace(old, new)
-            s = s.replace('-', '').replace(' ', '')
-            s = re.sub(r'(ST|ND|RD|TH)', '', s)
-            s = re.sub(r'[^A-Z0-9]', '', s)
-            alias_map = {
-                'TOPL': 'L1',
-                'SECONDL': 'L2',
-                'THIRDL': 'L3',
-                'FOURTHL': 'L4',
-                'TOPD': 'D1',
-                'SECONDD': 'D2',
-                'THIRDD': 'D3',
-                'FIRSTD': 'D1'
-            }
-            for key, val in alias_map.items():
-                if key in s:
-                    return val
-            match = re.match(r'(PP|PK|L|F|D)(\d)', s)
-            if match:
-                prefix = match.group(1)
-                if prefix == 'F':
-                    prefix = 'L'
-                return f"{prefix}{match.group(2)}"
-            match = re.match(r'(\d)(PP|PK|L|F|D)', s)
-            if match:
-                prefix = match.group(2)
-                if prefix == 'F':
-                    prefix = 'L'
-                return f"{prefix}{match.group(1)}"
-            return ''
-
-        df['line_bucket'] = df['line_slot'].apply(normalize_line_slot)
-
-        team_summary: Dict[str, Dict[str, Any]] = {}
-        for team, grp in df.groupby('team'):
-            weights = grp['prob_play']
-            active_xgar = float((grp['xgar'] * weights).sum())
-            active_rapm_off = float((grp['rapm_off'] * weights).sum())
-            active_rapm_def = float((grp['rapm_def'] * weights).sum())
-            top_line_xgar = float(grp.sort_values('xgar', ascending=False).head(6)['xgar'].sum())
-            missing = grp[weights < 0.5].sort_values('xgar', ascending=False)
-            missing_names = [f"{row['player']} ({row['position']})" for _, row in missing.iterrows()]
-            missing_value = float(missing['xgar'].clip(lower=0.0).sum())
-            status_penalty = float(-0.04 * missing_value)
-            forward_mask = grp['position'].isin(forward_positions)
-            defense_mask = grp['position'].isin(defense_positions)
-            forward_xgar = float((grp.loc[forward_mask, 'xgar'] * weights.loc[forward_mask]).sum()) if forward_mask.any() else 0.0
-            defense_xgar = float((grp.loc[defense_mask, 'xgar'] * weights.loc[defense_mask]).sum()) if defense_mask.any() else 0.0
-            elite = grp.sort_values('xgar', ascending=False).head(4)
-            elite_availability = float((elite['xgar'].clip(lower=0.0) * elite['prob_play']).sum())
-            bucket_totals: Dict[str, float] = {}
-            for bucket in all_line_buckets:
-                mask = grp['line_bucket'] == bucket
-                if mask.any():
-                    bucket_totals[bucket] = float((grp.loc[mask, 'xgar'] * weights.loc[mask]).sum())
-            line_summary = [
-                f"{bucket}:{bucket_totals[bucket]:+.1f}"
-                for bucket in line_categories
-                if bucket in bucket_totals and abs(bucket_totals[bucket]) >= 0.1
-            ]
-            status_lower = grp['status'].astype(str).str.lower()
-            scratch_mask = (
-                (weights < 0.2) |
-                status_lower.str.contains(r'scratch|inactive|out|ltir|ir|susp', regex=True, na=False)
-            )
-            scratch_value = 0.0
-            scratch_count = 0
-            scratch_names: List[str] = []
-            if scratch_mask.any():
-                scratch_weights = (1.0 - weights.loc[scratch_mask]).clip(0.0, 1.0)
-                scratch_rows = grp.loc[scratch_mask].copy().sort_values('xgar', ascending=False)
-                scratch_value = float(
-                    (
-                        scratch_rows['xgar'].clip(lower=0.0) *
-                        scratch_weights.reindex(scratch_rows.index).fillna(1.0)
-                    ).sum()
-                )
-                scratch_count = int(scratch_mask.sum())
-                scratch_names = [f"{row['player']} ({row['position']})" for _, row in scratch_rows.iterrows()]
-            roster_rapm_total = float(((grp['rapm_off'] + grp['rapm_def']) * weights).sum())
-            team_summary[team] = {
-                'active_xgar': active_xgar,
-                'active_rapm_off': active_rapm_off,
-                'active_rapm_def': active_rapm_def,
-                'top_line_xgar': top_line_xgar,
-                'status_penalty': status_penalty,
-                'missing_names': missing_names,
-                'forward_xgar': forward_xgar,
-                'defense_xgar': defense_xgar,
-                'elite_availability': elite_availability,
-                'line_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in line_categories},
-                'pair_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in pair_categories},
-                'pp_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in pp_categories},
-                'pk_xgar': {cat: float(bucket_totals.get(cat, 0.0)) for cat in pk_categories},
-                'line_summary': line_summary,
-                'scratch_value': scratch_value,
-                'scratch_count': scratch_count,
-                'scratch_names': scratch_names,
-                'roster_rapm_total': roster_rapm_total
-            }
-
-        if not team_summary:
-            return notes
-
-        if 'player_edge_total' not in todays_features.columns:
-            todays_features['player_edge_total'] = 0.0
-
-        for idx in todays_features.index:
-            try:
-                home_team = str(todays_features.at[idx, 'home_team']).upper()
-                away_team = str(todays_features.at[idx, 'away_team']).upper()
-            except Exception:
-                continue
-            home_summary = team_summary.get(home_team, {})
-            away_summary = team_summary.get(away_team, {})
-
-            def val(summary: Dict[str, Any], key: str) -> float:
-                try:
-                    return float(summary.get(key, 0.0)) if summary else 0.0
-                except Exception:
-                    return 0.0
-
-            def bucket_val(summary: Dict[str, Any], bucket_key: str, bucket: str) -> float:
-                if not summary:
-                    return 0.0
-                data = summary.get(bucket_key)
-                if not isinstance(data, dict):
-                    return 0.0
-                try:
-                    val_raw = float(data.get(bucket, 0.0))
-                    return val_raw if np.isfinite(val_raw) else 0.0
-                except Exception:
-                    return 0.0
-
-            def dict_diff(home_dict: Dict[str, Any], away_dict: Dict[str, Any], bucket: str) -> float:
-                try:
-                    hv = float(home_dict.get(bucket, 0.0)) if isinstance(home_dict, dict) else 0.0
-                except Exception:
-                    hv = 0.0
-                try:
-                    av = float(away_dict.get(bucket, 0.0)) if isinstance(away_dict, dict) else 0.0
-                except Exception:
-                    av = 0.0
-                diff_val = hv - av
-                return diff_val if np.isfinite(diff_val) else 0.0
-
-            todays_features.at[idx, 'home_active_xgar'] = val(home_summary, 'active_xgar')
-            todays_features.at[idx, 'away_active_xgar'] = val(away_summary, 'active_xgar')
-            todays_features.at[idx, 'home_active_rapm_off'] = val(home_summary, 'active_rapm_off')
-            todays_features.at[idx, 'away_active_rapm_off'] = val(away_summary, 'active_rapm_off')
-            todays_features.at[idx, 'home_active_rapm_def'] = val(home_summary, 'active_rapm_def')
-            todays_features.at[idx, 'away_active_rapm_def'] = val(away_summary, 'active_rapm_def')
-            todays_features.at[idx, 'home_top_line_xgar'] = val(home_summary, 'top_line_xgar')
-            todays_features.at[idx, 'away_top_line_xgar'] = val(away_summary, 'top_line_xgar')
-            todays_features.at[idx, 'home_player_status_penalty'] = val(home_summary, 'status_penalty')
-            todays_features.at[idx, 'away_player_status_penalty'] = val(away_summary, 'status_penalty')
-            todays_features.at[idx, 'home_forward_xgar'] = val(home_summary, 'forward_xgar')
-            todays_features.at[idx, 'away_forward_xgar'] = val(away_summary, 'forward_xgar')
-            todays_features.at[idx, 'home_defense_xgar'] = val(home_summary, 'defense_xgar')
-            todays_features.at[idx, 'away_defense_xgar'] = val(away_summary, 'defense_xgar')
-            todays_features.at[idx, 'home_elite_prob'] = val(home_summary, 'elite_availability')
-            todays_features.at[idx, 'away_elite_prob'] = val(away_summary, 'elite_availability')
-            for pos, bucket in enumerate(line_categories, start=1):
-                todays_features.at[idx, f'home_line{pos}_xgar'] = bucket_val(home_summary, 'line_xgar', bucket)
-                todays_features.at[idx, f'away_line{pos}_xgar'] = bucket_val(away_summary, 'line_xgar', bucket)
-            for pos, bucket in enumerate(pair_categories, start=1):
-                todays_features.at[idx, f'home_pair{pos}_xgar'] = bucket_val(home_summary, 'pair_xgar', bucket)
-                todays_features.at[idx, f'away_pair{pos}_xgar'] = bucket_val(away_summary, 'pair_xgar', bucket)
-            todays_features.at[idx, 'home_pp1_xgar'] = bucket_val(home_summary, 'pp_xgar', 'PP1')
-            todays_features.at[idx, 'away_pp1_xgar'] = bucket_val(away_summary, 'pp_xgar', 'PP1')
-            todays_features.at[idx, 'home_pk1_xgar'] = bucket_val(home_summary, 'pk_xgar', 'PK1')
-            todays_features.at[idx, 'away_pk1_xgar'] = bucket_val(away_summary, 'pk_xgar', 'PK1')
-            todays_features.at[idx, 'home_roster_rapm'] = val(home_summary, 'roster_rapm_total')
-            todays_features.at[idx, 'away_roster_rapm'] = val(away_summary, 'roster_rapm_total')
-            todays_features.at[idx, 'roster_rapm_diff'] = (
-                todays_features.at[idx, 'home_roster_rapm'] - todays_features.at[idx, 'away_roster_rapm']
-            )
-            todays_features.at[idx, 'home_scratched_xgar'] = val(home_summary, 'scratch_value')
-            todays_features.at[idx, 'away_scratched_xgar'] = val(away_summary, 'scratch_value')
-            todays_features.at[idx, 'home_scratch_count'] = val(home_summary, 'scratch_count')
-            todays_features.at[idx, 'away_scratch_count'] = val(away_summary, 'scratch_count')
-
-            player_adjustment = (
-                0.02 * (todays_features.at[idx, 'home_active_xgar'] - todays_features.at[idx, 'away_active_xgar']) +
-                0.015 * (todays_features.at[idx, 'home_active_rapm_off'] - todays_features.at[idx, 'away_active_rapm_off']) -
-                0.015 * (todays_features.at[idx, 'home_active_rapm_def'] - todays_features.at[idx, 'away_active_rapm_def']) +
-                0.01 * (todays_features.at[idx, 'home_top_line_xgar'] - todays_features.at[idx, 'away_top_line_xgar']) +
-                todays_features.at[idx, 'home_player_status_penalty'] +
-                todays_features.at[idx, 'away_player_status_penalty']
-            )
-            skater_edge = (
-                0.012 * (todays_features.at[idx, 'home_forward_xgar'] - todays_features.at[idx, 'away_forward_xgar']) +
-                0.008 * (todays_features.at[idx, 'home_defense_xgar'] - todays_features.at[idx, 'away_defense_xgar']) +
-                0.01 * (todays_features.at[idx, 'home_elite_prob'] - todays_features.at[idx, 'away_elite_prob'])
-            )
-            player_adjustment += skater_edge
-            home_lines = home_summary.get('line_xgar', {}) if home_summary else {}
-            away_lines = away_summary.get('line_xgar', {}) if away_summary else {}
-            home_pairs = home_summary.get('pair_xgar', {}) if home_summary else {}
-            away_pairs = away_summary.get('pair_xgar', {}) if away_summary else {}
-            home_pp_units = home_summary.get('pp_xgar', {}) if home_summary else {}
-            away_pp_units = away_summary.get('pp_xgar', {}) if away_summary else {}
-            home_pk_units = home_summary.get('pk_xgar', {}) if home_summary else {}
-            away_pk_units = away_summary.get('pk_xgar', {}) if away_summary else {}
-
-            l1_diff = dict_diff(home_lines, away_lines, 'L1')
-            l2_diff = dict_diff(home_lines, away_lines, 'L2')
-            l3_diff = dict_diff(home_lines, away_lines, 'L3')
-            l4_diff = dict_diff(home_lines, away_lines, 'L4')
-            pair1_diff = dict_diff(home_pairs, away_pairs, 'D1')
-            pair2_diff = dict_diff(home_pairs, away_pairs, 'D2')
-            pp_edge = (
-                bucket_val(home_summary, 'pp_xgar', 'PP1') - bucket_val(away_summary, 'pk_xgar', 'PK1') -
-                (bucket_val(away_summary, 'pp_xgar', 'PP1') - bucket_val(home_summary, 'pk_xgar', 'PK1'))
-            )
-            line_match_adj = (
-                0.012 * l1_diff +
-                0.008 * l2_diff +
-                0.004 * l3_diff +
-                0.002 * l4_diff +
-                0.006 * pair1_diff +
-                0.004 * pair2_diff +
-                0.003 * pp_edge
-            )
-            line_match_adj = float(max(-0.35, min(0.35, line_match_adj)))
-            scratch_diff = todays_features.at[idx, 'home_scratched_xgar'] - todays_features.at[idx, 'away_scratched_xgar']
-            scratch_count_diff = todays_features.at[idx, 'home_scratch_count'] - todays_features.at[idx, 'away_scratch_count']
-            scratch_penalty = -0.008 * scratch_diff - 0.01 * scratch_count_diff
-            scratch_penalty = float(max(-0.25, min(0.25, scratch_penalty)))
-            todays_features.at[idx, 'line_match_edge'] = line_match_adj
-            todays_features.at[idx, 'scratch_edge'] = scratch_penalty
-            player_adjustment += (line_match_adj + scratch_penalty)
-            skater_goalie_increment = skater_edge + line_match_adj + scratch_penalty
-            todays_features.at[idx, 'skater_goalie_edge'] = (
-                todays_features.at[idx, 'skater_goalie_edge'] + skater_goalie_increment
-            )
-            todays_features.at[idx, 'player_edge_total'] = player_adjustment
-            todays_features.at[idx, 'total_adjustments'] = todays_features.at[idx, 'total_adjustments'] + player_adjustment
-            todays_features.at[idx, 'final_prediction_base'] = (
-                todays_features.at[idx, 'base_total_prediction'] + todays_features.at[idx, 'total_adjustments']
-            )
-
-            gid = None
-            if 'game_id' in todays_features.columns:
-                gid_raw = todays_features.at[idx, 'game_id']
-                gid = str(gid_raw) if pd.notna(gid_raw) else None
-            note_parts: List[str] = []
-            missing_home = home_summary.get('missing_names', []) if home_summary else []
-            missing_away = away_summary.get('missing_names', []) if away_summary else []
-            scratch_home = home_summary.get('scratch_names', []) if home_summary else []
-            scratch_away = away_summary.get('scratch_names', []) if away_summary else []
-            if missing_home:
-                note_parts.append(f"{home_team}: -" + ", ".join(missing_home[:3]))
-            if missing_away:
-                note_parts.append(f"{away_team}: -" + ", ".join(missing_away[:3]))
-            missing_home_set = set(missing_home)
-            missing_away_set = set(missing_away)
-            scratch_home_filtered = [name for name in scratch_home if name not in missing_home_set]
-            scratch_away_filtered = [name for name in scratch_away if name not in missing_away_set]
-            if scratch_home_filtered:
-                note_parts.append(f"{home_team} SCR: " + ", ".join(scratch_home_filtered[:2]))
-            if scratch_away_filtered:
-                note_parts.append(f"{away_team} SCR: " + ", ".join(scratch_away_filtered[:2]))
-            line_desc_home = home_summary.get('line_summary', []) if home_summary else []
-            line_desc_away = away_summary.get('line_summary', []) if away_summary else []
-            if line_desc_home:
-                note_parts.append(f"{home_team} {line_desc_home[0]}")
-            if line_desc_away:
-                note_parts.append(f"{away_team} {line_desc_away[0]}")
-            if np.isfinite(line_match_adj) and abs(line_match_adj) >= 0.01:
-                note_parts.append(f"LM {line_match_adj:+.2f}")
-            if note_parts and gid:
-                notes[gid] = " | ".join(note_parts)
-
-        return notes
-    
     def apply_goalie_context_features(
         self,
         todays_games: pd.DataFrame,
@@ -3613,30 +3125,9 @@ class RealDataNHLModel:
             'home_rush60', 'away_rush60', 'home_rebounds60', 'away_rebounds60', 'home_slot60', 'away_slot60',
             'home_finish_delta', 'away_finish_delta',
             'special_teams_index', 'special_teams_diff',
-            # Skater/goalie context
-            'home_active_xgar', 'away_active_xgar',
-            'home_active_rapm_off', 'away_active_rapm_off',
-            'home_active_rapm_def', 'away_active_rapm_def',
-            'home_top_line_xgar', 'away_top_line_xgar',
-            'home_forward_xgar', 'away_forward_xgar',
-            'home_defense_xgar', 'away_defense_xgar',
-            'home_elite_prob', 'away_elite_prob',
+            # Goalie context
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
-            'home_line1_xgar', 'away_line1_xgar',
-            'home_line2_xgar', 'away_line2_xgar',
-            'home_line3_xgar', 'away_line3_xgar',
-            'home_line4_xgar', 'away_line4_xgar',
-            'home_pair1_xgar', 'away_pair1_xgar',
-            'home_pair2_xgar', 'away_pair2_xgar',
-            'home_pair3_xgar', 'away_pair3_xgar',
-            'home_pp1_xgar', 'away_pp1_xgar',
-            'home_pk1_xgar', 'away_pk1_xgar',
-            'home_roster_rapm', 'away_roster_rapm',
-            'roster_rapm_diff',
-            'home_scratched_xgar', 'away_scratched_xgar',
-            'home_scratch_count', 'away_scratch_count',
-            'line_match_edge', 'scratch_edge',
             'skater_goalie_edge'
         ]
         # Add rink bias proxy and penalties
@@ -7276,10 +6767,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             else:
                 team_out = getattr(cli_args, 'team_rates_path', None) or 'team_rates.csv'
                 goalie_out = getattr(cli_args, 'goalie_gsax_path', None) or 'goalie_gsax.csv'
-                player_out = getattr(cli_args, 'player_metrics_path', None) or 'player_metrics.csv'
                 setattr(cli_args, 'team_rates_path', team_out)
                 setattr(cli_args, 'goalie_gsax_path', goalie_out)
-                setattr(cli_args, 'player_metrics_path', player_out)
                 history_dir = getattr(cli_args, 'moneypuck_history_dir', 'data/history') or 'data/history'
                 stages = getattr(cli_args, 'moneypuck_stages', None)
                 seasons = getattr(cli_args, 'moneypuck_seasons', None)
@@ -7287,13 +6776,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 pipeline_kwargs = {
                     'team_output_path': team_out,
                     'goalie_output_path': goalie_out,
-                    'player_output_path': player_out,
                     'history_dir': Path(history_dir),
                     'stages': stages,
                     'seasons': seasons,
                     'team_override_url': getattr(cli_args, 'team_rates_url', None),
                     'goalie_override_url': getattr(cli_args, 'goalie_gsax_url', None),
-                    'player_override_url': getattr(cli_args, 'player_metrics_url', None),
                     'dry_run': bool(getattr(cli_args, 'moneypuck_dry_run', False)),
                     'fail_on_anomaly': bool(getattr(cli_args, 'fail_on_moneypuck_anomaly', False)),
                     'request_timeout': timeout,
@@ -7564,27 +7051,6 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 print(f"⚠️  Goalie GSAx fetched but could not write to {target_path}: {e}")
                         else:
                             print(f"⚠️  Goalie GSAx fetched but could not determine local path for {cli_args.goalie_gsax_path}")
-
-                if cli_args.player_metrics_url and cli_args.player_metrics_path:
-                    pm = None
-                    try:
-                        pm = model.load_player_metrics(cli_args.player_metrics_url)
-                    except Exception:
-                        time.sleep(1.0)
-                        try:
-                            pm = model.load_player_metrics(cli_args.player_metrics_url)
-                        except Exception:
-                            pm = None
-                    if pm is not None and isinstance(pm, pd.DataFrame) and not pm.empty:
-                        target_path = ensure_local_write_path(cli_args.player_metrics_path)
-                        if target_path:
-                            try:
-                                pm.to_csv(target_path, index=False)
-                                print(f"✅ Wrote player metrics to {target_path}")
-                            except Exception as e:
-                                print(f"⚠️  Player metrics fetched but could not write to {target_path}: {e}")
-                        else:
-                            print(f"⚠️  Player metrics fetched but could not determine local path for {cli_args.player_metrics_path}")
 
                 if cli_args.penalties_url and cli_args.penalty_rates_path:
                     pr = model.load_penalty_rates(cli_args.penalties_url)
@@ -8087,26 +7553,6 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     pass
             except Exception:
                 lineup_strength = {}
-            player_metrics_df: Optional[pd.DataFrame] = None
-            try:
-                player_metrics_path = getattr(cli_args, 'player_metrics_path', None) if cli_args else os.getenv('PLAYER_METRICS_PATH')
-                if player_metrics_path:
-                    player_metrics_df = model.load_player_metrics(player_metrics_path)
-                    if player_metrics_df is not None and not player_metrics_df.empty:
-                        try:
-                            print(f"🧍 Player metrics loaded: {len(player_metrics_df)} rows from {player_metrics_path}")
-                        except Exception:
-                            pass
-            except Exception as e:
-                player_metrics_df = None
-                print(f"⚠️  Player metrics not applied: {e}")
-            player_context_notes: Dict[str, str] = {}
-            try:
-                if player_metrics_df is not None and isinstance(player_metrics_df, pd.DataFrame) and not player_metrics_df.empty:
-                    player_context_notes = model.apply_player_context_features(todays_games, todays_features, player_metrics_df)
-            except Exception as e:
-                player_context_notes = {}
-                print(f"⚠️  Player context features skipped: {e}")
             goalie_context_notes: Dict[str, str] = {}
             try:
                 if goalie_rates is not None and isinstance(goalie_rates, pd.DataFrame) and not goalie_rates.empty:
@@ -8461,9 +7907,6 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         env_bits.append(f"{tempf}°F")
                         pred.env_info = ' '.join(env_bits)
                         pred.lineup_info = f"H:{hs:.2f}/A:{as_:.2f}"
-                        player_note = player_context_notes.get(game_id)
-                        if player_note:
-                            pred.lineup_info = f"{pred.lineup_info} | {player_note}" if pred.lineup_info else player_note
                         goalie_note = goalie_context_notes.get(game_id)
                         if goalie_note:
                             pred.lineup_info = f"{pred.lineup_info} | {goalie_note}" if pred.lineup_info else goalie_note
@@ -8690,11 +8133,9 @@ if __name__ == "__main__":
     parser.add_argument('--environment-path', type=str, default=os.getenv('ENVIRONMENT_JSON', None), help='Path to environment JSON (outdoor/start time/weather)')
     parser.add_argument('--env-refresh', action='store_true', help='Refresh/overwrite today entries in environment.json')
     parser.add_argument('--lineup-path', type=str, default=os.getenv('LINEUP_STRENGTH_CSV', None), help='Path to lineup strength CSV (team,lineup_strength)')
-    parser.add_argument('--player-metrics-path', type=str, default=os.getenv('PLAYER_METRICS_PATH', None), help='CSV/JSON with player-level RAPM/xGAR/injury context')
     parser.add_argument('--auto-populate', action='store_true', help='Auto-fetch team rates/goalie GSAx/penalties/referees from URLs and write CSVs')
     parser.add_argument('--team-rates-url', type=str, default=os.getenv('TEAM_RATES_URL', None), help='URL to fetch team rates CSV')
     parser.add_argument('--goalie-gsax-url', type=str, default=os.getenv('GOALIE_GSAX_URL', None), help='URL to fetch goalie GSAx CSV')
-    parser.add_argument('--player-metrics-url', type=str, default=os.getenv('PLAYER_METRICS_URL', None), help='URL to fetch player metrics (MoneyPuck skaters) CSV')
     parser.add_argument('--penalties-url', type=str, default=os.getenv('PENALTIES_URL', None), help='URL to fetch team penalties CSV')
     parser.add_argument('--referees-url', type=str, default=os.getenv('REFEREES_URL', None), help='URL to fetch referee rates CSV')
     parser.add_argument('--refresh-moneypuck', action='store_true', help='Run the MoneyPuck ETL pipeline before predictions')
