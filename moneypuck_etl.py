@@ -200,6 +200,37 @@ def normalize_team_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame({"team": df["team"]})
 
+    legacy_column_patterns = {
+        "scoreVenueAdjustedxGoalsFor": [
+            r"score.*venue.*adjust.*xg.*for",
+            r"score.*venue.*adjust.*expected.*goal.*for",
+        ],
+        "scoreVenueAdjustedxGoalsAgainst": [
+            r"score.*venue.*adjust.*xg.*against",
+            r"score.*venue.*adjust.*expected.*goal.*against",
+        ],
+        "shotsOnGoalFor": [
+            r"shots?.*on.*goal.*for",
+            r"sog.*for",
+        ],
+        "shotsOnGoalAgainst": [
+            r"shots?.*on.*goal.*against",
+            r"sog.*against",
+        ],
+        "iceTime": [
+            r"ice.*time",
+            r"time.*on.*ice",
+            r"\btoi\b",
+            r"minutes.*played",
+        ],
+    }
+
+    for canonical, patterns in legacy_column_patterns.items():
+        source = find_col(patterns)
+        if source is None:
+            continue
+        out[canonical] = pd.to_numeric(df[source], errors="coerce")
+
     c_xgf60 = find_col(
         [
             r"xg[f]?[a-z_]*60.*5.*v.*5",
