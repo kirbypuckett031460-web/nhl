@@ -1467,6 +1467,10 @@ class RealDataNHLModel:
             self.ref_goal_weight: float = float(os.getenv('REF_GOAL_WEIGHT', 0.05))
         except Exception:
             self.ref_goal_weight = 0.05
+        try:
+            self.post_total_adjust_cap: float = float(os.getenv('POST_TOTAL_ADJUST_CAP', 0.6))
+        except Exception:
+            self.post_total_adjust_cap = 0.6
         self.market_calibration_snapshot: Optional[Dict[str, Any]] = None
         self.book_confidence_multipliers: Dict[str, float] = {}
         self.month_confidence_multipliers: Dict[str, float] = {}
@@ -8004,16 +8008,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     except Exception:
                         pass
 
-                    # Empty-net expectation proxy: uplift totals when projected close game and late ENG likelihood high
-                    try:
-                        closeness = float(max(0.0, 1.0 - abs(pred.predicted_total - betting_line) / 2.5))
-                        total_adj += 0.05 * closeness
-                    except Exception:
-                        pass
-
-                    if abs(total_adj) > 1e-6:
-                        pred.predicted_total = float(pred.predicted_total + total_adj)
-                        pred.edge = float(pred.predicted_total - pred.betting_line)
+                        if abs(total_adj) > 1e-6:
+                            cap_value = getattr(model, 'post_total_adjust_cap', 0.0)
+                            try:
+                                cap_float = float(cap_value)
+                            except Exception:
+                                cap_float = 0.0
+                            if np.isfinite(cap_float) and cap_float > 0:
+                                total_adj = float(max(-cap_float, min(cap_float, total_adj)))
+                            pred.predicted_total = float(pred.predicted_total + total_adj)
+                            pred.edge = float(pred.predicted_total - pred.betting_line)
                     # Populate env/lineup info strings for dashboard
                     try:
                         e = env_data.get(game_id, {}) if isinstance(env_data, dict) else {}
