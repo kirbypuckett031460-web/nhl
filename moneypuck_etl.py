@@ -482,136 +482,6 @@ def normalize_goalie_rates(raw_df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def normalize_player_metrics(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize MoneyPuck skater summaries into player metrics for the model."""
-
-    df = flatten_columns(raw_df.copy())
-
-    situation_col = _find_column(df, [r"situation", r"state", r"strength"])
-    if situation_col and situation_col in df.columns:
-        situation = df[situation_col].astype(str).str.strip().str.lower()
-        all_mask = situation == "all"
-        if all_mask.any():
-            df = df[all_mask].copy()
-
-    player_candidates = ["name", "player", "player_name", "playername"]
-    player_col = next((col for col in player_candidates if col in df.columns), None)
-    if not player_col:
-        player_col = _find_column(df, [r"player", r"name"])
-    team_col = _find_column(df, [r"team"])
-    position_col = _find_column(df, [r"position", r"\bpos\b"])
-    icetime_col = _find_column(df, [r"ice.?time"])
-    games_col = _find_column(df, [r"games?_?played", r"\bgp\b", r"games"])
-    game_score_col = _find_column(df, [r"game.?score"])
-    xg_for_col = _find_column(df, [r"onice[_ ]?f.*score.*xg", r"onice[_ ]?f.*xgoals"])
-    xg_against_col = _find_column(df, [r"onice[_ ]?a.*score.*xg", r"onice[_ ]?a.*xgoals"])
-
-    column_map = {
-        "player": player_col,
-        "team": team_col,
-        "position": position_col,
-        "icetime": icetime_col,
-        "games_played": games_col,
-        "gameScore": game_score_col,
-        "OnIce_F_scoreVenueAdjustedxGoals": xg_for_col,
-        "OnIce_A_scoreVenueAdjustedxGoals": xg_against_col,
-    }
-    missing = [name for name, col in column_map.items() if col is None]
-    if missing:
-        raise ValueError(
-            "Player metrics normalization is missing columns: "
-            + ", ".join(missing)
-        )
-
-    rename_map = {source: target for target, source in column_map.items()}
-    df = df.rename(columns=rename_map)
-    df = df[
-        (df["player"].astype(str).str.len() > 0)
-        & (df["team"].astype(str).str.len() > 0)
-    ].copy()
-    df["team"] = df["team"].apply(to_team_abbr)
-    df["player"] = df["player"].astype(str).str.strip()
-    df["position"] = df["position"].astype(str).str.upper().str.strip()
-
-    df["icetime"] = pd.to_numeric(df["icetime"], errors="coerce")
-    df["games_played"] = pd.to_numeric(df["games_played"], errors="coerce")
-    df["gameScore"] = pd.to_numeric(df["gameScore"], errors="coerce")
-    df["OnIce_F_scoreVenueAdjustedxGoals"] = pd.to_numeric(
-        df["OnIce_F_scoreVenueAdjustedxGoals"], errors="coerce"
-    )
-    df["OnIce_A_scoreVenueAdjustedxGoals"] = pd.to_numeric(
-        df["OnIce_A_scoreVenueAdjustedxGoals"], errors="coerce"
-    )
-
-    df["games_played"] = df["games_played"].where(df["games_played"] > 0, 1.0)
-    df["icetime_minutes"] = df["icetime"].where(df["icetime"] > 0, np.nan) / 60.0
-    df["icetime_minutes"] = df["icetime_minutes"].fillna(df["games_played"] * 14.5)
-
-    minutes = df["icetime_minutes"].where(
-        df["icetime_minutes"] > 0, df["games_played"] * 14.5
-    )
-    per60_factor = np.where(minutes > 0, 60.0 / minutes, 0.0)
-
-    df["xg_for_per60"] = df["OnIce_F_scoreVenueAdjustedxGoals"].fillna(0.0) * per60_factor
-    df["xg_against_per60"] = df["OnIce_A_scoreVenueAdjustedxGoals"].fillna(0.0) * per60_factor
-
-    league_avg_for = np.nanmean(df["xg_for_per60"]) if len(df) else 0.0
-    league_avg_against = np.nanmean(df["xg_against_per60"]) if len(df) else 0.0
-
-    df["rapm_off"] = df["xg_for_per60"] - league_avg_for
-    df["rapm_def"] = league_avg_against - df["xg_against_per60"]
-    df["xgar"] = df["gameScore"].fillna(0.0)
-
-    team_games = df.groupby("team")["games_played"].transform("max").clip(lower=1.0)
-    df["prob_play"] = (df["games_played"] / team_games).clip(0.35, 1.0)
-    df["status"] = "ACTIVE"
-
-    df["toi_per_game"] = minutes / df["games_played"].clip(lower=1.0)
-    df["line_slot"] = ""
-
-    def is_defense(pos: str) -> bool:
-        pos_u = (pos or "").upper()
-        return "D" in pos_u and "G" not in pos_u
-
-    def is_goalie(pos: str) -> bool:
-        return str(pos).strip().upper().startswith("G")
-
-    for team, grp in df.groupby("team"):
-        ordered = grp.sort_values("toi_per_game", ascending=False).index.tolist()
-        forwards = [
-            idx
-            for idx in ordered
-            if not is_defense(df.at[idx, "position"]) and not is_goalie(df.at[idx, "position"])
-        ]
-        defenders = [idx for idx in ordered if is_defense(df.at[idx, "position"])]
-
-        for rank, idx in enumerate(forwards):
-            bucket = min(rank // 3, 3)
-            df.at[idx, "line_slot"] = f"L{bucket + 1}"
-
-        for rank, idx in enumerate(defenders):
-            bucket = min(rank // 2, 2)
-            df.at[idx, "line_slot"] = f"D{bucket + 1}"
-
-    columns = [
-        "team",
-        "player",
-        "position",
-        "status",
-        "prob_play",
-        "rapm_off",
-        "rapm_def",
-        "xgar",
-        "line_slot",
-        "games_played",
-        "toi_per_game",
-        "xg_for_per60",
-        "xg_against_per60",
-    ]
-
-    return df[columns].reset_index(drop=True)
-
-
 def estimate_current_season(reference: Optional[datetime] = None) -> int:
     """Return the NHL season identifier MoneyPuck uses (year of season end)."""
 
@@ -901,20 +771,17 @@ class MoneyPuckETLPipeline:
         self,
         team_output_path: str = "team_rates.csv",
         goalie_output_path: str = "goalie_gsax.csv",
-        player_output_path: str = "player_metrics.csv",
         history_dir: Path = DEFAULT_HISTORY_DIR,
         stages: Optional[Sequence[str]] = None,
         seasons: Optional[Sequence[int]] = None,
         team_override_url: Optional[str] = None,
         goalie_override_url: Optional[str] = None,
-        player_override_url: Optional[str] = None,
         dry_run: bool = False,
         fail_on_anomaly: bool = False,
         request_timeout: float = 25.0,
     ) -> None:
         self.team_override_url = team_override_url
         self.goalie_override_url = goalie_override_url
-        self.player_override_url = player_override_url
         self.stages = list(stages) if stages else ["regular"]
         self.seasons = default_season_candidates(seasons)
         self.detector = AnomalyDetector(target_season=max(self.seasons))
@@ -941,15 +808,6 @@ class MoneyPuckETLPipeline:
                 min_rows=40,
                 expected_unique=None,
             ),
-            DatasetTarget(
-                name="player_metrics",
-                slug="skaters",
-                output_path=Path(player_output_path),
-                entity_column="player",
-                numeric_columns=["xgar", "rapm_off", "rapm_def", "prob_play"],
-                min_rows=300,
-                expected_unique=400,
-            ),
         ]
 
     def _load_previous(self, path: Path) -> Optional[pd.DataFrame]:
@@ -965,8 +823,6 @@ class MoneyPuckETLPipeline:
             return normalize_team_rates(raw_df)
         if target.name == "goalie_gsax":
             return normalize_goalie_rates(raw_df)
-        if target.name == "player_metrics":
-            return normalize_player_metrics(raw_df)
         raise ValueError(f"No normalizer configured for {target.name}")
 
     def _maybe_version(
@@ -988,8 +844,6 @@ class MoneyPuckETLPipeline:
                 override = self.team_override_url
             elif target.name == "goalie_gsax":
                 override = self.goalie_override_url
-            elif target.name == "player_metrics":
-                override = self.player_override_url
             print(
                 f"\n📥 Refreshing {target.name} "
                 f"(seasons={self.seasons}, stages={self.stages})..."
@@ -1065,12 +919,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Where to write the normalized goalie GSAx CSV.",
     )
     parser.add_argument(
-        "--player-output",
-        type=str,
-        default=os.getenv("PLAYER_METRICS_PATH", "player_metrics.csv"),
-        help="Where to write the normalized player metrics CSV.",
-    )
-    parser.add_argument(
         "--history-dir",
         type=str,
         default=str(DEFAULT_HISTORY_DIR),
@@ -1099,11 +947,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override URL for the goalie CSV (skips MoneyPuck discovery).",
     )
     parser.add_argument(
-        "--player-url",
-        type=str,
-        help="Override URL for the skater CSV (skips MoneyPuck discovery).",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run the pipeline without writing files.",
@@ -1128,13 +971,11 @@ def main() -> None:
     pipeline = MoneyPuckETLPipeline(
         team_output_path=args.team_output,
         goalie_output_path=args.goalie_output,
-        player_output_path=args.player_output,
         history_dir=Path(args.history_dir),
         stages=args.stages,
         seasons=args.seasons,
         team_override_url=args.team_url,
         goalie_override_url=args.goalie_url,
-        player_override_url=args.player_url,
         dry_run=args.dry_run,
         fail_on_anomaly=args.fail_on_anomaly,
         request_timeout=args.request_timeout,
