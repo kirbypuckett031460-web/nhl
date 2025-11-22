@@ -1446,6 +1446,8 @@ class RealDataNHLModel:
         self.locked_feature_pipeline: Optional[Pipeline] = None
         self.goal_scaler = StandardScaler()
         self.feature_names = []
+        self.feature_baselines: Dict[str, float] = {}
+        self.target_baseline: float = 6.2
         # Store conformal quantiles for uncertainty intervals
         self.conformal_q80: Optional[float] = None
         self.conformal_q90: Optional[float] = None
@@ -3567,6 +3569,21 @@ class RealDataNHLModel:
         dates = dates[mask]
         
         self.feature_names = available_features
+        # Capture per-feature baselines for inference-time fallback
+        self.feature_baselines = {}
+        try:
+            baseline_series = X.mean(numeric_only=True)
+            for col, val in baseline_series.items():
+                if np.isfinite(val):
+                    self.feature_baselines[col] = float(val)
+        except Exception:
+            self.feature_baselines = {}
+        try:
+            target_mean = float(y.mean())
+            if np.isfinite(target_mean):
+                self.target_baseline = target_mean
+        except Exception:
+            pass
 
         if 'ref_goals_gm' in df.columns:
             try:
@@ -4006,6 +4023,8 @@ class RealDataNHLModel:
                 predicted_total = float(predicted_total + ref_goal_adjustment)
         else:
             ref_goal_adjustment = 0.0
+
+        predicted_total = float(max(0.0, predicted_total))
         
         # Calculate probabilities with calibrated uncertainty and push handling
         edge = predicted_total - betting_line
@@ -8072,24 +8091,39 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     team_rate_map = None
 
+            baseline_feature_map = getattr(model, 'feature_baselines', {}) or {}
+            baseline_total = getattr(model, 'target_baseline', None)
+            if baseline_total is None or not np.isfinite(baseline_total):
+                baseline_total = 6.2
+            static_feature_defaults = {
+                'home_gpg_l5': 3.0,
+                'away_gpg_l5': 3.0,
+                'combined_gpg': baseline_total / 2.0,
+                'venue_total_avg': baseline_total,
+                'base_total_prediction': baseline_total,
+                'final_prediction_base': baseline_total,
+                'pace_zscore': 0.0,
+                'rest_diff': 0.0,
+                'schedule_density_diff': 0.0,
+                'travel_fatigue_index': 0.0,
+                'home_shoot_pct_l5': 0.10,
+                'away_shoot_pct_l5': 0.10,
+                'home_save_pct_l5': 0.92,
+                'away_save_pct_l5': 0.92,
+                'special_teams_index': 0.0,
+                'special_teams_diff': 0.0
+            }
+
             for idx, game in todays_features.iterrows():
                 try:
                     feature_values = []
                     for feature_name in model.feature_names:
                         if feature_name in game.index and pd.notna(game[feature_name]):
                             feature_values.append(float(game[feature_name]))
+                        elif feature_name in baseline_feature_map:
+                            feature_values.append(float(baseline_feature_map[feature_name]))
                         else:
-                            defaults = {
-                                'home_gpg_l5': 3.0, 'away_gpg_l5': 3.0,
-                                'combined_gpg': 3.0, 'venue_total_avg': 6.2,
-                                'base_total_prediction': 6.2, 'final_prediction_base': 6.2,
-                                'pace_zscore': 0.0, 'rest_diff': 0.0, 'schedule_density_diff': 0.0,
-                                'travel_fatigue_index': 0.0,
-                                'home_shoot_pct_l5': 0.10, 'away_shoot_pct_l5': 0.10,
-                                'home_save_pct_l5': 0.92, 'away_save_pct_l5': 0.92,
-                                'special_teams_index': 0.0, 'special_teams_diff': 0.0
-                            }
-                            feature_values.append(defaults.get(feature_name, 0.0))
+                            feature_values.append(static_feature_defaults.get(feature_name, 0.0))
                     
                     game_id = str(game.get('game_id', f'game_{idx}'))
                     odds_rec = betting_odds.get(game_id, {'total': 6.5, 'over': -110, 'under': -110})
