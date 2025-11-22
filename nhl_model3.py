@@ -1483,6 +1483,14 @@ class RealDataNHLModel:
         self.risk_exposure_cap_pct: float = self.daily_exposure_cap_pct
         self.risk_feedback_snapshot: Optional[Dict[str, Any]] = None
         self.risk_budget_last_scale: float = 1.0
+        # Snapshots used to enrich historical features so they mirror live inputs
+        self.team_rates_snapshot: Optional[pd.DataFrame] = None
+        self.goalie_rates_snapshot: Optional[pd.DataFrame] = None
+        self.penalty_rates_snapshot: Optional[pd.DataFrame] = None
+        self.referee_rates_snapshot: Optional[pd.DataFrame] = None
+        self.lineup_strength_snapshot: Optional[Dict[str, float]] = None
+        self.environment_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
+        self.historical_cache_metadata: Dict[str, Any] = {}
 
     def _build_feature_pipeline(self) -> Pipeline:
         """Return a fresh feature transformation pipeline."""
@@ -1952,9 +1960,73 @@ class RealDataNHLModel:
         self.risk_budget_last_scale = scale
         print(f"🛡️  Risk budget enforced: scaled Kelly stakes by {scale:.2f} to cap exposure at {exposure_cap:.1f}% (was {total:.1f}%).")
 
+    def hydrate_training_context(
+        self,
+        team_rates_path: Optional[str] = None,
+        goalie_gsax_path: Optional[str] = None,
+        penalty_rates_path: Optional[str] = None,
+        referee_rates_path: Optional[str] = None,
+        lineup_path: Optional[str] = None,
+        environment_path: Optional[str] = None
+    ) -> None:
+        """Load optional context tables so historical training rows see live-style features."""
+        if team_rates_path:
+            self.team_rates_snapshot = self.load_team_rates(team_rates_path)
+            if isinstance(self.team_rates_snapshot, pd.DataFrame):
+                print(f"📥 Team rates snapshot loaded ({len(self.team_rates_snapshot)} teams)")
+        if goalie_gsax_path:
+            self.goalie_rates_snapshot = self.load_goalie_gsax(goalie_gsax_path)
+            if isinstance(self.goalie_rates_snapshot, pd.DataFrame):
+                print(f"📥 Goalie GSAx snapshot loaded ({len(self.goalie_rates_snapshot)} rows)")
+        if penalty_rates_path:
+            self.penalty_rates_snapshot = self.load_penalty_rates(penalty_rates_path)
+            if isinstance(self.penalty_rates_snapshot, pd.DataFrame):
+                print(f"📥 Penalty rates snapshot loaded ({len(self.penalty_rates_snapshot)} teams)")
+        if referee_rates_path:
+            self.referee_rates_snapshot = self.load_referee_rates(referee_rates_path)
+            if isinstance(self.referee_rates_snapshot, pd.DataFrame):
+                print(f"📥 Referee rates snapshot loaded ({len(self.referee_rates_snapshot)} officials)")
+        if lineup_path:
+            self.lineup_strength_snapshot = self.load_lineup_strength(lineup_path)
+            if isinstance(self.lineup_strength_snapshot, dict) and self.lineup_strength_snapshot:
+                print(f"📥 Lineup strength snapshot loaded ({len(self.lineup_strength_snapshot)} teams)")
+        if environment_path:
+            self.environment_snapshot = self._load_environment_snapshot(environment_path)
+            if isinstance(self.environment_snapshot, dict):
+                print(f"📥 Environment snapshot loaded ({len(self.environment_snapshot)} entries)")
+
+    def _load_environment_snapshot(self, env_path: Optional[str]) -> Optional[Dict[str, Dict[str, Any]]]:
+        if not env_path:
+            return None
+        try:
+            with open(env_path, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # Normalize keys to str for consistent lookup
+                return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except FileNotFoundError:
+            print(f"⚠️  Environment snapshot {env_path} not found.")
+        except Exception as e:
+            print(f"⚠️  Failed to load environment snapshot {env_path}: {e}")
+        return None
+
         
-    def fetch_historical_games(self, days_back: int = 30) -> pd.DataFrame:
-        """Fetch historical games data with robust error handling"""
+    def fetch_historical_games(
+        self,
+        days_back: int = 30,
+        cache_path: Optional[str] = None,
+        force_refresh: bool = False
+    ) -> pd.DataFrame:
+        """Fetch historical games data with robust error handling and optional caching."""
+        if cache_path and not force_refresh and os.path.exists(cache_path):
+            try:
+                cached = pd.read_csv(cache_path, parse_dates=['date'])
+                if not cached.empty:
+                    print(f"📦 Loaded {len(cached)} historical games from cache {cache_path}")
+                    self.historical_cache_metadata = {'path': cache_path, 'source': 'cache'}
+                    return cached
+            except Exception as e:
+                print(f"⚠️  Failed to read historical cache {cache_path}: {e}")
         print(f"Fetching historical games from last {days_back} days...")
         
         end_date = datetime.now()
@@ -1975,7 +2047,10 @@ class RealDataNHLModel:
         
         if not games:
             print("❌ Still no games from API. Using enhanced sample data...")
-            return self.create_realistic_sample_data()
+            df = self.create_realistic_sample_data()
+            if cache_path:
+                self._write_historical_cache(df, cache_path)
+            return df
         
         print(f"Found {len(games)} games from API")
         
@@ -1983,39 +2058,42 @@ class RealDataNHLModel:
         processed_count = 0
         
         for i, game in enumerate(games):
-            if game.get('status', {}).get('detailedState') != 'Final':
+            if str(game.get('status', {}).get('detailedState')).lower() != 'final':
                 continue
                 
             try:
                 home_team = game['teams']['home']['team']
                 away_team = game['teams']['away']['team']
+                home_abbr = home_team.get('abbreviation') or home_team.get('triCode')
+                away_abbr = away_team.get('abbreviation') or away_team.get('triCode')
                 
                 game_data = {
-                    'game_id': game['gamePk'],
-                    'date': pd.to_datetime(game['gameDate']),
-                    'home_team': home_team['abbreviation'],
-                    'away_team': away_team['abbreviation'],
-                    'venue': game.get('venue', {}).get('name', f"{home_team['abbreviation']} Arena"),
-                    'home_goals': game['teams']['home']['score'],
-                    'away_goals': game['teams']['away']['score'],
-                    'total_goals': game['teams']['home']['score'] + game['teams']['away']['score']
+                    'game_id': game.get('gamePk'),
+                    'date': pd.to_datetime(game.get('gameDate')),
+                    'home_team': home_abbr,
+                    'away_team': away_abbr,
+                    'venue': game.get('venue', {}).get('name', f"{home_abbr} Arena"),
+                    'home_goals': game['teams']['home'].get('score', 0),
+                    'away_goals': game['teams']['away'].get('score', 0),
                 }
+                game_data['total_goals'] = (game_data['home_goals'] or 0) + (game_data['away_goals'] or 0)
                 
-                # Add realistic stats
-                game_data.update({
-                    'home_shots': max(20, int(np.random.normal(32, 4))),
-                    'away_shots': max(20, int(np.random.normal(30, 4))),
-                    'home_pp_goals': min(game_data['home_goals'], max(0, int(np.random.poisson(0.7)))),
-                    'away_pp_goals': min(game_data['away_goals'], max(0, int(np.random.poisson(0.7)))),
-                    'home_pp_opps': max(1, int(np.random.poisson(3.0))),
-                    'away_pp_opps': max(1, int(np.random.poisson(3.0)))
-                })
+                stats = self._extract_boxscore_stats(
+                    game_id=game_data['game_id'],
+                    home_abbr=home_abbr,
+                    away_abbr=away_abbr
+                )
+                if not stats:
+                    stats = self._fallback_game_stats(game_data['home_goals'], game_data['away_goals'])
+                game_data.update(stats)
+                game_data['home_saves'] = max(0, (game_data.get('away_shots') or 0) - (game_data.get('away_goals') or 0))
+                game_data['away_saves'] = max(0, (game_data.get('home_shots') or 0) - (game_data.get('home_goals') or 0))
                 
                 games_data.append(game_data)
                 processed_count += 1
                 
-                if i % 5 == 0 and i > 0:
-                    time.sleep(0.5)
+                if i % 20 == 0 and i > 0:
+                    time.sleep(0.2)
                     print(f"Processed {processed_count} completed games...")
                     
             except Exception as e:
@@ -2024,10 +2102,113 @@ class RealDataNHLModel:
         
         if not games_data:
             print("❌ No valid games processed. Using enhanced sample data...")
-            return self.create_realistic_sample_data()
+            df = self.create_realistic_sample_data()
+            if cache_path:
+                self._write_historical_cache(df, cache_path)
+            return df
         
-        print(f"✅ Successfully processed {len(games_data)} completed games")
-        return pd.DataFrame(games_data)
+        df = pd.DataFrame(games_data)
+        print(f"✅ Successfully processed {len(df)} completed games")
+        if cache_path:
+            self._write_historical_cache(df, cache_path)
+        return df
+
+    def _write_historical_cache(self, df: pd.DataFrame, cache_path: str) -> None:
+        try:
+            resolved_path = ensure_local_write_path(cache_path) or cache_path
+            cache_dir = os.path.dirname(resolved_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            df.to_csv(resolved_path, index=False)
+            self.historical_cache_metadata = {'path': resolved_path, 'source': 'fresh', 'rows': len(df)}
+            print(f"💾 Cached {len(df)} historical rows to {resolved_path}")
+        except Exception as e:
+            print(f"⚠️  Failed to write historical cache {cache_path}: {e}")
+
+    def _extract_boxscore_stats(
+        self,
+        game_id: Optional[int],
+        home_abbr: Optional[str],
+        away_abbr: Optional[str]
+    ) -> Dict[str, Any]:
+        """Fetch and parse NHL boxscore stats for richer historical features."""
+        if game_id is None:
+            return {}
+        boxscore = self.data_fetcher.get_game_stats(game_id)
+        if not isinstance(boxscore, dict):
+            return {}
+
+        def _team_stats(block: Dict[str, Any]) -> Dict[str, Any]:
+            stats = {}
+            candidates = [
+                block,
+                block.get('teamStats', {}),
+                block.get('teamStats', {}).get('skaterStats', {})
+            ]
+            for obj in candidates:
+                if not isinstance(obj, dict):
+                    continue
+                stats.update({k: v for k, v in obj.items() if k not in stats})
+            return stats
+
+        def _value(obj: Dict[str, Any], keys: List[str]) -> Optional[float]:
+            for key in keys:
+                if key in obj and isinstance(obj[key], (int, float)):
+                    return float(obj[key])
+            return None
+
+        home_block = boxscore.get('homeTeam', {})
+        away_block = boxscore.get('awayTeam', {})
+        home_stats = _team_stats(home_block)
+        away_stats = _team_stats(away_block)
+
+        def _goalie_name(block: Dict[str, Any]) -> Optional[str]:
+            goalies = block.get('goalies') or block.get('players') or []
+            if isinstance(goalies, dict):
+                goalies = list(goalies.values())
+            primary = None
+            if isinstance(goalies, list):
+                for goalie in goalies:
+                    if not isinstance(goalie, dict):
+                        continue
+                    primary = goalie
+                    if goalie.get('decision') in ('W', 'L'):
+                        break
+            if isinstance(primary, dict):
+                for key in ['fullName', 'firstInitLastName', 'lastName', 'name']:
+                    if primary.get(key):
+                        return str(primary[key])
+            return None
+
+        home_shots = _value(home_stats, ['sog', 'shots', 'shotsOnGoal'])
+        away_shots = _value(away_stats, ['sog', 'shots', 'shotsOnGoal'])
+        home_pp_goals = _value(home_stats, ['powerPlayGoals', 'ppGoals'])
+        away_pp_goals = _value(away_stats, ['powerPlayGoals', 'ppGoals'])
+        home_pp_opps = _value(home_stats, ['powerPlayOpportunities', 'ppOpportunities'])
+        away_pp_opps = _value(away_stats, ['powerPlayOpportunities', 'ppOpportunities'])
+
+        result = {
+            'home_shots': int(home_shots) if isinstance(home_shots, (int, float)) else None,
+            'away_shots': int(away_shots) if isinstance(away_shots, (int, float)) else None,
+            'home_pp_goals': int(home_pp_goals) if isinstance(home_pp_goals, (int, float)) else None,
+            'away_pp_goals': int(away_pp_goals) if isinstance(away_pp_goals, (int, float)) else None,
+            'home_pp_opps': int(home_pp_opps) if isinstance(home_pp_opps, (int, float)) else None,
+            'away_pp_opps': int(away_pp_opps) if isinstance(away_pp_opps, (int, float)) else None,
+            'home_goalie': _goalie_name(home_block),
+            'away_goalie': _goalie_name(away_block)
+        }
+        return {k: v for k, v in result.items() if v is not None}
+
+    def _fallback_game_stats(self, home_goals: int, away_goals: int) -> Dict[str, Any]:
+        """Fallback stats used when boxscore data is unavailable."""
+        return {
+            'home_shots': max(20, int(np.random.normal(32, 4))),
+            'away_shots': max(20, int(np.random.normal(30, 4))),
+            'home_pp_goals': min(home_goals, max(0, int(np.random.poisson(0.7)))),
+            'away_pp_goals': min(away_goals, max(0, int(np.random.poisson(0.7)))),
+            'home_pp_opps': max(1, int(np.random.poisson(3.0))),
+            'away_pp_opps': max(1, int(np.random.poisson(3.0)))
+        }
     
     def create_realistic_sample_data(self) -> pd.DataFrame:
         """Create realistic sample data based on current NHL trends"""
@@ -2601,7 +2782,130 @@ class RealDataNHLModel:
                 else:
                     features[col] = features[col].fillna(0.0)
         
+        features = self._merge_context_snapshots(features)
         return features
+
+    def _merge_context_snapshots(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Blend MoneyPuck/team context snapshots into historical rows."""
+        if not isinstance(features, pd.DataFrame) or features.empty:
+            return features
+        df = features
+
+        # Team-level advanced rates (MoneyPuck) to backfill proxies
+        if isinstance(self.team_rates_snapshot, pd.DataFrame) and 'team' in self.team_rates_snapshot.columns:
+            tr = self.team_rates_snapshot.dropna(subset=['team']).copy()
+            tr = tr.groupby('team', as_index=True).first()
+            mapping = {
+                'xgf60_5v5': ['home_5v5_xgf60', 'away_5v5_xgf60'],
+                'hdcf60_5v5': ['home_5v5_hdcf60', 'away_5v5_hdcf60'],
+                'pp_xgf60': ['home_pp_xgf60', 'away_pp_xgf60'],
+                'pk_xga60': ['home_pk_xga60', 'away_pk_xga60']
+            }
+            for metric, cols in mapping.items():
+                if metric not in tr.columns:
+                    continue
+                for col in cols:
+                    team_col = 'home_team' if col.startswith('home_') else 'away_team'
+                    if col not in df.columns:
+                        df[col] = np.nan
+                    df[col] = df[col].fillna(df[team_col].map(tr[metric]))
+
+        # Penalty rates snapshot -> aggregate per matchup
+        if isinstance(self.penalty_rates_snapshot, pd.DataFrame) and 'team' in self.penalty_rates_snapshot.columns:
+            pr = self.penalty_rates_snapshot.dropna(subset=['team']).set_index('team')
+            def _agg_penalty(metric: str) -> pd.Series:
+                vals: List[float] = []
+                for _, row in df[['home_team', 'away_team']].iterrows():
+                    ht = str(row['home_team']).upper()
+                    at = str(row['away_team']).upper()
+                    hv = pr[metric].get(ht) if ht in pr.index else np.nan
+                    av = pr[metric].get(at) if at in pr.index else np.nan
+                    if pd.notna(hv) and pd.notna(av):
+                        vals.append(float(hv) + float(av))
+                    else:
+                        vals.append(np.nan)
+                return pd.Series(vals, index=df.index)
+            for metric in ['penalties_drawn60', 'penalties_taken60']:
+                if metric in pr.columns:
+                    series = _agg_penalty(metric)
+                    if metric not in df.columns:
+                        df[metric] = series
+                    else:
+                        df[metric] = df[metric].fillna(series)
+
+        # Goalie snapshots: fill team-level GSAx/probability placeholders
+        if isinstance(self.goalie_rates_snapshot, pd.DataFrame) and {'team', 'gsax_rolling'}.issubset(self.goalie_rates_snapshot.columns):
+            gdf = self.goalie_rates_snapshot.dropna(subset=['team']).copy()
+            team_gsax = gdf.groupby('team')['gsax_rolling'].mean()
+            team_prob = gdf.groupby('team')['prob_start'].mean() if 'prob_start' in gdf.columns else None
+            for prefix, team_col in [('home', 'home_team'), ('away', 'away_team')]:
+                gsax_col = f'{prefix}_goalie_gsax'
+                prob_col = f'{prefix}_goalie_prob'
+                fallback_gsax = df[team_col].map(team_gsax).fillna(0.0)
+                if gsax_col not in df.columns:
+                    df[gsax_col] = fallback_gsax
+                else:
+                    df[gsax_col] = df[gsax_col].replace(0.0, np.nan).fillna(fallback_gsax)
+                if team_prob is not None:
+                    fallback_prob = df[team_col].map(team_prob).fillna(0.6)
+                    if prob_col not in df.columns:
+                        df[prob_col] = fallback_prob
+                    else:
+                        df[prob_col] = df[prob_col].replace(0.0, np.nan).fillna(fallback_prob)
+
+        # Referee snapshot -> baseline scoring tendency
+        if isinstance(self.referee_rates_snapshot, pd.DataFrame):
+            ref_goals = pd.to_numeric(self.referee_rates_snapshot.get('goals_gm'), errors='coerce')
+            if len(ref_goals.dropna()):
+                baseline = float(ref_goals.dropna().mean())
+                if 'ref_goals_gm' not in df.columns:
+                    df['ref_goals_gm'] = baseline
+                else:
+                    df['ref_goals_gm'] = df['ref_goals_gm'].fillna(baseline)
+
+        # Lineup strength snapshot
+        if isinstance(self.lineup_strength_snapshot, dict) and self.lineup_strength_snapshot:
+            for prefix, team_col in [('home', 'home_team'), ('away', 'away_team')]:
+                col = f'{prefix}_lineup_strength'
+                series = df[team_col].map(self.lineup_strength_snapshot)
+                if col not in df.columns:
+                    df[col] = series
+                else:
+                    df[col] = df[col].fillna(series)
+
+        # Environment snapshot (outdoor/weather)
+        if isinstance(self.environment_snapshot, dict) and self.environment_snapshot:
+            env_cols = {
+                'outdoor': 'env_outdoor',
+                'start_hour_local': 'env_start_hour',
+                'temp_f': 'env_temp_f',
+                'wind_mph': 'env_wind_mph'
+            }
+            env_rows: List[Dict[str, Any]] = []
+            for _, row in df[['game_id', 'home_team', 'away_team']].iterrows():
+                keys = []
+                gid = row.get('game_id')
+                if pd.notna(gid):
+                    keys.append(str(gid))
+                keys.append(f"{row['away_team']}@{row['home_team']}")
+                record = None
+                for key in keys:
+                    if key in self.environment_snapshot:
+                        record = self.environment_snapshot[key]
+                        break
+                env_rows.append(record or {})
+            env_df = pd.DataFrame(env_rows)
+            if not env_df.empty:
+                for src, dest in env_cols.items():
+                    series = pd.to_numeric(env_df.get(src), errors='coerce') if src in env_df.columns else pd.Series(np.nan, index=df.index)
+                    if src == 'outdoor':
+                        series = series.fillna(0).astype(int)
+                    if dest not in df.columns:
+                        df[dest] = series
+                    else:
+                        df[dest] = df[dest].fillna(series)
+
+        return df
 
     def train_goal_models(self, enhanced_df: pd.DataFrame) -> None:
         """Train Poisson regression models for home and away goals using current feature set."""
@@ -3208,6 +3512,7 @@ class RealDataNHLModel:
             'home_3in4','away_3in4','home_4in6','away_4in6',
             'home_home_streak','away_home_streak','home_road_trip_len','away_road_trip_len',
             'hour_local','is_weekend','is_early','is_late','travel_direction_ew',
+            'home_lineup_strength','away_lineup_strength',
             # Advanced stats and EWM variants
             'home_5v5_xgf60', 'away_5v5_xgf60', 'home_5v5_hdcf60', 'away_5v5_hdcf60',
             'home_pp_xgf60', 'away_pp_xgf60', 'home_pk_xga60', 'away_pk_xga60',
@@ -3222,7 +3527,9 @@ class RealDataNHLModel:
             # Goalie context
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
-            'skater_goalie_edge'
+            'skater_goalie_edge',
+            # Environment overlays
+            'env_outdoor','env_start_hour','env_temp_f','env_wind_mph'
         ]
         # Add rink bias proxy and penalties
         extra_optional = [
@@ -6895,6 +7202,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
     try:
         model = RealDataNHLModel()
 
+        context_kwargs = {
+            'team_rates_path': getattr(cli_args, 'team_rates_path', None) if cli_args else None,
+            'goalie_gsax_path': getattr(cli_args, 'goalie_gsax_path', None) if cli_args else None,
+            'penalty_rates_path': getattr(cli_args, 'penalty_rates_path', None) if cli_args else None,
+            'referee_rates_path': getattr(cli_args, 'referee_rates_path', None) if cli_args else None,
+            'lineup_path': getattr(cli_args, 'lineup_path', None) if cli_args else None,
+            'environment_path': getattr(cli_args, 'environment_path', None) if cli_args else None
+        }
+        model.hydrate_training_context(**context_kwargs)
+
         if cli_args and getattr(cli_args, 'refresh_moneypuck', False):
             print("\n🧰 Refreshing MoneyPuck data before loading rate tables...")
             try:
@@ -6970,11 +7287,24 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         print("\n📊 Step 1: Fetching historical NHL data...")
         print("🔄 Trying multiple data sources...")
         
-        historical_data = model.fetch_historical_games(days_back=38)
+        hist_days = int(getattr(cli_args, 'historical_days', 90)) if cli_args else 90
+        cache_path = getattr(cli_args, 'historical_cache_path', None) if cli_args else None
+        cache_refresh = bool(getattr(cli_args, 'historical_cache_refresh', False)) if cli_args else False
+        
+        historical_data = model.fetch_historical_games(
+            days_back=hist_days,
+            cache_path=cache_path,
+            force_refresh=cache_refresh
+        )
         
         if len(historical_data) < 20:
-            print(f"⚠️  Limited data ({len(historical_data)} games). Trying extended range...")
-            historical_data = model.fetch_historical_games(days_back=90)
+            extended_days = max(hist_days * 2, 120)
+            print(f"⚠️  Limited data ({len(historical_data)} games). Trying extended range ({extended_days} days)...")
+            historical_data = model.fetch_historical_games(
+                days_back=extended_days,
+                cache_path=cache_path,
+                force_refresh=True
+            )
         
         if len(historical_data) < 10:
             print("⚠️  Still limited data. Using enhanced sample data...")
@@ -8247,6 +8577,9 @@ if __name__ == "__main__":
     parser.add_argument('--post-social', action='store_true', help='Enable social media posting')
     parser.add_argument('--date', type=str, default=None, help='ISO date YYYY-MM-DD for which to fetch/predict games (default: today)')
     parser.add_argument('--today-games-path', type=str, default=None, help='Path to offline today games JSON to bypass API')
+    parser.add_argument('--historical-days', type=int, default=int(os.getenv('HISTORICAL_DAYS', '90')), help='How many days of history to pull for training data')
+    parser.add_argument('--historical-cache-path', type=str, default=os.getenv('HISTORICAL_CACHE_PATH', 'data/history/historical_games.csv'), help='CSV cache for historical games')
+    parser.add_argument('--historical-cache-refresh', action='store_true', help='Force refresh of historical cache even if it exists')
     parser.add_argument('--offline', action='store_true', help='Use offline today games if provided and skip API calls')
     parser.add_argument('--realtime-odds', action='store_true', help='Fetch realtime totals odds from an external API (requires ODDS_API_KEY)')
     parser.add_argument('--odds-regions', type=str, default='us', help='Comma-separated odds regions (use "all" for every Odds API region)')
