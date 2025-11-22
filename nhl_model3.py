@@ -6970,7 +6970,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         print("\n📊 Step 1: Fetching historical NHL data...")
         print("🔄 Trying multiple data sources...")
         
-        historical_data = model.fetch_historical_games(days_back=38)
+        historical_data = model.fetch_historical_games(days_back=414)
         
         if len(historical_data) < 20:
             print(f"⚠️  Limited data ({len(historical_data)} games). Trying extended range...")
