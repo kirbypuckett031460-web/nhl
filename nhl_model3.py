@@ -2283,6 +2283,17 @@ class RealDataNHLModel:
         print("Creating enhanced features from NHL data...")
         features = features.sort_values(['date']).reset_index(drop=True)
 
+        # Ensure critical counting stats exist even if upstream feeds omit them
+        default_count_cols = {
+            'home_pp_goals': 0.0,
+            'away_pp_goals': 0.0,
+            'home_pp_opps': 0.0,
+            'away_pp_opps': 0.0,
+        }
+        for col, default in default_count_cols.items():
+            if col not in features.columns:
+                features[col] = default
+
         # Helper utilities for leak-free, vectorized rolling calculations
         def lagged_rolling_mean(group_col: str, value_col: str, window: int, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
             if value_col not in features.columns:
