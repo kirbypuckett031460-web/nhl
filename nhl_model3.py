@@ -7287,15 +7287,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         print("\n📊 Step 1: Fetching historical NHL data...")
         print("🔄 Trying multiple data sources...")
         
-        hist_days = int(getattr(cli_args, 'historical_days', 90)) if cli_args else 90
-        cache_path = getattr(cli_args, 'historical_cache_path', None) if cli_args else None
-        cache_refresh = bool(getattr(cli_args, 'historical_cache_refresh', False)) if cli_args else False
-        
-        historical_data = model.fetch_historical_games(
-            days_back=hist_days,
-            cache_path=cache_path,
-            force_refresh=cache_refresh
-        )
+        historical_data = model.fetch_historical_games(days_back=414)
         
         if len(historical_data) < 20:
             extended_days = max(hist_days * 2, 120)
