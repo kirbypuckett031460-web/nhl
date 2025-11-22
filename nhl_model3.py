@@ -29,6 +29,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
 from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss
+from sklearn.impute import SimpleImputer
 import warnings
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Optional, Set, Any
@@ -1495,6 +1496,7 @@ class RealDataNHLModel:
     def _build_feature_pipeline(self) -> Pipeline:
         """Return a fresh feature transformation pipeline."""
         return Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler())
         ])
 
@@ -3634,6 +3636,7 @@ class RealDataNHLModel:
         # Hyperparameter spaces (kept compact for speed)
         def make_model_pipeline(estimator):
             return Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
                 ('scaler', StandardScaler()),
                 ('model', estimator)
             ])
