@@ -34,6 +34,17 @@ Command-line options
 - --team-rates-url / --goalie-gsax-url / --penalties-url / --referees-url: Source URLs for auto-populate
 - --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
 - --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
+- --train-speed: Choose `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
+- --fast-train: Shortcut for `--train-speed fast`
+- --max-train-samples: Cap how many historical games are used for training (useful for fast experimentation)
+
+Faster training presets
+-----------------------
+
+- `balanced` trims the RandomizedSearch grid, scales down rolling-origin splits, and still runs walk-forward checks—this replaces the previous "full" default to cut runtimes ~40–60%.
+- `fast` further caps the training sample (600 games by default), skips stacking weight recalibration and walk-forward validation, and reduces each model search to two iterations for sub-10-minute runs.
+- `full` preserves the original exhaustive workflow (long rolling CV, eight-iteration searches, and walk-forward auditing).
+- You can also set `TRAIN_SPEED=fast|balanced|full` and optionally `MAX_TRAIN_SAMPLES=<N>` via environment variables for automation.
 
 Risk/edge feedback loop
 -----------------------

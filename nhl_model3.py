@@ -401,6 +401,83 @@ TEAM_ABBREV_TO_NAME: Dict[str, str] = {
     'WSH': 'Washington Capitals'
 }
 
+TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
+    'full': {
+        'label': 'Full search',
+        'rf_estimators': [200, 320, 450],
+        'rf_max_depth': [10, 14, 18, None],
+        'rf_min_samples_leaf': [1, 2, 3],
+        'rf_iter': 8,
+        'gb_estimators': [200, 300, 400],
+        'gb_learning_rate': [0.03, 0.05, 0.08, 0.1],
+        'gb_max_depth': [2, 3, 4],
+        'gb_iter': 8,
+        'hgb_learning_rate': [0.03, 0.05, 0.08, 0.1],
+        'hgb_max_iter': [250, 325, 400],
+        'hgb_max_depth': [None, 3, 5, 7],
+        'hgb_min_samples_leaf': [10, 15, 20, 30],
+        'hgb_l2_regularization': [0.0, 0.1, 0.3, 0.6],
+        'hgb_iter': 8,
+        'ridge_alphas': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+        'ridge_iter': 6,
+        'use_rolling_origin': True,
+        'cv_scale': 1.0,
+        'learn_weights': True,
+        'walk_forward': True,
+        'default_weights': [0.32, 0.28, 0.20, 0.20]
+    },
+    'balanced': {
+        'label': 'Balanced (default)',
+        'rf_estimators': [150, 240, 340],
+        'rf_max_depth': [8, 12, None],
+        'rf_min_samples_leaf': [1, 2],
+        'rf_iter': 5,
+        'gb_estimators': [150, 225, 300],
+        'gb_learning_rate': [0.04, 0.06, 0.08],
+        'gb_max_depth': [2, 3],
+        'gb_iter': 5,
+        'hgb_learning_rate': [0.04, 0.06, 0.08],
+        'hgb_max_iter': [200, 280, 340],
+        'hgb_max_depth': [None, 3, 5],
+        'hgb_min_samples_leaf': [12, 18, 24],
+        'hgb_l2_regularization': [0.0, 0.2, 0.4],
+        'hgb_iter': 5,
+        'ridge_alphas': [0.2, 0.5, 1.0, 2.0, 4.0],
+        'ridge_iter': 5,
+        'use_rolling_origin': True,
+        'cv_scale': 0.85,
+        'learn_weights': True,
+        'walk_forward': True,
+        'default_weights': [0.34, 0.28, 0.20, 0.18]
+    },
+    'fast': {
+        'label': 'Fast',
+        'rf_estimators': [120, 200, 260],
+        'rf_max_depth': [6, 10, None],
+        'rf_min_samples_leaf': [2, 3],
+        'rf_iter': 2,
+        'gb_estimators': [120, 180],
+        'gb_learning_rate': [0.05, 0.08, 0.12],
+        'gb_max_depth': [2, 3],
+        'gb_iter': 2,
+        'hgb_learning_rate': [0.05, 0.08],
+        'hgb_max_iter': [160, 220],
+        'hgb_max_depth': [None, 3, 5],
+        'hgb_min_samples_leaf': [15, 25],
+        'hgb_l2_regularization': [0.0, 0.2, 0.5],
+        'hgb_iter': 2,
+        'ridge_alphas': [0.5, 1.0, 2.0],
+        'ridge_iter': 3,
+        'use_rolling_origin': False,
+        'tss_splits': 3,
+        'cv_scale': 0.6,
+        'learn_weights': False,
+        'walk_forward': False,
+        'default_weights': [0.4, 0.35, 0.15, 0.10],
+        'auto_sample_cap': 600
+    }
+}
+
 TEAM_NAME_TO_ABBREV: Dict[str, str] = {name.upper(): abbr for abbr, name in TEAM_ABBREV_TO_NAME.items()}
 
 def _normalize_team_abbreviation(team: Optional[str]) -> str:
@@ -1494,6 +1571,15 @@ class RealDataNHLModel:
         self.lineup_strength_snapshot: Optional[Dict[str, float]] = None
         self.environment_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
         self.historical_cache_metadata: Dict[str, Any] = {}
+        profile = str(os.getenv('TRAIN_SPEED', 'balanced')).strip().lower()
+        if profile not in TRAIN_SPEED_PRESETS:
+            profile = 'balanced'
+        self.train_speed_profile: str = profile
+        try:
+            env_cap = int(os.getenv('MAX_TRAIN_SAMPLES', '0'))
+            self.max_train_samples: Optional[int] = env_cap if env_cap > 0 else None
+        except Exception:
+            self.max_train_samples = None
 
     def _build_feature_pipeline(self) -> Pipeline:
         """Return a fresh feature transformation pipeline."""
@@ -2959,13 +3045,20 @@ class RealDataNHLModel:
             print("✅ Trained Poisson goal models (home and away)")
             # Train conditional neural flow (multi-output MLP) for home/away goals
             try:
+                speed_profile = getattr(self, 'train_speed_profile', 'balanced')
+                if speed_profile == 'fast':
+                    flow_max_iter = 150
+                elif speed_profile == 'balanced':
+                    flow_max_iter = 300
+                else:
+                    flow_max_iter = 500
                 flow_model = MLPRegressor(
                     hidden_layer_sizes=(128, 64),
                     activation='relu',
                     solver='adam',
                     alpha=1e-4,
                     learning_rate_init=0.001,
-                    max_iter=500,
+                    max_iter=flow_max_iter,
                     random_state=42
                 )
                 y_targets = np.column_stack([y_home.values, y_away.values])
@@ -3609,6 +3702,32 @@ class RealDataNHLModel:
     
     def train_model(self, X: pd.DataFrame, y: pd.Series, dates: Optional[pd.Series] = None) -> Dict:
         """Train the over/under prediction model with time-series split and residual calibration"""
+        speed_profile = getattr(self, 'train_speed_profile', 'balanced') or 'balanced'
+        speed_profile = speed_profile.lower()
+        if speed_profile not in TRAIN_SPEED_PRESETS:
+            speed_profile = 'balanced'
+        self.train_speed_profile = speed_profile
+        speed_cfg = TRAIN_SPEED_PRESETS[speed_profile]
+        print(f"⏱️ Training preset: {speed_cfg.get('label', speed_profile.title())}")
+        # Optional sample cap for faster presets
+        original_len = len(X)
+        sample_cap = self.max_train_samples
+        applied_sample_cap: Optional[int] = None
+        auto_cap = speed_cfg.get('auto_sample_cap')
+        if sample_cap is None and auto_cap:
+            sample_cap = auto_cap
+        if sample_cap is not None and sample_cap > 0 and len(X) > sample_cap:
+            trim_start = max(0, original_len - sample_cap)
+            print(f"⚡ Trimming training set from {original_len} to last {sample_cap} games for speed")
+            idx = np.arange(trim_start, original_len)
+            X = X.iloc[idx].reset_index(drop=True)
+            y = y.iloc[idx].reset_index(drop=True)
+            if dates is not None:
+                if len(dates) == original_len:
+                    dates = dates.iloc[idx].reset_index(drop=True)
+                else:
+                    dates = dates.iloc[-len(X):].reset_index(drop=True)
+            applied_sample_cap = sample_cap
         
         if len(X) < 20:
             print("Warning: Very limited training data. Model performance may be poor.")
@@ -3637,18 +3756,28 @@ class RealDataNHLModel:
             X_train_scaled = X_train.values
             X_test_scaled = X_test.values
         
-        # Rolling-origin cross-validation setup for hyperparameter tuning
-        horizon_cv = max(6, min(40, len(X_train) // 6 if len(X_train) >= 36 else max(3, len(X_train) // 2)))
-        min_train_cv = max(horizon_cv * 2, int(len(X_train) * 0.4))
-        step_cv = max(2, horizon_cv // 2)
-        rolling_cv = self._rolling_origin_splits(len(X_train), min_train_cv, horizon_cv, step_cv)
-        if len(rolling_cv) >= 3:
-            cv_strategy: Any = rolling_cv
-            cv_label = f"rolling_origin_{len(rolling_cv)}"
+        # Rolling-origin/time-series cross-validation setup for hyperparameter tuning
+        base_horizon = max(6, min(40, len(X_train) // 6 if len(X_train) >= 36 else max(3, len(X_train) // 2)))
+        scaled_horizon = max(3, int(round(base_horizon * float(speed_cfg.get('cv_scale', 1.0)))))
+        scaled_horizon = min(scaled_horizon, max(3, len(X_train) - 1))
+        min_train_cv = max(scaled_horizon * 2, int(len(X_train) * 0.4))
+        step_cv = max(2, scaled_horizon // 2)
+        use_rolling = bool(speed_cfg.get('use_rolling_origin', True))
+        if use_rolling:
+            rolling_cv = self._rolling_origin_splits(len(X_train), min_train_cv, scaled_horizon, step_cv)
+            if len(rolling_cv) >= 3:
+                cv_strategy: Any = rolling_cv
+                cv_label = f"rolling_origin_{len(rolling_cv)}"
+            else:
+                n_splits = 4 if len(X_train) >= 60 else 3
+                n_splits = min(n_splits, max(2, len(X_train) - 1))
+                cv_strategy = TimeSeriesSplit(n_splits=n_splits)
+                cv_label = f"time_series_{n_splits}"
         else:
-            n_splits = 4 if len(X_train) >= 60 else 3
+            n_splits = int(speed_cfg.get('tss_splits', 3))
+            n_splits = max(2, min(n_splits, len(X_train) - 1))
             cv_strategy = TimeSeriesSplit(n_splits=n_splits)
-            cv_label = f"time_series_{n_splits}"
+            cv_label = f"fast_time_series_{n_splits}"
 
         # Hyperparameter spaces (kept compact for speed)
         def make_model_pipeline(estimator):
@@ -3660,24 +3789,26 @@ class RealDataNHLModel:
 
         rf_pipeline = make_model_pipeline(RandomForestRegressor(random_state=42))
         rf_params = {
-            'model__n_estimators': [150, 250, 350],
-            'model__max_depth': [8, 12, 16, None],
-            'model__min_samples_leaf': [1, 2, 3]
+            'model__n_estimators': speed_cfg['rf_estimators'],
+            'model__max_depth': speed_cfg['rf_max_depth'],
+            'model__min_samples_leaf': speed_cfg['rf_min_samples_leaf']
         }
+        rf_iter = int(speed_cfg.get('rf_iter', 6))
         rf_search = RandomizedSearchCV(
-            rf_pipeline, rf_params, n_iter=8, cv=cv_strategy, random_state=42,
+            rf_pipeline, rf_params, n_iter=rf_iter, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
         rf_search.fit(X_train, y_train)
 
         gb_pipeline = make_model_pipeline(GradientBoostingRegressor(random_state=42))
         gb_params = {
-            'model__n_estimators': [150, 250, 350],
-            'model__learning_rate': [0.03, 0.05, 0.08, 0.1],
-            'model__max_depth': [2, 3, 4]
+            'model__n_estimators': speed_cfg['gb_estimators'],
+            'model__learning_rate': speed_cfg['gb_learning_rate'],
+            'model__max_depth': speed_cfg['gb_max_depth']
         }
+        gb_iter = int(speed_cfg.get('gb_iter', 6))
         gb_search = RandomizedSearchCV(
-            gb_pipeline, gb_params, n_iter=8, cv=cv_strategy, random_state=42,
+            gb_pipeline, gb_params, n_iter=gb_iter, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
         gb_search.fit(X_train, y_train)
@@ -3688,22 +3819,25 @@ class RealDataNHLModel:
             loss='squared_error'
         ))
         hgb_params = {
-            'model__learning_rate': [0.03, 0.05, 0.08, 0.1],
-            'model__max_iter': [225, 275, 325, 375],
-            'model__max_depth': [None, 3, 5, 7],
-            'model__min_samples_leaf': [10, 15, 20, 30],
-            'model__l2_regularization': [0.0, 0.1, 0.3, 0.6]
+            'model__learning_rate': speed_cfg['hgb_learning_rate'],
+            'model__max_iter': speed_cfg['hgb_max_iter'],
+            'model__max_depth': speed_cfg['hgb_max_depth'],
+            'model__min_samples_leaf': speed_cfg['hgb_min_samples_leaf'],
+            'model__l2_regularization': speed_cfg['hgb_l2_regularization']
         }
+        hgb_iter = int(speed_cfg.get('hgb_iter', 6))
         hgb_search = RandomizedSearchCV(
-            hgb_pipeline, hgb_params, n_iter=8, cv=cv_strategy, random_state=42,
+            hgb_pipeline, hgb_params, n_iter=hgb_iter, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
         hgb_search.fit(X_train, y_train)
 
         ridge_pipeline = make_model_pipeline(Ridge())
-        ridge_params = {'model__alpha': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]}
+        ridge_params = {'model__alpha': speed_cfg['ridge_alphas']}
+        ridge_iter = int(speed_cfg.get('ridge_iter', len(ridge_params['model__alpha'])))
+        ridge_iter = max(1, min(ridge_iter, len(ridge_params['model__alpha'])))
         ridge_search = RandomizedSearchCV(
-            ridge_pipeline, ridge_params, n_iter=min(6, len(ridge_params['model__alpha'])), cv=cv_strategy, random_state=42,
+            ridge_pipeline, ridge_params, n_iter=ridge_iter, cv=cv_strategy, random_state=42,
             scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
         )
         ridge_search.fit(X_train, y_train)
@@ -3718,39 +3852,40 @@ class RealDataNHLModel:
         }
 
         # Learn stacking weights via OOF predictions across time-series splits
-        weights_array = np.array([0.32, 0.28, 0.20, 0.20], dtype=float)
-        try:
-            X_all = X_sorted
-            y_all = y_sorted
-            if len(X_all) >= 40:
-                tscv_w = TimeSeriesSplit(n_splits=min(5, max(3, len(X_all)//20)))
-                P = None
-                oof = {name: np.full(len(X_all), np.nan) for name in model_order}
-                for tr_idx, val_idx in tscv_w.split(X_all):
-                    X_tr_fold = X_all.iloc[tr_idx]
-                    y_tr_fold = y_all.iloc[tr_idx]
-                    X_val_fold = X_all.iloc[val_idx]
-                    for name in model_order:
-                        est = models[name]
-                        est_fold = clone(est)
-                        try:
-                            est_fold.fit(X_tr_fold, y_tr_fold)
-                            preds_fold = est_fold.predict(X_val_fold)
-                        except Exception:
-                            preds_fold = np.zeros(len(X_val_fold))
-                        oof[name][val_idx] = preds_fold
-                first_key = model_order[0]
-                valid = ~np.isnan(oof[first_key])
-                if valid.any():
-                    P = np.vstack([oof[name][valid] for name in model_order]).T
-                y_oof = y_all.iloc[valid].values
-                if P is not None and P.size:
-                    coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
-                    coefs = np.clip(coefs, 0.0, None)
-                    if coefs.sum() > 0:
-                        weights_array = coefs / coefs.sum()
-        except Exception:
-            pass
+        weights_array = np.array(speed_cfg.get('default_weights', [0.32, 0.28, 0.20, 0.20]), dtype=float)
+        if speed_cfg.get('learn_weights', True):
+            try:
+                X_all = X_sorted
+                y_all = y_sorted
+                if len(X_all) >= 40:
+                    tscv_w = TimeSeriesSplit(n_splits=min(5, max(3, len(X_all)//20)))
+                    P = None
+                    oof = {name: np.full(len(X_all), np.nan) for name in model_order}
+                    for tr_idx, val_idx in tscv_w.split(X_all):
+                        X_tr_fold = X_all.iloc[tr_idx]
+                        y_tr_fold = y_all.iloc[tr_idx]
+                        X_val_fold = X_all.iloc[val_idx]
+                        for name in model_order:
+                            est = models[name]
+                            est_fold = clone(est)
+                            try:
+                                est_fold.fit(X_tr_fold, y_tr_fold)
+                                preds_fold = est_fold.predict(X_val_fold)
+                            except Exception:
+                                preds_fold = np.zeros(len(X_val_fold))
+                            oof[name][val_idx] = preds_fold
+                    first_key = model_order[0]
+                    valid = ~np.isnan(oof[first_key])
+                    if valid.any():
+                        P = np.vstack([oof[name][valid] for name in model_order]).T
+                    y_oof = y_all.iloc[valid].values
+                    if P is not None and P.size:
+                        coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
+                        coefs = np.clip(coefs, 0.0, None)
+                        if coefs.sum() > 0:
+                            weights_array = coefs / coefs.sum()
+            except Exception:
+                pass
         if not np.isfinite(weights_array).all() or weights_array.sum() <= 0:
             weights_array = np.ones(len(model_order), dtype=float) / len(model_order)
         else:
@@ -3811,23 +3946,28 @@ class RealDataNHLModel:
             'poisson_model': poisson_model,
             'nb_params': nb_params,
             'gp_model': gp_model,
-            'cv_strategy_used': cv_label
+            'cv_strategy_used': cv_label,
+            'train_speed_profile': speed_profile,
+            'train_sample_cap': applied_sample_cap
         }
-        walk_horizon = max(6, min(40, len(X_sorted) // 8 if len(X_sorted) >= 80 else max(4, len(X_sorted) // 4)))
-        walk_step = max(2, walk_horizon // 2)
-        walk_min_train = max(walk_horizon * 2, len(X_sorted) // 3)
-        walk_metrics = self._walk_forward_backtest(
-            X_sorted,
-            y_sorted,
-            trained_models,
-            weights_array,
-            walk_min_train,
-            walk_horizon,
-            walk_step
-        )
-        if walk_metrics:
-            self.total_model['walk_forward_metrics'] = walk_metrics
-            print(f"Walk-forward RMSE {walk_metrics['rmse']:.3f} (splits={walk_metrics.get('splits_evaluated', 0)})")
+        walk_metrics: Dict[str, Any] = {}
+        if speed_cfg.get('walk_forward', True):
+            walk_horizon = max(6, min(40, len(X_sorted) // 8 if len(X_sorted) >= 80 else max(4, len(X_sorted) // 4)))
+            walk_horizon = max(4, int(round(walk_horizon * float(speed_cfg.get('cv_scale', 1.0)))))
+            walk_step = max(2, walk_horizon // 2)
+            walk_min_train = max(walk_horizon * 2, len(X_sorted) // 3)
+            walk_metrics = self._walk_forward_backtest(
+                X_sorted,
+                y_sorted,
+                trained_models,
+                weights_array,
+                walk_min_train,
+                walk_horizon,
+                walk_step
+            )
+            if walk_metrics:
+                self.total_model['walk_forward_metrics'] = walk_metrics
+                print(f"Walk-forward RMSE {walk_metrics['rmse']:.3f} (splits={walk_metrics.get('splits_evaluated', 0)})")
         
         # Calculate metrics and residual-based uncertainty (plus conformal radius)
         rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred))
@@ -7234,6 +7374,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
     
     try:
         model = RealDataNHLModel()
+        if cli_args:
+            requested_speed = getattr(cli_args, 'train_speed', model.train_speed_profile)
+            if getattr(cli_args, 'fast_train', False):
+                requested_speed = 'fast'
+            requested_speed = str(requested_speed or '').strip().lower()
+            if requested_speed in TRAIN_SPEED_PRESETS:
+                model.train_speed_profile = requested_speed
+        print(f"🚦 Training speed preset: {model.train_speed_profile}")
+        if cli_args:
+            max_samples_arg = getattr(cli_args, 'max_train_samples', 0) or 0
+            if max_samples_arg and max_samples_arg > 0:
+                model.max_train_samples = max_samples_arg
+                print(f"📉 Max training samples capped at {max_samples_arg}")
 
         context_kwargs = {
             'team_rates_path': getattr(cli_args, 'team_rates_path', None) if cli_args else None,
@@ -8620,6 +8773,12 @@ if __name__ == "__main__":
     parser.add_argument('--historical-days', type=int, default=int(os.getenv('HISTORICAL_DAYS', '90')), help='How many days of history to pull for training data')
     parser.add_argument('--historical-cache-path', type=str, default=os.getenv('HISTORICAL_CACHE_PATH', 'data/history/historical_games.csv'), help='CSV cache for historical games')
     parser.add_argument('--historical-cache-refresh', action='store_true', help='Force refresh of historical cache even if it exists')
+    default_train_speed = str(os.getenv('TRAIN_SPEED', 'balanced')).strip().lower()
+    if default_train_speed not in TRAIN_SPEED_PRESETS:
+        default_train_speed = 'balanced'
+    parser.add_argument('--train-speed', choices=['fast','balanced','full'], default=default_train_speed, help='Training speed preset: fast trims CV + samples, balanced is default, full matches legacy exhaustive search')
+    parser.add_argument('--fast-train', action='store_true', help='Shortcut for --train-speed fast')
+    parser.add_argument('--max-train-samples', type=int, default=int(os.getenv('MAX_TRAIN_SAMPLES', '0')), help='Cap how many historical games are used for training (0 = no cap)')
     parser.add_argument('--offline', action='store_true', help='Use offline today games if provided and skip API calls')
     parser.add_argument('--realtime-odds', action='store_true', help='Fetch realtime totals odds from an external API (requires ODDS_API_KEY)')
     parser.add_argument('--odds-regions', type=str, default='us', help='Comma-separated odds regions (use "all" for every Odds API region)')
