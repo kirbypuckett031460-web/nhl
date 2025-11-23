@@ -346,6 +346,8 @@ class OverUnderPrediction:
     consensus_total: Optional[float] = None
     best_side_total: Optional[float] = None
     line_diff: Optional[float] = None
+    decision_line: Optional[float] = None
+    decision_side: Optional[str] = None
     # Best price book names
     best_over_book: Optional[str] = None
     best_under_book: Optional[str] = None
@@ -4179,6 +4181,11 @@ class RealDataNHLModel:
         
         # Calculate probabilities with calibrated uncertainty and push handling
         edge = predicted_total - betting_line
+        try:
+            decision_line_value: Optional[float] = float(betting_line)
+        except Exception:
+            decision_line_value = None
+        line_decision_side: Optional[str] = None
 
         def american_to_decimal(american: int) -> float:
             if american >= 100:
@@ -4325,6 +4332,13 @@ class RealDataNHLModel:
             over_prob /= total_prob
             under_prob /= total_prob
             push_prob /= total_prob
+        tolerance = float(getattr(self, 'line_decision_tolerance', 1e-4))
+        if edge > tolerance:
+            line_decision_side = 'OVER'
+        elif edge < -tolerance:
+            line_decision_side = 'UNDER'
+        else:
+            line_decision_side = 'OVER' if over_prob >= under_prob else 'UNDER'
 
         # Market implied and no-vig fair probabilities
         def american_to_decimal(american: int) -> float:
@@ -4433,6 +4447,12 @@ class RealDataNHLModel:
                 else:
                     recommendation = 'OVER' if edge >= 0 else 'UNDER'
             kelly_size = 0.0
+        if recommendation in ('OVER', 'UNDER') and line_decision_side and recommendation != line_decision_side:
+            forced_pick = True
+            if not forced_reason:
+                forced_reason = 'line_comparison_guard'
+            recommendation = line_decision_side
+            kelly_size = 0.0
         
         # Confidence score
         conf_base = 0.5 + abs(edge) * 0.15 + (max(over_prob, under_prob) - 0.5) * 0.8
@@ -4474,6 +4494,7 @@ class RealDataNHLModel:
             odds_source=odds_source,
             ev_over_novig=ev_over_novig, ev_under_novig=ev_under_novig,
             consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff,
+            decision_line=decision_line_value, decision_side=line_decision_side,
             ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment,
             forced_recommendation=forced_pick, forced_reason=forced_reason
         )
