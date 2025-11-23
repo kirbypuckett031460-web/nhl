@@ -3016,9 +3016,20 @@ class RealDataNHLModel:
             return
         try:
             df = enhanced_df.dropna(subset=['home_goals','away_goals']).copy()
+            if df.empty:
+                print("⚠️  No completed games available for goal model training.")
+                return
             Xg = df[self.feature_names].copy()
-            self.goal_scaler = StandardScaler()
-            Xg_scaled = self.goal_scaler.fit_transform(Xg)
+            if Xg.empty:
+                print("⚠️  Goal feature matrix is empty; skipping goal model training.")
+                return
+            Xg = Xg.apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            goal_pipeline = Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
+                ('scaler', StandardScaler())
+            ])
+            self.goal_scaler = goal_pipeline
+            Xg_scaled = goal_pipeline.fit_transform(Xg)
             y_home = df['home_goals'].astype(float)
             y_away = df['away_goals'].astype(float)
             self.home_goal_mu_model = PoissonRegressor(alpha=0.5, max_iter=1000)
