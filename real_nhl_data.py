@@ -4,6 +4,8 @@ import json
 import time
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -22,6 +24,75 @@ except ImportError:
     BEAUTIFULSOUP_AVAILABLE = False
     print("BeautifulSoup not available. Web scraping will be disabled.")
 
+
+class GameStatsCache:
+    """
+    File-backed cache that stores up to a rolling year of NHL game stats so
+    repeated model runs only need to download the latest deltas.
+    """
+
+    def __init__(self, cache_dir: str = "data/cache", window_days: int = 365):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_csv = self.cache_dir / "nhl_games_cache.csv"
+        self.manifest_path = self.cache_dir / "nhl_games_manifest.json"
+        self.window_days = window_days
+
+    def load(self) -> pd.DataFrame:
+        if self.cache_csv.exists():
+            try:
+                df = pd.read_csv(self.cache_csv)
+                if "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"])
+                return df
+            except Exception:
+                return pd.DataFrame()
+        return pd.DataFrame()
+
+    def latest_cached_date(self, df: pd.DataFrame) -> Optional[datetime]:
+        if df.empty or "date" not in df.columns:
+            return None
+        return pd.to_datetime(df["date"]).max()
+
+    def trim_window(self, df: pd.DataFrame, reference_date: datetime) -> pd.DataFrame:
+        if df.empty or "date" not in df.columns:
+            return df
+        cutoff = pd.to_datetime(reference_date) - pd.Timedelta(days=self.window_days)
+        trimmed = df[df["date"] >= cutoff].copy()
+        return trimmed.reset_index(drop=True)
+
+    def merge(self, cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+        if cached.empty:
+            combined = fresh.copy()
+        elif fresh.empty:
+            combined = cached.copy()
+        else:
+            combined = pd.concat([cached, fresh], ignore_index=True)
+        if combined.empty:
+            return combined
+        # Deduplicate by core identifiers
+        subset_cols = [col for col in ["date", "home_team", "away_team"] if col in combined.columns]
+        if subset_cols:
+            combined = (
+                combined.sort_values("date")
+                .drop_duplicates(subset=subset_cols, keep="last")
+                .reset_index(drop=True)
+            )
+        return combined
+
+    def persist(self, df: pd.DataFrame) -> None:
+        df.to_csv(self.cache_csv, index=False)
+        has_dates = not df.empty and "date" in df.columns
+        manifest = {
+            "last_refresh": datetime.utcnow().isoformat(),
+            "rows": int(len(df)),
+            "min_date": df["date"].min().strftime("%Y-%m-%d") if has_dates else None,
+            "max_date": df["date"].max().strftime("%Y-%m-%d") if has_dates else None,
+            "window_days": self.window_days,
+        }
+        with open(self.manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2)
+
 class RealNHLDataCollector:
     def __init__(self):
         self.session = None
@@ -30,41 +101,90 @@ class RealNHLDataCollector:
             self.session.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
+        self.cache = GameStatsCache()
     
     def get_real_nhl_data(self, start_date='2024-10-10', end_date='2024-12-15', max_games=500):
         """
-        Main function to get real NHL data from multiple sources
+        Main function to get real NHL data from multiple sources with on-disk caching.
         """
         print("🏒 NHL Real Data Collector Starting...")
-        print(f"📅 Date Range: {start_date} to {end_date}")
-        
-        # Try multiple data sources in order of preference
+        print(f"📅 Requested Date Range: {start_date} to {end_date}")
+
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+        cached_df = self.cache.load()
+        cached_df = self.cache.trim_window(cached_df, end_dt)
+        latest_cached = self.cache.latest_cached_date(cached_df)
+
+        fetch_start_dt = start_dt
+        if latest_cached is not None:
+            fetch_start_dt = max(start_dt, latest_cached + timedelta(days=1))
+
         data_sources = [
             ("NHL Official API", self._get_from_nhl_api),
             ("ESPN API", self._get_from_espn_api),
             ("Local CSV", self._get_from_csv),
             ("Hockey Reference", self._get_from_hockey_reference),
         ]
-        
-        for source_name, source_func in data_sources:
-            try:
-                print(f"\n🔄 Trying {source_name}...")
-                df = source_func(start_date, end_date, max_games)
-                
-                if not df.empty and len(df) >= 10:  # Need at least 10 games
-                    print(f"✅ Success! Got {len(df)} games from {source_name}")
-                    df = self._clean_and_validate_data(df)
-                    return df
-                else:
-                    print(f"❌ {source_name} returned insufficient data")
-                    
-            except Exception as e:
-                print(f"❌ {source_name} failed: {str(e)[:100]}...")
-                continue
-        
-        # If all sources fail, return enhanced sample data
-        print("\n⚠️  All real data sources failed. Generating enhanced sample data...")
-        return self._create_enhanced_sample_data(max_games)
+
+        new_data = pd.DataFrame()
+        if fetch_start_dt <= end_dt:
+            effective_start = fetch_start_dt.strftime('%Y-%m-%d')
+            print(f"🗂️  Cache latest date: {latest_cached.strftime('%Y-%m-%d') if latest_cached else 'None'}")
+            print(f"📤 Fetching deltas starting {effective_start}...")
+            for source_name, source_func in data_sources:
+                try:
+                    print(f"\n🔄 Trying {source_name}...")
+                    df = source_func(effective_start, end_date, max_games)
+                    if not df.empty and len(df) >= 1:
+                        print(f"✅ Retrieved {len(df)} games from {source_name}")
+                        new_data = df
+                        break
+                    else:
+                        print(f"❌ {source_name} returned insufficient data")
+                except Exception as e:
+                    print(f"❌ {source_name} failed: {str(e)[:100]}...")
+                    continue
+        else:
+            print("🆗 Cache already includes requested date range. No download needed.")
+
+        if new_data.empty and cached_df.empty:
+            print("\n⚠️  All real data sources failed and cache is empty. Generating enhanced sample data...")
+            return self._create_enhanced_sample_data(max_games)
+
+        combined_df = self.cache.merge(cached_df, new_data)
+        combined_df = self._clean_and_validate_data(combined_df)
+        combined_df = self.cache.trim_window(combined_df, end_dt)
+
+        if not combined_df.empty:
+            self.cache.persist(combined_df)
+
+        filtered = combined_df[
+            (combined_df['date'] >= start_dt) & (combined_df['date'] <= end_dt)
+        ].copy() if not combined_df.empty else pd.DataFrame()
+
+        if filtered.empty:
+            print("\n⚠️  No games found in the requested window. Falling back to cache contents.")
+            filtered = combined_df.copy()
+
+        if filtered.empty:
+            print("\n⚠️  Cache contains no usable data. Generating enhanced sample data...")
+            return self._create_enhanced_sample_data(max_games)
+
+        filtered = filtered.sort_values('date')
+        if max_games and len(filtered) > max_games:
+            filtered = (
+                filtered.sort_values('date', ascending=False)
+                .head(max_games)
+                .sort_values('date')
+                .reset_index(drop=True)
+            )
+        else:
+            filtered = filtered.reset_index(drop=True)
+
+        print(f"📦 Returning {len(filtered)} games (cache + deltas).")
+        return filtered
     
     def _get_from_nhl_api(self, start_date, end_date, max_games):
         """Get data from NHL's official API"""
