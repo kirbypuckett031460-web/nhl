@@ -6650,60 +6650,65 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         if not referees_url_config and detected_referees_url:
             referees_url_config = detected_referees_url
 
-        # Independently refresh referees.csv if a path is provided, even without --auto-populate
-        try:
-            if referee_rates_path:
-                have_df = isinstance(referee_rates_fetched, pd.DataFrame) and not referee_rates_fetched.empty
-                rr: Optional[pd.DataFrame] = referee_rates_fetched if have_df else None
-                src_url = referees_url_config
-                if src_url:
-                    src_url, _, refreshed = ensure_fresh_referees_url(src_url)
-                    if refreshed and src_url:
-                        detected_referees_url = src_url
-                        referees_url_config = src_url
-                if not have_df:
-                    if not src_url:
-                        src_url, _, refreshed = ensure_fresh_referees_url(None)
+        should_refresh_referees = referee_primary_written_path is None
+
+        # Independently refresh referees.csv if a path is provided, even without --auto-populate.
+        if should_refresh_referees:
+            try:
+                if referee_rates_path:
+                    have_df = isinstance(referee_rates_fetched, pd.DataFrame) and not referee_rates_fetched.empty
+                    rr: Optional[pd.DataFrame] = referee_rates_fetched if have_df else None
+                    src_url = referees_url_config
+                    if src_url:
+                        src_url, _, refreshed = ensure_fresh_referees_url(src_url)
                         if refreshed and src_url:
                             detected_referees_url = src_url
                             referees_url_config = src_url
-                    if src_url:
-                        try:
-                            url_l = str(src_url).lower()
-                            if url_l.endswith('.csv'):
-                                rr = model.load_referee_rates(src_url)
-                            else:
-                                rr = model.scrape_referees_scoutingtherefs(src_url)
-                        except Exception:
-                            rr = None
-                    if rr is not None and not rr.empty:
-                        referee_rates_fetched = rr.copy()
-                        if 'matchup' in rr.columns:
-                            cached_referee_assignments_df = rr.copy()
-                        if src_url:
-                            detected_referees_url = src_url
-                            if not referees_url_config:
+                    if not have_df:
+                        if not src_url:
+                            src_url, _, refreshed = ensure_fresh_referees_url(None)
+                            if refreshed and src_url:
+                                detected_referees_url = src_url
                                 referees_url_config = src_url
-                        have_df = True
-                if have_df and isinstance(referee_rates_fetched, pd.DataFrame):
-                    if 'goals_gm' not in referee_rates_fetched.columns:
-                        referee_rates_fetched['goals_gm'] = 6.2
-                    write_targets = gather_referee_output_paths(referee_path_preference)
-                    written_paths = write_dataframe_to_paths(
-                        referee_rates_fetched,
-                        write_targets,
-                        success_msg="✅ Wrote referees",
-                        failure_msg="⚠️  Referee data fetched but could not write"
-                    )
-                    if written_paths:
-                        referee_primary_written_path = written_paths[0]
-                        referee_rates_path = referee_primary_written_path
-                    elif write_targets:
-                        print(f"⚠️  Referee data fetched but could not write to configured paths: {', '.join(write_targets)}")
-                else:
-                    print("⚠️  Referee data was not updated (empty result)")
-        except Exception as e:
-            print(f"⚠️  Referee update failed: {e}")
+                        if src_url:
+                            try:
+                                url_l = str(src_url).lower()
+                                if url_l.endswith('.csv'):
+                                    rr = model.load_referee_rates(src_url)
+                                else:
+                                    rr = model.scrape_referees_scoutingtherefs(src_url)
+                            except Exception:
+                                rr = None
+                        if rr is not None and not rr.empty:
+                            referee_rates_fetched = rr.copy()
+                            if 'matchup' in rr.columns:
+                                cached_referee_assignments_df = rr.copy()
+                            if src_url:
+                                detected_referees_url = src_url
+                                if not referees_url_config:
+                                    referees_url_config = src_url
+                            have_df = True
+                    if have_df and isinstance(referee_rates_fetched, pd.DataFrame):
+                        if 'goals_gm' not in referee_rates_fetched.columns:
+                            referee_rates_fetched['goals_gm'] = 6.2
+                        write_targets = gather_referee_output_paths(referee_path_preference)
+                        written_paths = write_dataframe_to_paths(
+                            referee_rates_fetched,
+                            write_targets,
+                            success_msg="✅ Wrote referees",
+                            failure_msg="⚠️  Referee data fetched but could not write"
+                        )
+                        if written_paths:
+                            referee_primary_written_path = written_paths[0]
+                            referee_rates_path = referee_primary_written_path
+                        elif write_targets:
+                            print(f"⚠️  Referee data fetched but could not write to configured paths: {', '.join(write_targets)}")
+                    else:
+                        print("⚠️  Referee data was not updated (empty result)")
+            except Exception as e:
+                print(f"⚠️  Referee update failed: {e}")
+        else:
+            print("ℹ️  Referee data already refreshed via auto-populate; skipping redundant write.")
 
         print("\n🔮 Step 5: Generating predictions...")
         predictions = []
