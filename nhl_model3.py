@@ -36,7 +36,7 @@ from typing import Dict, List, Tuple, Optional, Set, Any
 import io
 import csv
 import re
-from dataclasses import dataclass, field
+import hashlib
 import webbrowser
 import argparse
 import os
@@ -51,6 +51,17 @@ from pathlib import Path
 import inspect
 from scipy.stats import norm, poisson, nbinom
 from sklearn.isotonic import IsotonicRegression
+from nhl_model.common import (
+    OverUnderPrediction,
+    format_matchup_code,
+    format_matchup_display,
+    format_matchup_search_blob,
+    format_team_display,
+    get_team_abbreviation,
+    get_team_full_name,
+)
+from nhl_model.data_fetcher import NHLDataFetcher
+from nhl_model.social import SocialMediaPoster
 try:
     import pytz  # timezone handling
 except Exception:
@@ -61,53 +72,12 @@ try:
 except Exception:
     STATSMODELS_AVAILABLE = False
 
-# Optional imports for social media
-try:
-    import tweepy
-    TWITTER_AVAILABLE = True
-except ImportError:
-    TWITTER_AVAILABLE = False
-    print("⚠️  tweepy not installed. Twitter posting disabled.")
-
-try:
-    import discord
-    DISCORD_AVAILABLE = True
-except ImportError:
-    DISCORD_AVAILABLE = False
-    print("⚠️  discord.py not installed. Discord bot posting disabled.")
-
-# Optional tools to render HTML dashboard to an image
-try:
-    import imgkit  # requires wkhtmltoimage installed on system
-    IMGKIT_AVAILABLE = True
-except Exception:
-    IMGKIT_AVAILABLE = False
-
-try:
-    from html2image import Html2Image  # pure-python fallback (will download a browser engine on first run)
-    HTML2IMAGE_AVAILABLE = True
-except Exception:
-    HTML2IMAGE_AVAILABLE = False
-
 # Optional plotting library to build tweet-style image
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
 except Exception:
     MATPLOTLIB_AVAILABLE = False
-
-# Optional deployment libraries
-try:
-    import boto3
-    BOTO3_AVAILABLE = True
-except Exception:
-    BOTO3_AVAILABLE = False
-
-try:
-    import paramiko
-    PARAMIKO_AVAILABLE = True
-except Exception:
-    PARAMIKO_AVAILABLE = False
 
 try:
     from bs4 import BeautifulSoup  # type: ignore
@@ -308,103 +278,6 @@ def write_dataframe_to_paths(
 
     return written
 
-@dataclass
-class OverUnderPrediction:
-    """Structured over/under prediction with confidence metrics"""
-    game_id: str
-    home_team: str
-    away_team: str
-    predicted_total: float
-    betting_line: float
-    over_probability: float
-    under_probability: float
-    push_probability: float
-    confidence: float
-    expected_value_over: float
-    expected_value_under: float
-    recommendation: str  # 'OVER', 'UNDER', or 'No Bet' after thresholds/conflict checks
-    edge: float
-    kelly_bet_size: float
-    # Optional American odds used for EV/Kelly
-    over_american_odds: Optional[int] = None
-    under_american_odds: Optional[int] = None
-    bet_month: Optional[str] = None
-    calibration_multiplier: Optional[float] = None
-    # Added uncertainty interval (conformal) for display
-    ci_lower: Optional[float] = None
-    ci_upper: Optional[float] = None
-    # Market-derived probabilities (with and without vig) and source
-    market_over_prob: Optional[float] = None
-    market_under_prob: Optional[float] = None
-    fair_over_prob: Optional[float] = None
-    fair_under_prob: Optional[float] = None
-    odds_source: Optional[str] = None
-    # No-vig EVs
-    ev_over_novig: Optional[float] = None
-    ev_under_novig: Optional[float] = None
-    # Consensus vs side-specific line info for display
-    consensus_total: Optional[float] = None
-    best_side_total: Optional[float] = None
-    line_diff: Optional[float] = None
-    decision_line: Optional[float] = None
-    decision_side: Optional[str] = None
-    # Best price book names
-    best_over_book: Optional[str] = None
-    best_under_book: Optional[str] = None
-    # Environment / lineup summaries for dashboard
-    env_info: Optional[str] = None
-    lineup_info: Optional[str] = None
-    # Referee enrichment (crew assignments & scoring tendencies)
-    ref_goals_gm: Optional[float] = None
-    referee_crew: List[str] = field(default_factory=list)
-    referee_avg_goals: Optional[float] = None
-    referee_home_bias: Optional[float] = None
-    referee_info: Optional[str] = None
-    referee_source: Optional[str] = None
-    ref_goal_adjustment: Optional[float] = None
-    # Market velocity (change in total per hour), optional
-    market_velocity: Optional[float] = None
-    # Why we declined to make a wager (if recommendation == 'No Bet')
-    no_bet_reason: Optional[str] = None
-    # Whether the pick was forced/overridden after an initial conflict
-    forced_recommendation: bool = False
-    forced_reason: Optional[str] = None
-
-TEAM_ABBREV_TO_NAME: Dict[str, str] = {
-    'ANA': 'Anaheim Ducks',
-    'ARI': 'Arizona Coyotes',
-    'BOS': 'Boston Bruins',
-    'BUF': 'Buffalo Sabres',
-    'CAR': 'Carolina Hurricanes',
-    'CBJ': 'Columbus Blue Jackets',
-    'CGY': 'Calgary Flames',
-    'CHI': 'Chicago Blackhawks',
-    'COL': 'Colorado Avalanche',
-    'DAL': 'Dallas Stars',
-    'DET': 'Detroit Red Wings',
-    'EDM': 'Edmonton Oilers',
-    'FLA': 'Florida Panthers',
-    'LAK': 'Los Angeles Kings',
-    'MIN': 'Minnesota Wild',
-    'MTL': 'Montreal Canadiens',
-    'NJD': 'New Jersey Devils',
-    'NSH': 'Nashville Predators',
-    'NYI': 'New York Islanders',
-    'NYR': 'New York Rangers',
-    'OTT': 'Ottawa Senators',
-    'PHI': 'Philadelphia Flyers',
-    'PIT': 'Pittsburgh Penguins',
-    'SEA': 'Seattle Kraken',
-    'SJS': 'San Jose Sharks',
-    'STL': 'St. Louis Blues',
-    'TBL': 'Tampa Bay Lightning',
-    'TOR': 'Toronto Maple Leafs',
-    'VAN': 'Vancouver Canucks',
-    'VGK': 'Vegas Golden Knights',
-    'WPG': 'Winnipeg Jets',
-    'WSH': 'Washington Capitals'
-}
-
 TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
     'full': {
         'label': 'Full search',
@@ -481,1042 +354,6 @@ TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
         'auto_sample_cap': 600
     }
 }
-
-TEAM_NAME_TO_ABBREV: Dict[str, str] = {name.upper(): abbr for abbr, name in TEAM_ABBREV_TO_NAME.items()}
-
-def _normalize_team_abbreviation(team: Optional[str]) -> str:
-    raw = str(team or '').strip()
-    if not raw:
-        return ''
-    upper = raw.upper()
-    if upper in TEAM_ABBREV_TO_NAME:
-        return upper
-    return TEAM_NAME_TO_ABBREV.get(upper, '')
-
-def get_team_full_name(team: Optional[str]) -> str:
-    abbr = _normalize_team_abbreviation(team)
-    if abbr:
-        return TEAM_ABBREV_TO_NAME[abbr]
-    raw = str(team or '').strip()
-    return raw or 'TBD'
-
-def get_team_abbreviation(team: Optional[str]) -> str:
-    return _normalize_team_abbreviation(team)
-
-def format_team_display(team: Optional[str]) -> str:
-    return get_team_full_name(team)
-
-def format_matchup_display(away_team: Optional[str], home_team: Optional[str]) -> str:
-    away_name = get_team_full_name(away_team)
-    home_name = get_team_full_name(home_team)
-    if away_name and home_name:
-        return f"{away_name} @ {home_name}"
-    if away_name:
-        return away_name
-    if home_name:
-        return home_name
-    return 'TBD'
-
-def format_matchup_code(away_team: Optional[str], home_team: Optional[str]) -> str:
-    away_code = get_team_abbreviation(away_team) or str(away_team or '').strip() or 'AWAY'
-    home_code = get_team_abbreviation(home_team) or str(home_team or '').strip() or 'HOME'
-    return f"{away_code}@{home_code}"
-
-def format_matchup_search_blob(away_team: Optional[str], home_team: Optional[str]) -> str:
-    display = format_matchup_display(away_team, home_team)
-    code = format_matchup_code(away_team, home_team)
-    parts: List[str] = []
-    for value in (display, code):
-        val = (value or '').strip()
-        if val and val not in parts:
-            parts.append(val)
-    return " | ".join(parts)
-
-class NHLDataFetcher:
-    """Fetches real NHL data from multiple sources with fallbacks"""
-    
-    def __init__(self):
-        # Prefer new NHL web API
-        self.base_url = "https://api-web.nhle.com/v1"
-        # Legacy stats API kept as fallback reference
-        self.legacy_url = "https://statsapi.web.nhl.com/api/v1"
-        self.backup_url = "https://api.nhle.com/stats/rest/en"
-        self.teams_cache = None
-        
-    def get_teams(self) -> Dict[int, Dict]:
-        """Get all NHL teams with multiple fallback sources"""
-        if self.teams_cache is None:
-            # Try primary NHL API
-            try:
-                print("📡 Trying NHL statsapi...")
-                response = requests.get(f"{self.base_url}/teams", timeout=10)
-                response.raise_for_status()
-                teams_data = response.json()
-                self.teams_cache = {team['id']: team for team in teams_data['teams']}
-                print("✅ Successfully fetched teams from NHL statsapi")
-                return self.teams_cache
-            except Exception as e:
-                print(f"⚠️  NHL statsapi failed: {e}")
-            
-            # Use hardcoded fallback
-            print("📋 Using hardcoded team data...")
-            self.teams_cache = self._get_fallback_teams()
-        
-        return self.teams_cache
-    
-    def _get_fallback_teams(self) -> Dict[int, Dict]:
-        """Comprehensive fallback team data"""
-        return {
-            1: {'id': 1, 'name': 'New Jersey Devils', 'abbreviation': 'NJD'},
-            2: {'id': 2, 'name': 'New York Islanders', 'abbreviation': 'NYI'},
-            3: {'id': 3, 'name': 'New York Rangers', 'abbreviation': 'NYR'},
-            4: {'id': 4, 'name': 'Philadelphia Flyers', 'abbreviation': 'PHI'},
-            5: {'id': 5, 'name': 'Pittsburgh Penguins', 'abbreviation': 'PIT'},
-            6: {'id': 6, 'name': 'Boston Bruins', 'abbreviation': 'BOS'},
-            7: {'id': 7, 'name': 'Buffalo Sabres', 'abbreviation': 'BUF'},
-            8: {'id': 8, 'name': 'Montreal Canadiens', 'abbreviation': 'MTL'},
-            9: {'id': 9, 'name': 'Ottawa Senators', 'abbreviation': 'OTT'},
-            10: {'id': 10, 'name': 'Toronto Maple Leafs', 'abbreviation': 'TOR'},
-            12: {'id': 12, 'name': 'Carolina Hurricanes', 'abbreviation': 'CAR'},
-            13: {'id': 13, 'name': 'Florida Panthers', 'abbreviation': 'FLA'},
-            14: {'id': 14, 'name': 'Tampa Bay Lightning', 'abbreviation': 'TBL'},
-            15: {'id': 15, 'name': 'Washington Capitals', 'abbreviation': 'WSH'},
-            16: {'id': 16, 'name': 'Chicago Blackhawks', 'abbreviation': 'CHI'},
-            17: {'id': 17, 'name': 'Detroit Red Wings', 'abbreviation': 'DET'},
-            18: {'id': 18, 'name': 'Nashville Predators', 'abbreviation': 'NSH'},
-            19: {'id': 19, 'name': 'St. Louis Blues', 'abbreviation': 'STL'},
-            20: {'id': 20, 'name': 'Calgary Flames', 'abbreviation': 'CGY'},
-            21: {'id': 21, 'name': 'Colorado Avalanche', 'abbreviation': 'COL'},
-            22: {'id': 22, 'name': 'Edmonton Oilers', 'abbreviation': 'EDM'},
-            23: {'id': 23, 'name': 'Vancouver Canucks', 'abbreviation': 'VAN'},
-            24: {'id': 24, 'name': 'Anaheim Ducks', 'abbreviation': 'ANA'},
-            25: {'id': 25, 'name': 'Dallas Stars', 'abbreviation': 'DAL'},
-            26: {'id': 26, 'name': 'Los Angeles Kings', 'abbreviation': 'LAK'},
-            28: {'id': 28, 'name': 'San Jose Sharks', 'abbreviation': 'SJS'},
-            29: {'id': 29, 'name': 'Columbus Blue Jackets', 'abbreviation': 'CBJ'},
-            30: {'id': 30, 'name': 'Minnesota Wild', 'abbreviation': 'MIN'},
-            52: {'id': 52, 'name': 'Winnipeg Jets', 'abbreviation': 'WPG'},
-            53: {'id': 53, 'name': 'Utah Mammoth', 'abbreviation': 'UTA'},
-            54: {'id': 54, 'name': 'Vegas Golden Knights', 'abbreviation': 'VGK'},
-            55: {'id': 55, 'name': 'Seattle Kraken', 'abbreviation': 'SEA'}
-        }
-    
-    def get_schedule(self, start_date: str, end_date: str) -> List[Dict]:
-        """Get NHL schedule using api-web.nhle.com with robust parsing and date iteration.
-
-        Returns a list of game dicts normalized to mimic legacy statsapi fields used elsewhere:
-        {
-          'gamePk': <int>, 'gameDate': <iso>,
-          'status': {'detailedState': <str>},
-          'teams': {'home': {'team': {'abbreviation': 'XXX'}}, 'away': {'team': {'abbreviation': 'YYY'}}},
-          'venue': {'name': <str>}
-        }
-        """
-        def normalize_game(g: Dict, expected_date: Optional[str] = None) -> Optional[Dict]:
-            if not isinstance(g, dict):
-                return None
-            game_id = g.get('id') or g.get('gameId') or g.get('gamePk')
-            start_time = g.get('startTimeUTC') or g.get('gameDate') or g.get('startTime')
-            if (start_time is None or start_time == "") and expected_date:
-                # Fallback to target date at midnight UTC
-                start_time = f"{expected_date}T00:00:00Z"
-            home = g.get('homeTeam') or {}
-            away = g.get('awayTeam') or {}
-            home_abbr = home.get('abbrev') or home.get('abbreviation') or home.get('triCode') or home.get('name')
-            away_abbr = away.get('abbrev') or away.get('abbreviation') or away.get('triCode') or away.get('name')
-            # Try to extract scores if provided by the endpoint
-            def _score(val):
-                try:
-                    s = val.get('score')
-                    return int(s) if s is not None else None
-                except Exception:
-                    return None
-            home_score = _score(home)
-            away_score = _score(away)
-            venue_name = g.get('venue') or g.get('venueName') or (g.get('venue', {}) if isinstance(g.get('venue'), str) else None)
-            # Map new gameState -> legacy detailedState
-            state = g.get('gameState') or g.get('status') or ''
-            state_map = {
-                'FUT': 'Scheduled', 'PRE': 'Pre-Game', 'LIVE': 'In Progress', 'CRIT': 'In Progress',
-                'FINAL': 'Final', 'OFF': 'Final', 'POSTPONED': 'Postponed'
-            }
-            detailed = state_map.get(str(state).upper(), str(state))
-            try:
-                # Normalize
-                return {
-                    'gamePk': int(game_id) if game_id is not None else None,
-                    'gameDate': start_time,
-                    'status': {'detailedState': detailed},
-                    'teams': {
-                        'home': {'team': {'abbreviation': home_abbr or 'HOME'}, 'score': home_score},
-                        'away': {'team': {'abbreviation': away_abbr or 'AWAY'}, 'score': away_score}
-                    },
-                    'venue': {'name': venue_name if isinstance(venue_name, str) else (venue_name or {}).get('name', '')}
-                }
-            except Exception:
-                return None
-
-        def fetch_date(date_str: str) -> List[Dict]:
-            # Try schedule/{date}
-            urls = [
-                f"{self.base_url}/schedule/{date_str}",
-                f"{self.base_url}/scoreboard/{date_str}",
-            ]
-            for url in urls:
-                try:
-                    resp = requests.get(url, timeout=15)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    games_raw: List[Dict] = []
-                    if isinstance(data, dict):
-                        if 'games' in data and isinstance(data['games'], list):
-                            games_raw = data['games']
-                        elif 'gameWeek' in data and isinstance(data['gameWeek'], list):
-                            for day in data['gameWeek']:
-                                games_raw.extend(day.get('games', []))
-                        elif 'dates' in data and isinstance(data['dates'], list):
-                            for d in data['dates']:
-                                games_raw.extend(d.get('games', []))
-                    normalized = []
-                    for gr in games_raw:
-                        ng = normalize_game(gr, expected_date=date_str)
-                        if ng is not None:
-                            normalized.append(ng)
-                    # Filter strictly to the requested date
-                    if normalized:
-                        target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                        tz_str = os.getenv('SCHEDULE_TZ', 'US/Eastern')
-                        filtered = []
-                        for ng in normalized:
-                            try:
-                                gd = pd.to_datetime(ng.get('gameDate'), utc=True, errors='coerce')
-                                if pd.isna(gd):
-                                    continue
-                                # Compare by configured local date to capture late games
-                                try:
-                                    local_date = gd.tz_convert(tz_str).date()
-                                except Exception:
-                                    local_date = gd.tz_convert(None).date()
-                                if local_date == target_date:
-                                    filtered.append(ng)
-                            except Exception:
-                                continue
-                        if filtered:
-                            return filtered
-                except Exception as e:
-                    continue
-            return []
-
-        print(f"📡 Fetching schedule from {start_date} to {end_date}...")
-        try:
-            start = datetime.strptime(start_date, '%Y-%m-%d')
-            end = datetime.strptime(end_date, '%Y-%m-%d')
-        except Exception:
-            start = datetime.now()
-            end = start
-        all_games: List[Dict] = []
-        dt = start
-        while dt <= end:
-            date_str = dt.strftime('%Y-%m-%d')
-            day_games = fetch_date(date_str)
-            all_games.extend(day_games)
-            dt += timedelta(days=1)
-
-        if all_games:
-            print(f"✅ Found {len(all_games)} games from new NHL API")
-            return all_games
-
-        print("❌ All NHL API sources failed")
-        return []
-    
-    def get_game_stats(self, game_id: int) -> Dict:
-        """Get detailed game statistics with fallbacks"""
-        # New API endpoint
-        try:
-            url = f"{self.base_url}/gamecenter/{game_id}/boxscore"
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except Exception:
-            # Legacy fallback
-            try:
-                url = f"{self.legacy_url}/game/{game_id}/boxscore"
-                response = requests.get(url, timeout=10)
-                response.raise_for_status()
-                return response.json()
-            except Exception:
-                return {}
-
-class SocialMediaPoster:
-    """Handles posting predictions to X (Twitter) and Discord"""
-    
-    def __init__(self):
-        self.twitter_api = None
-        self.discord_webhook_url = None
-        self.discord_verify = True
-        self.setup_credentials()
-        if TWITTER_AVAILABLE:
-            self.setup_twitter()
-    
-    def setup_credentials(self):
-        """Setup API credentials from environment variables"""
-        self.twitter_bearer_token = os.getenv('TWITTER_BEARER_TOKEN')
-        self.twitter_consumer_key = os.getenv('TWITTER_CONSUMER_KEY')
-        self.twitter_consumer_secret = os.getenv('TWITTER_CONSUMER_SECRET')
-        self.twitter_access_token = os.getenv('TWITTER_ACCESS_TOKEN')
-        self.twitter_access_token_secret = os.getenv('TWITTER_ACCESS_TOKEN_SECRET')
-        # Also support API-style env names used in tweet_predictions_image.py
-        api_key = os.getenv('TWITTER_API_KEY')
-        api_secret = os.getenv('TWITTER_API_SECRET')
-        if not self.twitter_consumer_key and api_key:
-            self.twitter_consumer_key = api_key
-        if not self.twitter_consumer_secret and api_secret:
-            self.twitter_consumer_secret = api_secret
-        self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-        
-        # Always try to read social_config.json to backfill any missing fields
-        try:
-            with open('social_config.json', 'r') as f:
-                config = json.load(f)
-            
-            twitter_config = config.get('twitter', {})
-            if not self.twitter_bearer_token:
-                self.twitter_bearer_token = twitter_config.get('bearer_token')
-            if not self.twitter_consumer_key:
-                self.twitter_consumer_key = twitter_config.get('consumer_key')
-            if not self.twitter_consumer_secret:
-                self.twitter_consumer_secret = twitter_config.get('consumer_secret')
-            if not self.twitter_access_token:
-                self.twitter_access_token = twitter_config.get('access_token')
-            if not self.twitter_access_token_secret:
-                self.twitter_access_token_secret = twitter_config.get('access_token_secret')
-            
-            discord_config = config.get('discord', {})
-            if not self.discord_webhook_url:
-                self.discord_webhook_url = discord_config.get('webhook_url')
-            
-            # Honor DISCORD_INSECURE from env or config.deploy.discord_insecure
-            insecure_env = os.getenv('DISCORD_INSECURE')
-            if isinstance(insecure_env, str) and insecure_env.strip().lower() in ('1','true','yes','y'):
-                self.discord_verify = False
-            deploy_cfg = config.get('deploy') or {}
-            insecure_cfg = str((deploy_cfg.get('discord_insecure') or '')).strip().lower()
-            if insecure_cfg in ('1','true','yes','y'):
-                self.discord_verify = False
-        except FileNotFoundError:
-            print("⚠️  No social_config.json found. Creating template...")
-            self.create_config_template()
-        # Debug summary (no secrets printed)
-        try:
-            dbg = {
-                'discord': 'yes' if bool(self.discord_webhook_url) else 'no',
-                'twitter': 'yes' if bool(self.twitter_bearer_token) else 'no'
-            }
-            print(f"🔧 Social config -> Discord? {dbg['discord']} | Twitter? {dbg['twitter']}")
-        except Exception:
-            pass
-
-    def create_config_template(self):
-        """Create a template configuration file"""
-        template = {
-            "twitter": {
-                "bearer_token": "YOUR_TWITTER_BEARER_TOKEN",
-                "consumer_key": "YOUR_TWITTER_CONSUMER_KEY",
-                "consumer_secret": "YOUR_TWITTER_CONSUMER_SECRET",
-                "access_token": "YOUR_TWITTER_ACCESS_TOKEN",
-                "access_token_secret": "YOUR_TWITTER_ACCESS_TOKEN_SECRET"
-            },
-            "discord": {
-                "webhook_url": "YOUR_DISCORD_WEBHOOK_URL"
-            },
-            "odds": {
-                "api_key": "YOUR_ODDS_API_KEY"
-            },
-            "deploy": {
-                "method": "http",  # http | s3 | sftp
-                "http": {
-                    "url": "https://www.thepointou.com/nhl_real_data_dashboard.html",
-                    "http_method": "PUT",
-                    "auth": {
-                        "type": "bearer",  # bearer | basic | none
-                        "token": "YOUR_BEARER_TOKEN",
-                        "username": "",
-                        "password": ""
-                    }
-                },
-                "s3": {
-                    "bucket": "YOUR_BUCKET",
-                    "key": "dashboards/nhl_real_data_dashboard.html",
-                    "region": "us-east-1",
-                    "acl": "public-read"
-                },
-                "sftp": {
-                    "host": "sftp.thepointou.com",
-                    "port": 22,
-                    "username": "",
-                    "password": "",
-                    "remote_path": "/var/www/thepointou/nhl_real_data_dashboard.html"
-                }
-            }
-        }
-        
-        with open('social_config.json', 'w') as f:
-            json.dump(template, f, indent=4)
-        
-        print("📄 Created social_config.json template. Please fill in your API credentials.")
-
-    def post_file_to_discord(self, file_path: str, message: Optional[str] = None) -> bool:
-        """Upload a file (e.g., Excel or CSV) to Discord via webhook."""
-        if not self.discord_webhook_url:
-            print("⚠️  Discord webhook URL not available")
-            return False
-        try:
-            if not os.path.exists(file_path):
-                print(f"⚠️  File not found for Discord upload: {file_path}")
-                return False
-            filename = os.path.basename(file_path)
-            # Basic content-type detection
-            ctype = 'application/octet-stream'
-            fn_l = filename.lower()
-            if fn_l.endswith('.xlsx'):
-                ctype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            elif fn_l.endswith('.xls'):
-                ctype = 'application/vnd.ms-excel'
-            elif fn_l.endswith('.csv'):
-                ctype = 'text/csv'
-            elif fn_l.endswith('.html') or fn_l.endswith('.htm'):
-                ctype = 'text/html'
-            elif fn_l.endswith('.png'):
-                ctype = 'image/png'
-            with open(file_path, 'rb') as f:
-                files = { 'file': (filename, f, ctype) }
-                data = { 'content': message or '📎 Predictions export' }
-                resp = requests.post(self.discord_webhook_url, data=data, files=files, timeout=30, verify=self.discord_verify)
-                resp.raise_for_status()
-                print(f"✅ Uploaded file to Discord: {filename}")
-                return True
-        except Exception as e:
-            print(f"❌ Discord file upload failed: {e}")
-            return False
-
-    def post_inline_predictions(self, predictions: List[OverUnderPrediction], top_n: int = 10, title: str = "NHL Predictions (Top)") -> bool:
-        """Post a compact inline summary of top predictions to Discord as embeds.
-
-        Splits across multiple messages if needed. Returns True if at least one post succeeds.
-        """
-        if not self.discord_webhook_url:
-            print("⚠️  Discord webhook URL not available")
-            return False
-        try:
-            # Prefer bets first, then by absolute edge desc
-            preds = list(predictions or [])
-            preds.sort(key=lambda p: (p.recommendation == 'No Bet', -abs(float(getattr(p, 'edge', 0.0) or 0.0))), reverse=False)
-            preds = preds[:max(1, int(top_n))]
-            # Build embeds in chunks of up to 8 fields per embed (Discord soft limit)
-            CHUNK = 8
-            posted_any = False
-            for i in range(0, len(preds), CHUNK):
-                chunk = preds[i:i+CHUNK]
-                embed = {
-                    "title": f"{title} {i+1}-{i+len(chunk)}",
-                    "color": 0x2ecc71,
-                    "fields": []
-                }
-                for p in chunk:
-                    name = format_matchup_display(p.away_team, p.home_team)
-                    val_bits = []
-                    try:
-                        val_bits.append(f"Line {p.betting_line:.1f} | Pred {p.predicted_total:.2f}")
-                    except Exception:
-                        val_bits.append(f"Line {p.betting_line} | Pred {p.predicted_total}")
-                    val_bits.append(f"Rec {p.recommendation} {p.edge:+.2f}")
-                    try:
-                        val_bits.append(f"Kelly {p.kelly_bet_size:.1f}%")
-                    except Exception:
-                        pass
-                    try:
-                        val_bits.append(f"O {p.over_probability:.0%} / U {p.under_probability:.0%}")
-                    except Exception:
-                        pass
-                    ref_bits = getattr(p, 'referee_info', None)
-                    if not ref_bits:
-                        crew_list = getattr(p, 'referee_crew', []) or []
-                        ref_bits = ", ".join([str(n) for n in crew_list if str(n).strip()])
-                    ref_metrics: List[str] = []
-                    if isinstance(p.referee_avg_goals, (int, float)) and np.isfinite(p.referee_avg_goals):
-                        ref_metrics.append(f"{p.referee_avg_goals:.2f} G/G")
-                    if isinstance(p.referee_home_bias, (int, float)) and np.isfinite(p.referee_home_bias):
-                        ref_metrics.append(f"HB {p.referee_home_bias:+.2f}")
-                    if isinstance(p.ref_goals_gm, (int, float)) and np.isfinite(p.ref_goals_gm) and not ref_metrics:
-                        ref_metrics.append(f"Feature {p.ref_goals_gm:.2f} G/G")
-                    if ref_bits or ref_metrics:
-                        detail = ref_bits or ''
-                        if ref_metrics:
-                            metric_txt = ", ".join(ref_metrics)
-                            detail = f"{detail} ({metric_txt})" if detail else metric_txt
-                        val_bits.append(f"Refs {detail}")
-                    embed["fields"].append({
-                        "name": name,
-                        "value": " | ".join(val_bits),
-                        "inline": False
-                    })
-                resp = requests.post(self.discord_webhook_url, json={"embeds": [embed]}, timeout=15, verify=self.discord_verify)
-                if 200 <= resp.status_code < 300:
-                    posted_any = True
-                else:
-                    print(f"⚠️  Inline post failed: {resp.status_code} {resp.text[:120]}")
-            return posted_any
-        except Exception as e:
-            print(f"❌ Inline Discord post failed: {e}")
-            return False
-
-    def deploy_dashboard_html(self, html_path: str, cli_args: Optional[argparse.Namespace] = None) -> bool:
-        """Deploy the dashboard HTML to www.thepointou.com using configured method.
-
-        Supported methods:
-          - http (PUT/POST to a URL, optional bearer/basic auth)
-          - s3 (upload to S3 bucket/key with public-read)
-          - sftp (upload over SFTP to a remote path)
-        """
-        try:
-            # Resolve deploy method and config (CLI overrides file config)
-            cfg = getattr(self, 'deploy_config', {}) if hasattr(self, 'deploy_config') else {}
-            method = None
-            if cli_args and getattr(cli_args, 'deploy_method', None):
-                method = str(cli_args.deploy_method).strip().lower()
-            elif isinstance(cfg, dict):
-                method = str(cfg.get('method', '')).strip().lower() or None
-            if not method:
-                return False
-            print(f"🌐 Deploying dashboard via '{method}'...")
-
-            if method == 'http':
-                # Determine URL, method, auth
-                url = None
-                http_method = 'PUT'
-                headers = {'Content-Type': 'text/html'}
-                if cli_args and getattr(cli_args, 'deploy_target_url', None):
-                    url = cli_args.deploy_target_url
-                    http_method = getattr(cli_args, 'deploy_http_method', 'PUT').upper()
-                    token = getattr(cli_args, 'deploy_token', None)
-                    basic_user = getattr(cli_args, 'deploy_basic_user', None)
-                    basic_pass = getattr(cli_args, 'deploy_basic_pass', None)
-                else:
-                    http_cfg = (cfg.get('http') or {}) if isinstance(cfg, dict) else {}
-                    url = http_cfg.get('url')
-                    http_method = str(http_cfg.get('http_method', 'PUT')).upper()
-                    auth_cfg = http_cfg.get('auth') or {}
-                    token = auth_cfg.get('token') if str(auth_cfg.get('type', 'none')).lower() == 'bearer' else None
-                    basic_user = auth_cfg.get('username') if str(auth_cfg.get('type', 'none')).lower() == 'basic' else None
-                    basic_pass = auth_cfg.get('password') if str(auth_cfg.get('type', 'none')).lower() == 'basic' else None
-                if token:
-                    headers['Authorization'] = f"Bearer {token}"
-                auth = None
-                if basic_user and basic_pass:
-                    auth = (basic_user, basic_pass)
-                with open(html_path, 'rb') as f:
-                    data = f.read()
-                try:
-                    if http_method == 'PUT':
-                        resp = requests.put(url, data=data, headers=headers, auth=auth, timeout=30)
-                    else:
-                        # POST as multipart form if not PUT
-                        files = {'file': ('nhl_real_data_dashboard.html', data, 'text/html')}
-                        resp = requests.post(url, headers={k: v for k, v in headers.items() if k.lower() != 'content-type'}, files=files, auth=auth, timeout=30)
-                    if 200 <= resp.status_code < 300:
-                        print("✅ Deployed dashboard via HTTP")
-                        return True
-                    print(f"⚠️  HTTP deploy failed: {resp.status_code} {resp.text[:200]}")
-                except Exception as e:
-                    print(f"⚠️  HTTP deploy error: {e}")
-                return False
-
-            if method == 's3':
-                s3_cfg = (cfg.get('s3') or {}) if isinstance(cfg, dict) else {}
-                bucket = getattr(cli_args, 'deploy_s3_bucket', None) or s3_cfg.get('bucket')
-                key = getattr(cli_args, 'deploy_s3_key', None) or s3_cfg.get('key')
-                region = getattr(cli_args, 'deploy_s3_region', None) or s3_cfg.get('region') or None
-                acl = getattr(cli_args, 'deploy_s3_acl', None) or s3_cfg.get('acl') or 'public-read'
-                if not BOTO3_AVAILABLE:
-                    print("⚠️  boto3 not installed; cannot deploy to S3")
-                    return False
-                if not (bucket and key):
-                    print("⚠️  Missing S3 bucket/key for deploy")
-                    return False
-                try:
-                    s3 = boto3.client('s3', region_name=region) if region else boto3.client('s3')
-                    with open(html_path, 'rb') as f:
-                        s3.put_object(Bucket=bucket, Key=key, Body=f, ContentType='text/html', ACL=acl)
-                    print("✅ Deployed dashboard to S3")
-                    return True
-                except Exception as e:
-                    print(f"⚠️  S3 deploy error: {e}")
-                    return False
-
-            if method == 'sftp':
-                sftp_cfg = (cfg.get('sftp') or {}) if isinstance(cfg, dict) else {}
-                host = getattr(cli_args, 'deploy_sftp_host', None) or sftp_cfg.get('host')
-                port = int(getattr(cli_args, 'deploy_sftp_port', 0) or sftp_cfg.get('port') or 22)
-                user = getattr(cli_args, 'deploy_sftp_user', None) or sftp_cfg.get('username')
-                password = getattr(cli_args, 'deploy_sftp_pass', None) or sftp_cfg.get('password')
-                remote_path = getattr(cli_args, 'deploy_sftp_path', None) or sftp_cfg.get('remote_path')
-                if not PARAMIKO_AVAILABLE:
-                    print("⚠️  paramiko not installed; cannot deploy via SFTP")
-                    return False
-                if not (host and user and password and remote_path):
-                    print("⚠️  Missing SFTP host/user/pass/remote_path for deploy")
-                    return False
-                try:
-                    transport = paramiko.Transport((host, port))
-                    transport.connect(username=user, password=password)
-                    sftp = paramiko.SFTPClient.from_transport(transport)
-                    sftp.put(html_path, remote_path)
-                    sftp.close()
-                    transport.close()
-                    print("✅ Deployed dashboard via SFTP")
-                    return True
-                except Exception as e:
-                    print(f"⚠️  SFTP deploy error: {e}")
-                    return False
-
-            print(f"⚠️  Unknown deploy method: {method}")
-            return False
-        except Exception as e:
-            print(f"⚠️  Deploy failed: {e}")
-            return False
-    
-    def setup_twitter(self):
-        """Setup Twitter API client"""
-        try:
-            if all([self.twitter_consumer_key, self.twitter_consumer_secret, 
-                   self.twitter_access_token, self.twitter_access_token_secret]):
-                
-                self.twitter_api = tweepy.Client(
-                    bearer_token=self.twitter_bearer_token,
-                    consumer_key=self.twitter_consumer_key,
-                    consumer_secret=self.twitter_consumer_secret,
-                    access_token=self.twitter_access_token,
-                    access_token_secret=self.twitter_access_token_secret,
-                    wait_on_rate_limit=True
-                )
-                print("✅ Twitter API initialized successfully")
-            else:
-                print("⚠️  Twitter credentials not found. Twitter posting disabled.")
-                
-        except Exception as e:
-            print(f"❌ Twitter API setup failed: {e}")
-            self.twitter_api = None
-    
-    def _format_tweet_table(self, predictions: List[OverUnderPrediction], max_rows: int = 4) -> Optional[str]:
-        """Return an ASCII table string sized for Twitter using top predictions."""
-
-        preds = [p for p in (predictions or []) if p is not None]
-        if not preds:
-            return None
-
-        def _fmt_float(val: Optional[float], decimals: int = 1) -> str:
-            try:
-                return f"{float(val):.{decimals}f}"
-            except Exception:
-                return "--"
-
-        def _fmt_edge(val: Optional[float]) -> str:
-            try:
-                return f"{float(val):+.2f}"
-            except Exception:
-                return "--"
-
-        def _fmt_conf(val: Optional[float]) -> str:
-            try:
-                num = float(val)
-                if 0.0 <= num <= 1.0:
-                    num *= 100.0
-                return f"{num:.0f}%"
-            except Exception:
-                return "--"
-
-        def _sort_key(pred: OverUnderPrediction) -> float:
-            try:
-                return -abs(float(getattr(pred, 'edge', 0.0) or 0.0))
-            except Exception:
-                return 0.0
-
-        prioritized: List[OverUnderPrediction] = []
-        others: List[OverUnderPrediction] = []
-        for pred in preds:
-            rec = (getattr(pred, 'recommendation', '') or '').strip().upper()
-            if rec and rec != 'NO BET':
-                prioritized.append(pred)
-            else:
-                others.append(pred)
-
-        prioritized.sort(key=_sort_key)
-        others.sort(key=_sort_key)
-
-        ordered = prioritized + others
-        if not ordered:
-            return None
-
-        limited = ordered[:max(1, int(max_rows))]
-        columns = [
-            ("Matchup", "left"),
-            ("Line", "right"),
-            ("Pred", "right"),
-            ("Edge", "right"),
-            ("Pick", "left"),
-            ("Conf", "right"),
-        ]
-
-        rows: List[List[str]] = []
-        for pred in limited:
-            away = str(getattr(pred, 'away_team', '') or '').strip()
-            home = str(getattr(pred, 'home_team', '') or '').strip()
-            matchup = f"{away} @ {home}".strip()
-            if not matchup or matchup == '@':
-                matchup = away or home or 'TBD'
-
-            line_txt = _fmt_float(getattr(pred, 'betting_line', None))
-            pred_txt = _fmt_float(getattr(pred, 'predicted_total', None))
-            edge_txt = _fmt_edge(getattr(pred, 'edge', None))
-            pick_raw = (getattr(pred, 'recommendation', '') or 'No Bet').strip().upper() or 'NO BET'
-            if pick_raw == 'NO BET':
-                pick_txt = 'NO BET'
-            else:
-                pick_txt = pick_raw
-            conf_txt = _fmt_conf(getattr(pred, 'confidence', None))
-
-            rows.append([matchup, line_txt, pred_txt, edge_txt, pick_txt, conf_txt])
-
-        widths: List[int] = []
-        for idx, (header, _) in enumerate(columns):
-            width = len(header)
-            for row in rows:
-                width = max(width, len(row[idx]))
-            widths.append(width)
-
-        def _format_cell(value: str, width: int, align: str) -> str:
-            return value.rjust(width) if align == 'right' else value.ljust(width)
-
-        separator = []
-        for width in widths:
-            separator.append('-' * width)
-
-        header_line = '  '.join(
-            _format_cell(header, widths[idx], align)
-            for idx, (header, align) in enumerate(columns)
-        )
-        separator_line = '  '.join(separator)
-        row_lines = [
-            '  '.join(
-                _format_cell(row[idx], widths[idx], columns[idx][1])
-                for idx in range(len(columns))
-            )
-            for row in rows
-        ]
-
-        table_lines = [header_line, separator_line]
-        table_lines.extend(row_lines)
-        return '\n'.join(table_lines)
-
-    def post_to_twitter(self, predictions: List[OverUnderPrediction], training_results: Dict) -> bool:
-        """Post predictions to Twitter in the same style used by tweet_predictions_image.py.
-
-        We prioritize posting a predictions image with a short caption. If no media is
-        available, we fall back to a concise text-only tweet. The image formatting will
-        mirror the table style and caption behavior from tweet_predictions_image.py.
-        """
-        if not self.twitter_api or not TWITTER_AVAILABLE:
-            print("⚠️  Twitter API not available")
-            return False
-
-        try:
-            # Build image similar to tweet_predictions_image.py
-            img_path = save_predictions_image(
-                predictions,
-                training_results=training_results,
-                html_path='predictions_table.html',
-                image_path='predictions.png'
-            )
-
-            # Caption modeled after tweet_predictions_image.py default
-            default_caption = "Predictor picks for this week's NFL games."  # will adjust to NHL
-            # For NHL context, craft an equivalent concise caption
-            tweet_caption = "Predictor picks for tonight's NHL games."
-
-            if img_path and os.path.exists(img_path):
-                return self.post_image_to_twitter(img_path, caption=tweet_caption)
-
-            # Fallback: concise text-only tweet (no multiline list)
-            betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
-            tweet_text: Optional[str] = None
-
-            candidate_groups: List[List[OverUnderPrediction]] = []
-            if betting_preds:
-                candidate_groups.append(betting_preds)
-            if predictions:
-                candidate_groups.append(predictions)
-
-            for group in candidate_groups:
-                if not group:
-                    continue
-                max_rows = min(4, len(group))
-                for rows in range(max_rows, 0, -1):
-                    table_part = self._format_tweet_table(group, max_rows=rows)
-                    if not table_part:
-                        continue
-                    combined_text = f"{tweet_caption}\n{table_part}"
-                    if len(combined_text) <= 280:
-                        tweet_text = combined_text
-                        break
-                if tweet_text:
-                    break
-
-                if not tweet_text:
-                    if not betting_preds:
-                        tweet_text = tweet_caption
-                    else:
-                        top = betting_preds[0]
-                        matchup_display = format_matchup_display(top.away_team, top.home_team)
-                        tweet_text = (
-                            f"{tweet_caption} Top: {matchup_display} — "
-                            f"{top.recommendation} {top.betting_line} (edge {float(getattr(top, 'edge', 0.0)):+.1f})."
-                        )
-
-            try:
-                response = self.twitter_api.create_tweet(text=tweet_text)
-            except tweepy.TooManyRequests:
-                print("⏳ Twitter rate limit hit while posting text tweet. Skipping for now.")
-                return False
-            print(f"✅ Posted to Twitter: {response.data['id']}")
-            return True
-
-        except Exception as e:
-            print(f"❌ Twitter posting failed: {e}")
-            return False
-    
-    def post_to_discord_webhook(self, predictions: List[OverUnderPrediction], training_results: Dict) -> bool:
-        """Post predictions to Discord via webhook"""
-        if not self.discord_webhook_url:
-            print("⚠️  Discord webhook URL not available")
-            return False
-        
-        try:
-            betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
-            
-            embed = {
-                "title": "🏒 NHL Over/Under Predictions",
-                "description": f"Daily predictions powered by machine learning",
-                "color": 0x00ff00 if betting_preds else 0xffff00,
-                "timestamp": datetime.now().isoformat(),
-                "fields": []
-            }
-            
-            summary_value = f"**📊 Model Accuracy:** {training_results.get('over_under_accuracy', 0):.1%}\n"
-            summary_value += f"**💰 Opportunities:** {len(betting_preds)} recommended bets"
-            
-            embed["fields"].append({
-                "name": "📈 Daily Summary",
-                "value": summary_value,
-                "inline": False
-            })
-            
-            for pred in betting_preds[:6]:
-                matchup_display = format_matchup_display(pred.away_team, pred.home_team)
-                field_name = f"🏒 {matchup_display}"
-                field_value = f"**Line:** {pred.betting_line} | **Pred:** {pred.predicted_total:.1f}\n"
-                field_value += f"**Rec:** {pred.recommendation} ({pred.edge:+.2f})\n"
-                field_value += f"**Conf:** {pred.confidence:.0%}"
-                ref_bits = getattr(pred, 'referee_info', None)
-                if not ref_bits:
-                    crew_list = getattr(pred, 'referee_crew', []) or []
-                    ref_bits = ", ".join([str(n) for n in crew_list if str(n).strip()])
-                if ref_bits:
-                    ref_metrics: List[str] = []
-                    if isinstance(pred.referee_avg_goals, (int, float)) and np.isfinite(pred.referee_avg_goals):
-                        ref_metrics.append(f"{pred.referee_avg_goals:.2f} G/G")
-                    if isinstance(pred.referee_home_bias, (int, float)) and np.isfinite(pred.referee_home_bias):
-                        ref_metrics.append(f"HB {pred.referee_home_bias:+.2f}")
-                    if ref_metrics:
-                        ref_bits = f"{ref_bits} ({', '.join(ref_metrics)})" if ref_bits else ", ".join(ref_metrics)
-                    field_value += f"\n**Refs:** {ref_bits}"
-                
-                embed["fields"].append({
-                    "name": field_name,
-                    "value": field_value,
-                    "inline": True
-                })
-            
-            payload = {"embeds": [embed]}
-            response = requests.post(self.discord_webhook_url, json=payload, verify=self.discord_verify)
-            response.raise_for_status()
-            
-            print("✅ Posted to Discord via webhook")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Discord webhook posting failed: {e}")
-            return False
-    
-    def post_predictions(self, predictions: List[OverUnderPrediction], training_results: Dict) -> Dict[str, bool]:
-        """Post predictions to all configured social media platforms"""
-        results = {}
-        
-        print("\n📱 Posting predictions to social media...")
-        
-        if TWITTER_AVAILABLE:
-            print("🐦 Posting to X (Twitter)...")
-            results['twitter'] = self.post_to_twitter(predictions, training_results)
-        else:
-            results['twitter'] = False
-        
-        # Minimal Discord mode: skip summary embed; rely on manual posting if needed
-        print("💬 Skipping Discord summary (minimal mode)")
-        results['discord'] = False
-        
-        return results
-
-    def render_dashboard_image(self, html_path: str, image_path: str = 'dashboard.png') -> Optional[str]:
-        """Render the local HTML dashboard to an image suitable for posting.
-
-        Tries imgkit (wkhtmltoimage) first, falls back to html2image. Returns image path or None.
-        """
-        try:
-            if os.path.exists(image_path):
-                os.remove(image_path)
-        except Exception:
-            pass
-
-        # Try imgkit
-        if IMGKIT_AVAILABLE:
-            try:
-                options = {
-                    'quality': 85,
-                    'format': 'png',
-                    'encoding': 'utf-8',
-                    'crop-h': '1200',
-                    'crop-w': '1400',
-                }
-                imgkit.from_file(html_path, image_path, options=options)
-                if os.path.exists(image_path):
-                    return image_path
-            except Exception:
-                pass
-
-        # Fallback: html2image
-        if HTML2IMAGE_AVAILABLE:
-            try:
-                hti = Html2Image()
-                hti.output_path = os.path.dirname(os.path.abspath(image_path)) or '.'
-                hti.screenshot(html_file=html_path, save_as=os.path.basename(image_path), size=(1400, 1200))
-                if os.path.exists(image_path):
-                    return image_path
-            except Exception:
-                pass
-
-        print("⚠️  Could not render dashboard to image. Install wkhtmltoimage or enable html2image.")
-        return None
-
-    def post_dashboard_to_discord(self, html_path: str) -> bool:
-        """Post the dashboard as an image attachment to Discord via webhook."""
-        if not self.discord_webhook_url:
-            print("⚠️  Discord webhook URL not available")
-            return False
-
-        try:
-            print("💬 Posting dashboard image to Discord…")
-            image_path = self.render_dashboard_image(html_path)
-            if image_path and os.path.exists(image_path):
-                with open(image_path, 'rb') as f:
-                    files = { 'file': (os.path.basename(image_path), f, 'image/png') }
-                    data = { 'content': '🏒 NHL Over/Under Dashboard' }
-                    resp = requests.post(self.discord_webhook_url, data=data, files=files, verify=self.discord_verify)
-                    resp.raise_for_status()
-                    print("✅ Dashboard image posted to Discord")
-                    return True
-            # Fallback: send a link to the local file path (Discord clients won't open local paths)
-            print("ℹ️ Image render unavailable; posting local file path to Discord…")
-            payload = { 'content': f"Dashboard saved locally: {os.path.abspath(html_path)}" }
-            resp = requests.post(self.discord_webhook_url, json=payload, verify=self.discord_verify)
-            resp.raise_for_status()
-            print("✅ Dashboard link posted to Discord")
-            return True
-        except Exception as e:
-            print(f"❌ Discord dashboard posting failed: {e}")
-            return False
-
-    def post_dashboard_to_twitter(self, html_path: str, caption: str = "🏒 NHL Over/Under Dashboard") -> bool:
-        """Post the dashboard as an image to X (Twitter)."""
-        if not self.twitter_api or not TWITTER_AVAILABLE:
-            print("⚠️  Twitter API not available")
-            return False
-        try:
-            image_path = self.render_dashboard_image(html_path)
-            if not image_path or not os.path.exists(image_path):
-                print("⚠️  Dashboard image not available for Twitter post")
-                return False
-
-            # Upload media then create tweet
-            with open(image_path, 'rb') as f:
-                media_bytes = f.read()
-            # v2 tweepy Client does not support media upload directly; fallback to API v1.1 via OAuth1 if available
-            try:
-                auth = tweepy.OAuth1UserHandler(
-                    self.twitter_consumer_key,
-                    self.twitter_consumer_secret,
-                    self.twitter_access_token,
-                    self.twitter_access_token_secret
-                )
-                api_v1 = tweepy.API(auth, wait_on_rate_limit=True)
-                media = api_v1.media_upload(filename=image_path)
-                media_id = media.media_id_string
-                self.twitter_api.create_tweet(text=caption, media_ids=[media_id])
-                print("✅ Dashboard image posted to Twitter")
-                return True
-            except tweepy.TooManyRequests:
-                print("⏳ Twitter rate limit hit while posting dashboard. Saved for manual posting.")
-                print(f"👉 Image: {image_path}")
-                print(f"👉 Text:  {caption}")
-                return False
-            except Exception as e:
-                print(f"❌ Twitter media upload failed: {e}")
-                return False
-        except Exception as e:
-            print(f"❌ Twitter dashboard posting failed: {e}")
-            return False
-
-    def post_image_to_twitter(self, image_path: str, caption: str = "🏒 NHL Predictions") -> bool:
-        """Post an arbitrary image (e.g., predictions.png) to X (Twitter)."""
-        if not self.twitter_api or not TWITTER_AVAILABLE:
-            print("⚠️  Twitter API not available")
-            return False
-        try:
-            if not os.path.exists(image_path):
-                print(f"⚠️  Image not found for Twitter post: {image_path}")
-                return False
-            try:
-                auth = tweepy.OAuth1UserHandler(
-                    self.twitter_consumer_key,
-                    self.twitter_consumer_secret,
-                    self.twitter_access_token,
-                    self.twitter_access_token_secret
-                )
-                api_v1 = tweepy.API(auth, wait_on_rate_limit=True)
-                media = api_v1.media_upload(filename=image_path)
-                media_id = media.media_id_string
-                self.twitter_api.create_tweet(text=caption, media_ids=[media_id])
-                print("✅ Predictions image posted to Twitter")
-                return True
-            except tweepy.TooManyRequests:
-                print("⏳ Twitter rate limit hit while posting image. Saved for manual posting.")
-                print(f"👉 Image: {image_path}")
-                print(f"👉 Text:  {caption}")
-                return False
-            except Exception as e:
-                print(f"❌ Twitter media upload failed: {e}")
-                return False
-        except Exception as e:
-            print(f"❌ Twitter image posting failed: {e}")
-            return False
 
 class RealDataNHLModel:
     """NHL Over/Under model using real data"""
@@ -3761,13 +2598,13 @@ class RealDataNHLModel:
         X_test = X_sorted.iloc[split_index:].reset_index(drop=True)
         y_test = y_sorted.iloc[split_index:].reset_index(drop=True)
         
-        # Lock feature pipeline for deploy-time inference & Poisson models
-        self.locked_feature_pipeline = self._build_feature_pipeline()
+        # Feature pipeline for scaled modeling during validation
+        eval_feature_pipeline = self._build_feature_pipeline()
         try:
-            X_train_scaled = self.locked_feature_pipeline.fit_transform(X_train)
-            X_test_scaled = self.locked_feature_pipeline.transform(X_test)
+            X_train_scaled = eval_feature_pipeline.fit_transform(X_train)
+            X_test_scaled = eval_feature_pipeline.transform(X_test)
         except Exception:
-            self.locked_feature_pipeline = None
+            eval_feature_pipeline = None
             X_train_scaled = X_train.values
             X_test_scaled = X_test.values
         
@@ -3918,32 +2755,35 @@ class RealDataNHLModel:
         test_preds = np.vstack(test_preds)  # shape (K, N)
         ensemble_pred = (weights_array.reshape(-1, 1) * test_preds).sum(axis=0)
 
+        def _fit_poisson_components(features_scaled: Any, target: pd.Series) -> Tuple[Optional[PoissonRegressor], Optional[Dict[str, float]], Optional[Any]]:
+            poisson_local = None
+            nb_local = None
+            gp_local = None
+            if features_scaled is None:
+                return None, None, None
+            try:
+                poisson_local = PoissonRegressor(alpha=0.5, max_iter=1000)
+                poisson_local.fit(features_scaled, target)
+                mu_vals = poisson_local.predict(features_scaled)
+                resid = target.values - mu_vals
+                var_hat = float(np.var(resid)) + float(np.mean(mu_vals))
+                mean_hat = float(np.mean(mu_vals))
+                if mean_hat > 0 and var_hat > mean_hat:
+                    k = (mean_hat ** 2) / max(1e-6, (var_hat - mean_hat))
+                    nb_local = {'k': float(max(1e-6, k))}
+                if STATSMODELS_AVAILABLE and len(features_scaled) >= 100 and bool(getattr(self, 'use_compoisson', False)):
+                    try:
+                        import statsmodels.api as sm
+                        Xg = sm.add_constant(features_scaled)
+                        gp_local = GeneralizedPoisson(target.values, Xg).fit(disp=0)
+                    except Exception:
+                        gp_local = None
+            except Exception:
+                poisson_local = None
+            return poisson_local, nb_local, gp_local
+
         # Poisson model for total goals (non-negative)
-        poisson_model = PoissonRegressor(alpha=0.5, max_iter=1000)
-        # Estimate overdispersion via residual variance; fit NB parameters per training set
-        nb_params = None
-        gp_model = None
-        try:
-            poisson_model.fit(X_train_scaled, y_train)
-            # Overdispersion estimate: variance/mean > 1 suggests NB
-            mu_train = poisson_model.predict(X_train_scaled)
-            resid = y_train.values - mu_train
-            var_hat = float(np.var(resid)) + float(np.mean(mu_train))
-            mean_hat = float(np.mean(mu_train))
-            if mean_hat > 0 and var_hat > mean_hat:
-                # NB parameterization: variance = mean + mean^2/k => k = mean^2/(var-mean)
-                k = (mean_hat ** 2) / max(1e-6, (var_hat - mean_hat))
-                nb_params = {'k': float(max(1e-6, k))}
-            # Try generalized Poisson (COM-Poisson proxy) if enabled
-            if STATSMODELS_AVAILABLE and len(X_train_scaled) >= 100 and bool(getattr(self, 'use_compoisson', False)):
-                try:
-                    import statsmodels.api as sm
-                    Xg = sm.add_constant(X_train_scaled)
-                    gp_model = GeneralizedPoisson(y_train.values, Xg).fit(disp=0)
-                except Exception:
-                    gp_model = None
-        except Exception:
-            poisson_model = None
+        poisson_model, nb_params, gp_model = _fit_poisson_components(X_train_scaled, y_train)
 
         # Poisson expected totals on the test set
         if poisson_model is not None:
@@ -3951,20 +2791,6 @@ class RealDataNHLModel:
         else:
             poisson_pred = None
         
-        # Store trained model
-        self.total_model = {
-            'models': trained_models,
-            'model_order': model_order,
-            'weights': weights_array.tolist(),
-            'feature_pipeline': self.locked_feature_pipeline,
-            'feature_names': self.feature_names,
-            'poisson_model': poisson_model,
-            'nb_params': nb_params,
-            'gp_model': gp_model,
-            'cv_strategy_used': cv_label,
-            'train_speed_profile': speed_profile,
-            'train_sample_cap': applied_sample_cap
-        }
         walk_metrics: Dict[str, Any] = {}
         if speed_cfg.get('walk_forward', True):
             walk_horizon = max(6, min(40, len(X_sorted) // 8 if len(X_sorted) >= 80 else max(4, len(X_sorted) // 4)))
@@ -3981,16 +2807,12 @@ class RealDataNHLModel:
                 walk_step
             )
             if walk_metrics:
-                self.total_model['walk_forward_metrics'] = walk_metrics
                 print(f"Walk-forward RMSE {walk_metrics['rmse']:.3f} (splits={walk_metrics.get('splits_evaluated', 0)})")
         
         # Calculate metrics and residual-based uncertainty (plus conformal radius)
         rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred))
         mae = mean_absolute_error(y_test, ensemble_pred)
         residual_std = float(np.std(y_test.values - ensemble_pred)) if len(y_test) > 1 else 0.85
-
-        # Persist residual std for downstream uncertainty
-        self.total_model['residual_std'] = residual_std
 
         # Symmetric conformal interval via absolute residual quantiles (configurable quantile)
         abs_res = np.abs(y_test.values - ensemble_pred)
@@ -4003,9 +2825,6 @@ class RealDataNHLModel:
             self.conformal_q80 = 0.8
             self.conformal_q90 = 1.0
             self.conformal_radius = self.conformal_q90
-        self.total_model['conformal_q80'] = self.conformal_q80
-        self.total_model['conformal_q90'] = self.conformal_q90
-        self.total_model['conformal_radius'] = self.conformal_radius
         
         # Over/under accuracy (using average line of 6.5)
         test_lines = np.full(len(y_test), 6.5)
@@ -4027,16 +2846,56 @@ class RealDataNHLModel:
             logloss = None
 
         # Fit isotonic calibration mapping from raw over-prob proxies (Gaussian) to outcomes
+        iso_over_model: Optional[IsotonicRegression] = None
         try:
             # Proxy over-prob using Gaussian on test set for calibration only
             std_dev = residual_std if residual_std > 0 else 0.85
             raw_over_prob = norm.sf(test_lines, loc=ensemble_pred, scale=std_dev)
             iso = IsotonicRegression(out_of_bounds='clip')
             iso.fit(raw_over_prob, actual_over)
-            self.total_model['iso_over'] = iso
+            iso_over_model = iso
         except Exception:
-            self.total_model['iso_over'] = None
+            iso_over_model = None
         
+        final_pipeline = self._build_feature_pipeline()
+        try:
+            X_full_scaled = final_pipeline.fit_transform(X_sorted)
+        except Exception:
+            final_pipeline = None
+            X_full_scaled = X_sorted.values
+
+        final_models: Dict[str, Any] = {}
+        for name in model_order:
+            est_full = clone(models[name])
+            est_full.fit(X_sorted, y_sorted)
+            final_models[name] = est_full
+
+        final_poisson, final_nb_params, final_gp = _fit_poisson_components(X_full_scaled, y_sorted)
+
+        self.locked_feature_pipeline = final_pipeline
+
+        model_state: Dict[str, Any] = {
+            'models': final_models,
+            'model_order': model_order,
+            'weights': weights_array.tolist(),
+            'feature_pipeline': final_pipeline,
+            'feature_names': self.feature_names,
+            'poisson_model': final_poisson,
+            'nb_params': final_nb_params,
+            'gp_model': final_gp,
+            'cv_strategy_used': cv_label,
+            'train_speed_profile': speed_profile,
+            'train_sample_cap': applied_sample_cap,
+            'residual_std': residual_std,
+            'conformal_q80': self.conformal_q80,
+            'conformal_q90': self.conformal_q90,
+            'conformal_radius': self.conformal_radius,
+            'iso_over': iso_over_model,
+        }
+        if walk_metrics:
+            model_state['walk_forward_metrics'] = walk_metrics
+        self.total_model = model_state
+
         return {
             'rmse': rmse,
             'mae': mae,
@@ -4262,8 +3121,13 @@ class RealDataNHLModel:
             else:
                 component_weights = [w / total_w for w in component_weights]
             try:
+                feature_seed = np.asarray(feature_row, dtype=np.float64)
+                odds_seed = np.array([betting_line, over_american_odds, under_american_odds], dtype=np.float64)
+                seed_material = feature_seed.tobytes() + odds_seed.tobytes()
+                seed_int = int.from_bytes(hashlib.blake2b(seed_material, digest_size=8).digest(), 'big', signed=False)
+                rng = np.random.default_rng(seed_int)
                 sims = 60000
-                choices = np.random.choice(len(component_mus), size=sims, p=component_weights)
+                choices = rng.choice(len(component_mus), size=sims, p=component_weights)
                 totals = np.zeros(sims)
                 for comp_idx, (mu_h, mu_a) in enumerate(component_mus):
                     mask = choices == comp_idx
@@ -4271,7 +3135,7 @@ class RealDataNHLModel:
                         continue
                     rho_use = component_rhos[comp_idx]
                     cov = np.array([[1.0, rho_use], [rho_use, 1.0]])
-                    z = np.random.multivariate_normal([0, 0], cov, size=int(mask.sum()))
+                    z = rng.multivariate_normal([0, 0], cov, size=int(mask.sum()))
                     u = norm.cdf(z)
                     home_goals = poisson.ppf(u[:, 0], mu_h)
                     away_goals = poisson.ppf(u[:, 1], mu_a)
@@ -4603,11 +3467,15 @@ class RealDataNHLModel:
                 rec['over'] = -110
                 rec['under'] = -110
             else:
-                # Fallback heuristic if not provided
-                base_line = float(np.random.uniform(5.5, 7.5))
-                rec['total'] = round(base_line * 2.0) / 2.0
+                # Deterministic fallback when no odds data present
+                try:
+                    default_total = float(os.getenv('DEFAULT_MARKET_TOTAL', 6.2))
+                except Exception:
+                    default_total = 6.2
+                rec['total'] = round(default_total * 2.0) / 2.0
                 rec['over'] = -110
                 rec['under'] = -110
+                rec['odds_source'] = 'deterministic_fallback'
 
             odds[game_id] = rec
 
@@ -8686,7 +7554,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         # Optional: deploy to www.thepointou.com (HTTP/S3/SFTP)
         try:
             if not cli_args or getattr(cli_args, 'deploy', False):
-                smp = SocialMediaPoster()
+                smp = SocialMediaPoster(image_renderer=save_predictions_image)
                 smp.deploy_dashboard_html(dashboard_file, cli_args=cli_args)
         except Exception as e:
             print(f"⚠️  Deployment step skipped/failed: {e}")
@@ -8697,7 +7565,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 excel_path = getattr(cli_args, 'excel_path', 'predictions.xls') if cli_args else 'predictions.xls'
                 saved = save_predictions_excel(predictions, out_path=excel_path)
                 if saved and (not cli_args or getattr(cli_args, 'post_excel', False)):
-                    smp = SocialMediaPoster()
+                    smp = SocialMediaPoster(image_renderer=save_predictions_image)
                     # Also render a clean image and attach alongside Excel
                     img = save_predictions_image(
                         predictions,
@@ -8721,7 +7589,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
 
         if not cli_args or cli_args.post_social:
             print("\n📲 Step 8: Posting to social media...")
-            social_poster = SocialMediaPoster()
+            social_poster = SocialMediaPoster(image_renderer=save_predictions_image)
             social_results = {'twitter': False, 'discord': False}
             try:
                 # Only post predictions image to Twitter (no text summary)
