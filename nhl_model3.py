@@ -322,7 +322,7 @@ class OverUnderPrediction:
     confidence: float
     expected_value_over: float
     expected_value_under: float
-    recommendation: str  # 'OVER' or 'UNDER' (forced if edge/conf thresholds fail)
+    recommendation: str  # 'OVER', 'UNDER', or 'No Bet' after thresholds/conflict checks
     edge: float
     kelly_bet_size: float
     # Optional American odds used for EV/Kelly
@@ -364,7 +364,9 @@ class OverUnderPrediction:
     ref_goal_adjustment: Optional[float] = None
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
-    # Whether the pick was forced after an initial "No Bet"
+    # Why we declined to make a wager (if recommendation == 'No Bet')
+    no_bet_reason: Optional[str] = None
+    # Whether the pick was forced/overridden after an initial conflict
     forced_recommendation: bool = False
     forced_reason: Optional[str] = None
 
@@ -4382,10 +4384,15 @@ class RealDataNHLModel:
         max_prob_side = max(over_prob, under_prob)
         forced_pick = False
         forced_reason = None
+        no_bet_reason = None
+        kelly_size = 0.0
         
-        if abs(edge) < min_edge or max_prob_side < min_prob:
+        if abs(edge) < min_edge:
             recommendation = 'No Bet'
-            kelly_size = 0.0
+            no_bet_reason = 'low_edge'
+        elif max_prob_side < min_prob:
+            recommendation = 'No Bet'
+            no_bet_reason = 'low_confidence'
         elif edge > min_edge and over_prob > min_prob:
             recommendation = 'OVER'
             # Kelly fraction for decimal odds b (= over_b)
@@ -4426,27 +4433,7 @@ class RealDataNHLModel:
             kelly_size = float(min(float(getattr(self, 'kelly_cap_pct', 2.0))/100.0, kelly_scaled)) * 100.0
         else:
             recommendation = 'No Bet'
-            kelly_size = 0.0
-
-        if recommendation == 'No Bet':
-            forced_pick = True
-            if abs(edge) < min_edge:
-                forced_reason = 'low_edge'
-            elif max_prob_side < min_prob:
-                forced_reason = 'low_confidence'
-            else:
-                forced_reason = 'model_conflict'
-            if ev_over > ev_under:
-                recommendation = 'OVER'
-            elif ev_under > ev_over:
-                recommendation = 'UNDER'
-            else:
-                prob_delta = over_prob - under_prob
-                if abs(prob_delta) > 1e-4:
-                    recommendation = 'OVER' if prob_delta > 0 else 'UNDER'
-                else:
-                    recommendation = 'OVER' if edge >= 0 else 'UNDER'
-            kelly_size = 0.0
+            no_bet_reason = 'model_conflict'
         if recommendation in ('OVER', 'UNDER') and line_decision_side and recommendation != line_decision_side:
             forced_pick = True
             if not forced_reason:
@@ -4496,6 +4483,7 @@ class RealDataNHLModel:
             consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff,
             decision_line=decision_line_value, decision_side=line_decision_side,
             ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment,
+            no_bet_reason=no_bet_reason,
             forced_recommendation=forced_pick, forced_reason=forced_reason
         )
 
