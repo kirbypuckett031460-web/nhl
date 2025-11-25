@@ -33,6 +33,7 @@ TEAM_ABBREV_TO_NAME: Dict[str, str] = {
     'STL': 'St. Louis Blues',
     'TBL': 'Tampa Bay Lightning',
     'TOR': 'Toronto Maple Leafs',
+    'UTA': 'Utah Mammoth',
     'VAN': 'Vancouver Canucks',
     'VGK': 'Vegas Golden Knights',
     'WPG': 'Winnipeg Jets',
