@@ -6444,6 +6444,38 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             if requested_speed in TRAIN_SPEED_PRESETS:
                 model.train_speed_profile = requested_speed
         print(f"🚦 Training speed preset: {model.train_speed_profile}")
+
+        # Historical fetch configuration (days + caching)
+        truthy_flags = {'1', 'true', 'yes', 'on'}
+        hist_days = 414
+        env_hist_days = os.getenv('HISTORICAL_DAYS')
+        if env_hist_days:
+            try:
+                parsed_env_days = int(env_hist_days)
+                if parsed_env_days > 0:
+                    hist_days = parsed_env_days
+            except Exception:
+                print(f"⚠️  Ignoring invalid HISTORICAL_DAYS={env_hist_days!r}")
+        cache_path = os.getenv('HISTORICAL_CACHE_PATH')
+        force_cache_refresh = str(os.getenv('HISTORICAL_CACHE_REFRESH', '')).strip().lower() in truthy_flags
+
+        if cli_args:
+            hist_days_arg = getattr(cli_args, 'historical_days', None)
+            if hist_days_arg is not None:
+                try:
+                    parsed_hist_days = int(hist_days_arg)
+                    if parsed_hist_days > 0:
+                        hist_days = parsed_hist_days
+                    else:
+                        raise ValueError("historical days must be positive")
+                except Exception:
+                    print(f"⚠️  Invalid --historical-days value '{hist_days_arg}'. Using {hist_days}.")
+            cache_candidate = getattr(cli_args, 'historical_cache_path', cache_path)
+            if cache_candidate is not None:
+                cache_str = str(cache_candidate).strip()
+                cache_path = cache_str or None
+            force_cache_refresh = force_cache_refresh or bool(getattr(cli_args, 'historical_cache_refresh', False))
+
         if cli_args:
             max_samples_arg = getattr(cli_args, 'max_train_samples', 0) or 0
             if max_samples_arg and max_samples_arg > 0:
@@ -6533,9 +6565,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         raise
         
         print("\n📊 Step 1: Fetching historical NHL data...")
+        print(f"🗓️ History window: last {hist_days} days")
+        if cache_path:
+            cache_note = "refreshing cache" if force_cache_refresh else "reusing cache when available"
+            print(f"💾 Historical cache: {cache_path} ({cache_note})")
+        else:
+            print("💾 Historical cache: disabled")
         print("🔄 Trying multiple data sources...")
         
-        historical_data = model.fetch_historical_games(days_back=414)
+        historical_data = model.fetch_historical_games(
+            days_back=hist_days,
+            cache_path=cache_path,
+            force_refresh=force_cache_refresh
+        )
         
         if len(historical_data) < 20:
             extended_days = max(hist_days * 2, 120)
