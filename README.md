@@ -37,6 +37,9 @@ Command-line options
 - --train-speed: Choose `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
 - --fast-train: Shortcut for `--train-speed fast`
 - --max-train-samples: Cap how many historical games are used for training (useful for fast experimentation)
+- --historical-days: Limit how many days of completed games are downloaded before training (default `HISTORICAL_DAYS` env or 90)
+- --historical-cache-path: CSV cache for historical games (default `data/history/historical_games.csv`; set to empty to disable)
+- --historical-cache-refresh: Force-refresh the historical cache even if the file already exists
 
 Faster training presets
 -----------------------
