@@ -56,6 +56,16 @@ Risk/edge feedback loop
 - A short status line (e.g., `🛡️ Risk feedback loop: edge≥0.26; prob≥0.58; Kelly×0.78; exposure≤4.8%; loss streak 3`) prints after the calibration summary so you know why recommendations throttled up or down.
 - No special flag is required—just keep `--log-bets` enabled so the loop has fresh data. If you disable logging, the system automatically falls back to the static 0.22 edge / 0.56 probability guardrails.
 
+High-precision accuracy guardrails
+----------------------------------
+
+To push recommendation accuracy as high as possible, the training routine now back-tests two defensive filters on the holdout split and automatically activates them at inference time:
+
+- **Precision edge floor:** we scan a grid of absolute-edge cutoffs, measure the accuracy achieved when only acting on games whose model edge exceeds that cutoff, and retain the tightest floor that materially improves accuracy. This dynamic threshold (often 0.40+ goals) overrides the historical 0.22 edge minimum whenever it proves superior on the validation slate.
+- **Consensus variance cap:** we also inspect the standard deviation between ensemble members for every holdout game. If near-100% accuracy only occurs when the ensemble disagrees by ≤0.12 goals (example), we store that cap and decline future bets whenever the live disagreement exceeds it.
+
+Every prediction now carries `model_consensus_std`, `model_consensus_range`, and `edge_threshold_used` diagnostics, and `OverUnderPrediction.no_bet_reason` will surface `precision_guard` or `consensus_guard` whenever these high-precision filters suppress a wager. Together with the risk feedback loop, this provides a stacked safety system that only green-lights the most unanimous, high-edge positions.
+
 Automated MoneyPuck ETL
 -----------------------
 

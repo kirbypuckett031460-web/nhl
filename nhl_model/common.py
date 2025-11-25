@@ -155,6 +155,10 @@ class OverUnderPrediction:
     ref_goal_adjustment: Optional[float] = None
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
+    # Model diagnostics for higher-precision gating
+    model_consensus_std: Optional[float] = None
+    model_consensus_range: Optional[float] = None
+    edge_threshold_used: Optional[float] = None
     # Why we declined to make a wager (if recommendation == 'No Bet')
     no_bet_reason: Optional[str] = None
     # Whether the pick was forced/overridden after an initial conflict
