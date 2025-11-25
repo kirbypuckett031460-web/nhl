@@ -404,6 +404,12 @@ class RealDataNHLModel:
         self.risk_exposure_cap_pct: float = self.daily_exposure_cap_pct
         self.risk_feedback_snapshot: Optional[Dict[str, Any]] = None
         self.risk_budget_last_scale: float = 1.0
+        self.precision_edge_floor: Optional[float] = None
+        self.precision_guard_accuracy: Optional[float] = None
+        self.precision_guard_support: Optional[int] = None
+        self.consensus_std_cap: Optional[float] = None
+        self.consensus_guard_accuracy: Optional[float] = None
+        self.consensus_guard_support: Optional[int] = None
         # Snapshots used to enrich historical features so they mirror live inputs
         self.team_rates_snapshot: Optional[pd.DataFrame] = None
         self.goalie_rates_snapshot: Optional[pd.DataFrame] = None
@@ -515,6 +521,111 @@ class RealDataNHLModel:
             'rmse': float(np.sqrt(np.mean(np.square(errors_arr)))),
             'mae': float(np.mean(np.abs(errors_arr))),
             'details': per_split
+        }
+
+    def _calibrate_precision_guard(
+        self,
+        ensemble_pred: np.ndarray,
+        actual_totals: np.ndarray,
+        reference_lines: np.ndarray
+    ) -> Optional[Dict[str, Any]]:
+        """Pick an edge floor that improves accuracy on high-conviction games."""
+        try:
+            n_samples = len(actual_totals)
+        except Exception:
+            return None
+        if n_samples < 20:
+            return None
+        abs_edge = np.abs(ensemble_pred - reference_lines)
+        actual_over = (actual_totals > reference_lines).astype(int)
+        predicted_over = (ensemble_pred > reference_lines).astype(int)
+        base_accuracy = float(np.mean(actual_over == predicted_over))
+        quantiles: List[float] = []
+        try:
+            quantiles = list(np.quantile(abs_edge, [0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
+        except Exception:
+            pass
+        candidate_thresholds = sorted(set(
+            round(val, 3) for val in (
+                [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.75, 1.0] + quantiles
+            ) if val and np.isfinite(val)
+        ))
+        if not candidate_thresholds:
+            return None
+        min_support = max(6, int(n_samples * 0.08))
+        best_edge = None
+        best_accuracy = base_accuracy
+        best_support = 0
+        for edge_floor in candidate_thresholds:
+            mask = abs_edge >= edge_floor
+            support = int(mask.sum())
+            if support < min_support:
+                continue
+            acc = float(np.mean(actual_over[mask] == predicted_over[mask]))
+            if acc > best_accuracy + 1e-3 or (abs(acc - best_accuracy) <= 1e-3 and support > best_support):
+                best_accuracy = acc
+                best_support = support
+                best_edge = float(edge_floor)
+        if best_edge is None or best_support == 0:
+            return None
+        return {
+            'edge': best_edge,
+            'accuracy': best_accuracy,
+            'support': best_support,
+            'baseline_accuracy': base_accuracy
+        }
+
+    def _calibrate_consensus_guard(
+        self,
+        model_predictions: np.ndarray,
+        ensemble_pred: np.ndarray,
+        actual_totals: np.ndarray,
+        reference_lines: np.ndarray
+    ) -> Optional[Dict[str, Any]]:
+        """Set a cap on ensemble disagreement for near-perfect consensus bets."""
+        if model_predictions is None or not hasattr(model_predictions, 'ndim'):
+            return None
+        if model_predictions.ndim != 2 or model_predictions.shape[0] < 2:
+            return None
+        n_samples = model_predictions.shape[1]
+        if n_samples < 15:
+            return None
+        consensus_std = np.std(model_predictions, axis=0)
+        actual_over = (actual_totals > reference_lines).astype(int)
+        predicted_over = (ensemble_pred > reference_lines).astype(int)
+        base_accuracy = float(np.mean(actual_over == predicted_over))
+        try:
+            quantiles = list(np.quantile(consensus_std, [0.2, 0.4, 0.6, 0.8]))
+        except Exception:
+            quantiles = []
+        candidate_caps = sorted(set(
+            round(val, 3) for val in (
+                [0.05, 0.08, 0.1, 0.15, 0.2, 0.25, 0.3] + quantiles
+            ) if val and np.isfinite(val)
+        ))
+        if not candidate_caps:
+            return None
+        min_support = max(5, int(n_samples * 0.05))
+        best_cap = None
+        best_accuracy = base_accuracy
+        best_support = 0
+        for cap in candidate_caps:
+            mask = consensus_std <= cap
+            support = int(mask.sum())
+            if support < min_support:
+                continue
+            acc = float(np.mean(actual_over[mask] == predicted_over[mask]))
+            if acc > best_accuracy + 1e-3 or (abs(acc - best_accuracy) <= 1e-3 and support > best_support):
+                best_accuracy = acc
+                best_support = support
+                best_cap = float(cap)
+        if best_cap is None or best_support == 0:
+            return None
+        return {
+            'std_cap': best_cap,
+            'accuracy': best_accuracy,
+            'support': best_support,
+            'baseline_accuracy': base_accuracy
         }
 
     @staticmethod
@@ -2856,6 +2967,36 @@ class RealDataNHLModel:
             iso_over_model = iso
         except Exception:
             iso_over_model = None
+
+        precision_guard = self._calibrate_precision_guard(
+            ensemble_pred=np.asarray(ensemble_pred, dtype=float),
+            actual_totals=y_test.values.astype(float),
+            reference_lines=test_lines.astype(float)
+        )
+        if precision_guard:
+            self.precision_edge_floor = precision_guard['edge']
+            self.precision_guard_accuracy = precision_guard['accuracy']
+            self.precision_guard_support = precision_guard['support']
+            print(
+                f"🎯 Precision guard: |edge|≥{precision_guard['edge']:.2f} "
+                f"hit {precision_guard['accuracy']:.1%} on {precision_guard['support']} holdout games "
+                f"(baseline {precision_guard['baseline_accuracy']:.1%})"
+            )
+        consensus_guard = self._calibrate_consensus_guard(
+            model_predictions=test_preds,
+            ensemble_pred=np.asarray(ensemble_pred, dtype=float),
+            actual_totals=y_test.values.astype(float),
+            reference_lines=test_lines.astype(float)
+        )
+        if consensus_guard:
+            self.consensus_std_cap = consensus_guard['std_cap']
+            self.consensus_guard_accuracy = consensus_guard['accuracy']
+            self.consensus_guard_support = consensus_guard['support']
+            print(
+                f"🤝 Consensus cap: model STD≤{consensus_guard['std_cap']:.2f} "
+                f"hit {consensus_guard['accuracy']:.1%} on {consensus_guard['support']} holdout games "
+                f"(baseline {consensus_guard['baseline_accuracy']:.1%})"
+            )
         
         final_pipeline = self._build_feature_pipeline()
         try:
@@ -2891,6 +3032,12 @@ class RealDataNHLModel:
             'conformal_q90': self.conformal_q90,
             'conformal_radius': self.conformal_radius,
             'iso_over': iso_over_model,
+            'precision_edge_floor': self.precision_edge_floor,
+            'precision_guard_accuracy': self.precision_guard_accuracy,
+            'precision_guard_support': self.precision_guard_support,
+            'consensus_std_cap': self.consensus_std_cap,
+            'consensus_guard_accuracy': self.consensus_guard_accuracy,
+            'consensus_guard_support': self.consensus_guard_support,
         }
         if walk_metrics:
             model_state['walk_forward_metrics'] = walk_metrics
@@ -2907,7 +3054,13 @@ class RealDataNHLModel:
             'brier': brier,
             'logloss': logloss,
             'cv_strategy': cv_label,
-            'walk_forward': walk_metrics
+            'walk_forward': walk_metrics,
+            'precision_edge_floor': self.precision_edge_floor,
+            'precision_guard_accuracy': self.precision_guard_accuracy,
+            'precision_guard_support': self.precision_guard_support,
+            'consensus_std_cap': self.consensus_std_cap,
+            'consensus_guard_accuracy': self.consensus_guard_accuracy,
+            'consensus_guard_support': self.consensus_guard_support
         }
     
     def predict_game(self, game_features: np.ndarray, betting_line: float = 6.5, over_american_odds: int = -110, under_american_odds: int = -110, odds_source: Optional[str] = None, consensus_total: Optional[float] = None) -> OverUnderPrediction:
@@ -3000,6 +3153,8 @@ class RealDataNHLModel:
             weights = np.ones(len(preds_arr), dtype=float)
         weights = weights / weights.sum()
         ensemble_pred = float(np.dot(weights, preds_arr))
+        consensus_std_val = float(np.std(preds_arr)) if len(preds_arr) > 1 else 0.0
+        consensus_range_val = float(np.max(preds_arr) - np.min(preds_arr)) if len(preds_arr) else 0.0
 
         # Poisson expected total
         poisson_model = self.total_model.get('poisson_model')
@@ -3243,8 +3398,21 @@ class RealDataNHLModel:
             pass
 
         # Betting recommendation thresholds (tuned slightly post-calibration)
-        min_edge = float(getattr(self, 'risk_edge_floor', 0.22))
+        base_edge_floor = float(getattr(self, 'risk_edge_floor', 0.22))
+        precision_floor_val = (self.total_model or {}).get('precision_edge_floor')
+        if precision_floor_val is None:
+            precision_floor_val = getattr(self, 'precision_edge_floor', None)
+        precision_floor = float(precision_floor_val) if precision_floor_val is not None else 0.0
+        min_edge = max(base_edge_floor, precision_floor)
+        edge_threshold_used = min_edge
+        edge_reason = 'low_edge'
+        if min_edge > base_edge_floor + 1e-6:
+            edge_reason = 'precision_guard'
         min_prob = float(getattr(self, 'risk_prob_floor', 0.56))
+        consensus_cap_val = (self.total_model or {}).get('consensus_std_cap')
+        if consensus_cap_val is None:
+            consensus_cap_val = getattr(self, 'consensus_std_cap', None)
+        consensus_cap = float(consensus_cap_val) if consensus_cap_val is not None else None
         max_prob_side = max(over_prob, under_prob)
         forced_pick = False
         forced_reason = None
@@ -3253,7 +3421,10 @@ class RealDataNHLModel:
         
         if abs(edge) < min_edge:
             recommendation = 'No Bet'
-            no_bet_reason = 'low_edge'
+            no_bet_reason = edge_reason
+        elif consensus_cap is not None and consensus_std_val > consensus_cap:
+            recommendation = 'No Bet'
+            no_bet_reason = 'consensus_guard'
         elif max_prob_side < min_prob:
             recommendation = 'No Bet'
             no_bet_reason = 'low_confidence'
@@ -3347,6 +3518,9 @@ class RealDataNHLModel:
             consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff,
             decision_line=decision_line_value, decision_side=line_decision_side,
             ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment,
+            model_consensus_std=consensus_std_val,
+            model_consensus_range=consensus_range_val,
+            edge_threshold_used=edge_threshold_used,
             no_bet_reason=no_bet_reason,
             forced_recommendation=forced_pick, forced_reason=forced_reason
         )
