@@ -5840,7 +5840,7 @@ def save_predictions_image(
 
     title_text = (
         f"NHL Predictions\n"
-        f"{ytd_str} | {last_week_str}\n"
+        # f"{ytd_str} | {last_week_str}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds aggregated from multiple books."
     )
