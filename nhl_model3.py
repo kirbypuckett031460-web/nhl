@@ -22,6 +22,12 @@ import pandas as pd
 import numpy as np
 import requests
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+try:
+    from sklearn.experimental import enable_halving_search_cv  # type: ignore  # noqa: F401
+    from sklearn.model_selection import HalvingRandomSearchCV
+    HALVING_SEARCH_AVAILABLE = True
+except Exception:
+    HALVING_SEARCH_AVAILABLE = False
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor
 from sklearn.neural_network import MLPRegressor
@@ -86,6 +92,8 @@ except Exception:
     BEAUTIFULSOUP_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
+
+TRUTHY_FLAGS: Set[str] = {'1', 'true', 'yes', 'on'}
 
 BET_LOG_COLUMNS: List[str] = [
     'date',
@@ -410,6 +418,18 @@ class RealDataNHLModel:
         self.consensus_std_cap: Optional[float] = None
         self.consensus_guard_accuracy: Optional[float] = None
         self.consensus_guard_support: Optional[int] = None
+        self.use_halving_search: bool = str(os.getenv('USE_HALVING_SEARCH', '1')).strip().lower() in TRUTHY_FLAGS
+        self.force_hyper_search: bool = str(os.getenv('FORCE_HYPER_SEARCH', '0')).strip().lower() in TRUTHY_FLAGS
+        default_hparam_cache = os.getenv('HYPERPARAM_CACHE_PATH', 'data/cache/model_hparams.json')
+        try:
+            self.hyperparam_cache_path: Path = Path(default_hparam_cache)
+        except Exception:
+            self.hyperparam_cache_path = Path('model_hparams.json')
+        try:
+            env_jobs = int(os.getenv('TRAIN_N_JOBS', '0'))
+        except Exception:
+            env_jobs = 0
+        self.train_n_jobs: int = env_jobs if env_jobs not in (0, None) else -1
         # Snapshots used to enrich historical features so they mirror live inputs
         self.team_rates_snapshot: Optional[pd.DataFrame] = None
         self.goalie_rates_snapshot: Optional[pd.DataFrame] = None
@@ -522,6 +542,57 @@ class RealDataNHLModel:
             'mae': float(np.mean(np.abs(errors_arr))),
             'details': per_split
         }
+
+    def _should_use_halving(self) -> bool:
+        """Return True when HalvingRandomSearchCV should be used."""
+        return bool(getattr(self, 'use_halving_search', False) and HALVING_SEARCH_AVAILABLE)
+
+    def _hyperparam_cache_key(self, model_name: str, speed_profile: str) -> Optional[str]:
+        """Build a cache key that incorporates the active feature set."""
+        if not model_name:
+            return None
+        feature_signature = 'none'
+        try:
+            if self.feature_names:
+                joined = '||'.join(self.feature_names)
+                feature_signature = hashlib.md5(joined.encode('utf-8')).hexdigest()
+        except Exception:
+            pass
+        return f"{speed_profile}:{model_name}:{feature_signature}:{len(self.feature_names)}"
+
+    def _load_hyperparam_cache(self) -> Dict[str, Dict[str, Any]]:
+        """Read persisted hyperparameter choices from disk."""
+        path = getattr(self, 'hyperparam_cache_path', None)
+        if not path:
+            return {}
+        try:
+            cache_path = Path(path)
+            if cache_path.exists():
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+        except Exception as exc:
+            print(f"⚠️  Hyperparameter cache could not be read: {exc}")
+        return {}
+
+    def _save_hyperparam_cache(self, cache: Dict[str, Dict[str, Any]]) -> None:
+        """Persist tuned hyperparameters for reuse."""
+        if not cache:
+            return
+        path = getattr(self, 'hyperparam_cache_path', None)
+        if not path:
+            return
+        cache_path = Path(path)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix('.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, cache_path)
+            print(f"💾 Hyperparameter cache updated at {cache_path}")
+        except Exception as exc:
+            print(f"⚠️  Could not write hyperparameter cache {cache_path}: {exc}")
 
     def _calibrate_precision_guard(
         self,
@@ -2750,6 +2821,76 @@ class RealDataNHLModel:
                 ('model', estimator)
             ])
 
+        search_n_jobs = self.train_n_jobs if getattr(self, 'train_n_jobs', None) is not None else -1
+        hyper_cache = self._load_hyperparam_cache()
+        hyper_cache_updated = False
+
+        def build_search(estimator_label: str, pipeline, param_grid, iter_count: int):
+            cache_key = self._hyperparam_cache_key(estimator_label, speed_profile)
+            if cache_key and not self.force_hyper_search:
+                cached_params = hyper_cache.get(cache_key)
+                if isinstance(cached_params, dict) and cached_params:
+                    try:
+                        cached_estimator = clone(pipeline)
+                        cached_estimator.set_params(**cached_params)
+                        print(f"⚡ {estimator_label.upper()} loaded cached hyperparameters ({speed_profile})")
+                        return cached_estimator, False
+                    except Exception as exc:
+                        print(f"⚠️  Cached hyperparameters invalid for {estimator_label.upper()}: {exc}. Re-running search.")
+
+            base_kwargs = {
+                'cv': cv_strategy,
+                'random_state': 42,
+                'scoring': 'neg_mean_squared_error',
+                'n_jobs': search_n_jobs,
+                'verbose': 0
+            }
+            use_halving = self._should_use_halving()
+            if use_halving:
+                candidates = max(4, int(iter_count) * 2)
+                try:
+                    search_obj = HalvingRandomSearchCV(
+                        pipeline,
+                        param_grid,
+                        n_candidates=candidates,
+                        factor=3,
+                        resource='n_samples',
+                        aggressive_elimination=True,
+                        **base_kwargs
+                    )
+                    search_label = 'HalvingRandomSearchCV'
+                except Exception as exc:
+                    print(f"⚠️  Halving search unavailable for {estimator_label.upper()}: {exc}. Falling back to RandomizedSearchCV.")
+                    use_halving = False
+            if not self._should_use_halving() or not use_halving:
+                search_obj = RandomizedSearchCV(
+                    pipeline,
+                    param_grid,
+                    n_iter=int(iter_count),
+                    **base_kwargs
+                )
+                search_label = 'RandomizedSearchCV'
+
+            candidate_desc = getattr(search_obj, 'n_candidates', getattr(search_obj, 'n_iter', 'auto'))
+            print(f"🔎 Tuning {estimator_label.upper()} with {search_label} (candidates≈{candidate_desc})")
+            start_time = time.time()
+            try:
+                search_obj.fit(X_train, y_train)
+                elapsed = time.time() - start_time
+                best_score = getattr(search_obj, 'best_score_', None)
+                if best_score is not None:
+                    print(f"✅ {estimator_label.upper()} tuning done in {elapsed:.1f}s (best score {best_score:.4f})")
+                else:
+                    print(f"✅ {estimator_label.upper()} tuning done in {elapsed:.1f}s")
+                best_params = getattr(search_obj, 'best_params_', None)
+                if cache_key and isinstance(best_params, dict):
+                    hyper_cache[cache_key] = best_params
+                    hyper_cache_updated = True
+                return search_obj.best_estimator_, True
+            except Exception as exc:
+                print(f"⚠️  {estimator_label.upper()} tuning failed: {exc}. Using default settings.")
+                return clone(pipeline), False
+
         rf_pipeline = make_model_pipeline(RandomForestRegressor(random_state=42))
         rf_params = {
             'model__n_estimators': speed_cfg['rf_estimators'],
@@ -2757,11 +2898,7 @@ class RealDataNHLModel:
             'model__min_samples_leaf': speed_cfg['rf_min_samples_leaf']
         }
         rf_iter = int(speed_cfg.get('rf_iter', 6))
-        rf_search = RandomizedSearchCV(
-            rf_pipeline, rf_params, n_iter=rf_iter, cv=cv_strategy, random_state=42,
-            scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
-        )
-        rf_search.fit(X_train, y_train)
+        rf_estimator, _ = build_search('rf', rf_pipeline, rf_params, rf_iter)
 
         gb_pipeline = make_model_pipeline(GradientBoostingRegressor(random_state=42))
         gb_params = {
@@ -2770,11 +2907,7 @@ class RealDataNHLModel:
             'model__max_depth': speed_cfg['gb_max_depth']
         }
         gb_iter = int(speed_cfg.get('gb_iter', 6))
-        gb_search = RandomizedSearchCV(
-            gb_pipeline, gb_params, n_iter=gb_iter, cv=cv_strategy, random_state=42,
-            scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
-        )
-        gb_search.fit(X_train, y_train)
+        gb_estimator, _ = build_search('gb', gb_pipeline, gb_params, gb_iter)
 
         hgb_pipeline = make_model_pipeline(HistGradientBoostingRegressor(
             random_state=42,
@@ -2789,29 +2922,24 @@ class RealDataNHLModel:
             'model__l2_regularization': speed_cfg['hgb_l2_regularization']
         }
         hgb_iter = int(speed_cfg.get('hgb_iter', 6))
-        hgb_search = RandomizedSearchCV(
-            hgb_pipeline, hgb_params, n_iter=hgb_iter, cv=cv_strategy, random_state=42,
-            scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
-        )
-        hgb_search.fit(X_train, y_train)
+        hgb_estimator, _ = build_search('hgb', hgb_pipeline, hgb_params, hgb_iter)
 
         ridge_pipeline = make_model_pipeline(Ridge())
         ridge_params = {'model__alpha': speed_cfg['ridge_alphas']}
         ridge_iter = int(speed_cfg.get('ridge_iter', len(ridge_params['model__alpha'])))
         ridge_iter = max(1, min(ridge_iter, len(ridge_params['model__alpha'])))
-        ridge_search = RandomizedSearchCV(
-            ridge_pipeline, ridge_params, n_iter=ridge_iter, cv=cv_strategy, random_state=42,
-            scoring='neg_mean_squared_error', n_jobs=-1, verbose=0
-        )
-        ridge_search.fit(X_train, y_train)
+        ridge_estimator, _ = build_search('ridge', ridge_pipeline, ridge_params, ridge_iter)
+
+        if hyper_cache_updated:
+            self._save_hyperparam_cache(hyper_cache)
 
         # Collect tuned models
         model_order = ['rf', 'gb', 'ridge', 'hgb']
         models = {
-            'rf': rf_search.best_estimator_,
-            'gb': gb_search.best_estimator_,
-            'ridge': ridge_search.best_estimator_,
-            'hgb': hgb_search.best_estimator_
+            'rf': rf_estimator,
+            'gb': gb_estimator,
+            'ridge': ridge_estimator,
+            'hgb': hgb_estimator
         }
 
         # Learn stacking weights via OOF predictions across time-series splits
@@ -6443,10 +6571,27 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             requested_speed = str(requested_speed or '').strip().lower()
             if requested_speed in TRAIN_SPEED_PRESETS:
                 model.train_speed_profile = requested_speed
+            hyper_cache_override = getattr(cli_args, 'hyper_cache_path', None)
+            if hyper_cache_override:
+                try:
+                    model.hyperparam_cache_path = Path(hyper_cache_override)
+                except Exception:
+                    model.hyperparam_cache_path = Path(str(hyper_cache_override))
+            if getattr(cli_args, 'force_hyper_search', False):
+                model.force_hyper_search = True
+            if getattr(cli_args, 'disable_halving_search', False):
+                model.use_halving_search = False
+            train_jobs_arg = getattr(cli_args, 'train_n_jobs', None)
+            if train_jobs_arg is not None:
+                try:
+                    train_jobs_val = int(train_jobs_arg)
+                except Exception:
+                    train_jobs_val = -1
+                model.train_n_jobs = train_jobs_val if train_jobs_val not in (0,) else -1
         print(f"🚦 Training speed preset: {model.train_speed_profile}")
 
         # Historical fetch configuration (days + caching)
-        truthy_flags = {'1', 'true', 'yes', 'on'}
+        truthy_flags = TRUTHY_FLAGS
         hist_days = 414
         env_hist_days = os.getenv('HISTORICAL_DAYS')
         if env_hist_days:
@@ -7889,6 +8034,10 @@ if __name__ == "__main__":
     parser.add_argument('--fast-train', action='store_true', help='Shortcut for --train-speed fast')
     parser.add_argument('--max-train-samples', type=int, default=int(os.getenv('MAX_TRAIN_SAMPLES', '0')), help='Cap how many historical games are used for training (0 = no cap)')
     parser.add_argument('--offline', action='store_true', help='Use offline today games if provided and skip API calls')
+    parser.add_argument('--hyper-cache-path', type=str, default=os.getenv('HYPERPARAM_CACHE_PATH', 'data/cache/model_hparams.json'), help='Path to store tuned hyperparameters for reuse')
+    parser.add_argument('--force-hyper-search', action='store_true', help='Ignore cached hyperparameters and rerun searches')
+    parser.add_argument('--disable-halving-search', action='store_true', help='Disable HalvingRandomSearchCV even if available')
+    parser.add_argument('--train-n-jobs', type=int, default=int(os.getenv('TRAIN_N_JOBS', '0')), help='Parallel jobs for hyperparameter search (-1 uses all cores, 0=auto)')
     parser.add_argument('--realtime-odds', action='store_true', help='Fetch realtime totals odds from an external API (requires ODDS_API_KEY)')
     parser.add_argument('--odds-regions', type=str, default='us', help='Comma-separated odds regions (use "all" for every Odds API region)')
     parser.add_argument('--odds-timeout', type=int, default=25, help='Realtime odds request timeout in seconds')
