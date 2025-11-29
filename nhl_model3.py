@@ -360,6 +360,53 @@ TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
         'walk_forward': False,
         'default_weights': [0.4, 0.35, 0.15, 0.10],
         'auto_sample_cap': 600
+    },
+    'turbo': {
+        'label': 'Turbo (no search)',
+        'rf_estimators': [140],
+        'rf_max_depth': [8],
+        'rf_min_samples_leaf': [2],
+        'rf_iter': 0,
+        'rf_defaults': {
+            'model__n_estimators': 140,
+            'model__max_depth': 8,
+            'model__min_samples_leaf': 2
+        },
+        'gb_estimators': [140],
+        'gb_learning_rate': [0.08],
+        'gb_max_depth': [2],
+        'gb_iter': 0,
+        'gb_defaults': {
+            'model__n_estimators': 140,
+            'model__learning_rate': 0.08,
+            'model__max_depth': 2
+        },
+        'hgb_learning_rate': [0.08],
+        'hgb_max_iter': [180],
+        'hgb_max_depth': [None],
+        'hgb_min_samples_leaf': [25],
+        'hgb_l2_regularization': [0.2],
+        'hgb_iter': 0,
+        'hgb_defaults': {
+            'model__learning_rate': 0.08,
+            'model__max_iter': 180,
+            'model__max_depth': None,
+            'model__min_samples_leaf': 25,
+            'model__l2_regularization': 0.2
+        },
+        'ridge_alphas': [1.0],
+        'ridge_iter': 0,
+        'ridge_defaults': {
+            'model__alpha': 1.0
+        },
+        'use_rolling_origin': False,
+        'tss_splits': 2,
+        'cv_scale': 0.45,
+        'learn_weights': False,
+        'walk_forward': False,
+        'default_weights': [0.45, 0.35, 0.20, 0.0],
+        'auto_sample_cap': 400,
+        'skip_goal_models': True
     }
 }
 
@@ -418,6 +465,7 @@ class RealDataNHLModel:
         self.consensus_std_cap: Optional[float] = None
         self.consensus_guard_accuracy: Optional[float] = None
         self.consensus_guard_support: Optional[int] = None
+        self.skip_goal_model_training: bool = False
         self.use_halving_search: bool = str(os.getenv('USE_HALVING_SEARCH', '1')).strip().lower() in TRUTHY_FLAGS
         self.force_hyper_search: bool = str(os.getenv('FORCE_HYPER_SEARCH', '0')).strip().lower() in TRUTHY_FLAGS
         default_hparam_cache = os.getenv('HYPERPARAM_CACHE_PATH', 'data/cache/model_hparams.json')
@@ -2742,6 +2790,7 @@ class RealDataNHLModel:
             speed_profile = 'balanced'
         self.train_speed_profile = speed_profile
         speed_cfg = TRAIN_SPEED_PRESETS[speed_profile]
+        self.skip_goal_model_training = bool(speed_cfg.get('skip_goal_models', False))
         print(f"⏱️ Training preset: {speed_cfg.get('label', speed_profile.title())}")
         # Optional sample cap for faster presets
         original_len = len(X)
@@ -2825,7 +2874,22 @@ class RealDataNHLModel:
         hyper_cache = self._load_hyperparam_cache()
         hyper_cache_updated = False
 
-        def build_search(estimator_label: str, pipeline, param_grid, iter_count: int):
+        def build_search(
+            estimator_label: str,
+            pipeline,
+            param_grid,
+            iter_count: int,
+            preset_params: Optional[Dict[str, Any]] = None
+        ):
+            iter_count = int(iter_count)
+            if iter_count <= 0:
+                if preset_params:
+                    try:
+                        pipeline.set_params(**preset_params)
+                    except Exception as exc:
+                        print(f"⚠️  Could not apply preset params for {estimator_label.upper()}: {exc}")
+                print(f"⏭️  Skipping hyperparameter search for {estimator_label.upper()} (preset mode)")
+                return pipeline, False
             cache_key = self._hyperparam_cache_key(estimator_label, speed_profile)
             if cache_key and not self.force_hyper_search:
                 cached_params = hyper_cache.get(cache_key)
@@ -2898,7 +2962,8 @@ class RealDataNHLModel:
             'model__min_samples_leaf': speed_cfg['rf_min_samples_leaf']
         }
         rf_iter = int(speed_cfg.get('rf_iter', 6))
-        rf_estimator, _ = build_search('rf', rf_pipeline, rf_params, rf_iter)
+        rf_defaults = speed_cfg.get('rf_defaults')
+        rf_estimator, _ = build_search('rf', rf_pipeline, rf_params, rf_iter, rf_defaults)
 
         gb_pipeline = make_model_pipeline(GradientBoostingRegressor(random_state=42))
         gb_params = {
@@ -2907,7 +2972,8 @@ class RealDataNHLModel:
             'model__max_depth': speed_cfg['gb_max_depth']
         }
         gb_iter = int(speed_cfg.get('gb_iter', 6))
-        gb_estimator, _ = build_search('gb', gb_pipeline, gb_params, gb_iter)
+        gb_defaults = speed_cfg.get('gb_defaults')
+        gb_estimator, _ = build_search('gb', gb_pipeline, gb_params, gb_iter, gb_defaults)
 
         hgb_pipeline = make_model_pipeline(HistGradientBoostingRegressor(
             random_state=42,
@@ -2922,13 +2988,18 @@ class RealDataNHLModel:
             'model__l2_regularization': speed_cfg['hgb_l2_regularization']
         }
         hgb_iter = int(speed_cfg.get('hgb_iter', 6))
-        hgb_estimator, _ = build_search('hgb', hgb_pipeline, hgb_params, hgb_iter)
+        hgb_defaults = speed_cfg.get('hgb_defaults')
+        hgb_estimator, _ = build_search('hgb', hgb_pipeline, hgb_params, hgb_iter, hgb_defaults)
 
         ridge_pipeline = make_model_pipeline(Ridge())
         ridge_params = {'model__alpha': speed_cfg['ridge_alphas']}
-        ridge_iter = int(speed_cfg.get('ridge_iter', len(ridge_params['model__alpha'])))
-        ridge_iter = max(1, min(ridge_iter, len(ridge_params['model__alpha'])))
-        ridge_estimator, _ = build_search('ridge', ridge_pipeline, ridge_params, ridge_iter)
+        ridge_iter_cfg = int(speed_cfg.get('ridge_iter', len(ridge_params['model__alpha'])))
+        if ridge_iter_cfg <= 0:
+            ridge_iter = 0
+        else:
+            ridge_iter = max(1, min(ridge_iter_cfg, len(ridge_params['model__alpha'])))
+        ridge_defaults = speed_cfg.get('ridge_defaults')
+        ridge_estimator, _ = build_search('ridge', ridge_pipeline, ridge_params, ridge_iter, ridge_defaults)
 
         if hyper_cache_updated:
             self._save_hyperparam_cache(hyper_cache)
@@ -6752,11 +6823,14 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         
         print("\n🎯 Step 3: Training prediction model...")
         training_results = model.train_model(X, y, dates)
-        # Train goal models for bivariate Poisson MC
-        try:
-            model.train_goal_models(enhanced_data)
-        except Exception as e:
-            print(f"⚠️  Skipped goal model training: {e}")
+        # Train goal models for bivariate Poisson MC (optional for fastest preset)
+        if getattr(model, 'skip_goal_model_training', False):
+            print("⏭️  Skipping goal flow training for turbo preset")
+        else:
+            try:
+                model.train_goal_models(enhanced_data)
+            except Exception as e:
+                print(f"⚠️  Skipped goal model training: {e}")
         
         print(f"✅ Model trained successfully!")
         print(f"   📊 RMSE: {training_results['rmse']:.3f}")
