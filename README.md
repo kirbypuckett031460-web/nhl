@@ -34,7 +34,7 @@ Command-line options
 - --team-rates-url / --goalie-gsax-url / --penalties-url / --referees-url: Source URLs for auto-populate
 - --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
 - --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
-- --train-speed: Choose `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
+- --train-speed: Choose `turbo`, `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
 - --fast-train: Shortcut for `--train-speed fast`
 - --max-train-samples: Cap how many historical games are used for training (useful for fast experimentation)
 - --historical-days: Limit how many days of completed games are downloaded before training (default `HISTORICAL_DAYS` env or 90)
@@ -44,10 +44,11 @@ Command-line options
 Faster training presets
 -----------------------
 
+- `turbo` reuses preset hyperparameters (no RandomizedSearch), limits training data to the most recent 400 games, skips goal-flow modeling, and turns off walk-forward/stacked-weight recalibration—use when you just need a quick sanity check (<5 minutes on most machines).
 - `balanced` trims the RandomizedSearch grid, scales down rolling-origin splits, and still runs walk-forward checks—this replaces the previous "full" default to cut runtimes ~40–60%.
 - `fast` further caps the training sample (600 games by default), skips stacking weight recalibration and walk-forward validation, and reduces each model search to two iterations for sub-10-minute runs.
 - `full` preserves the original exhaustive workflow (long rolling CV, eight-iteration searches, and walk-forward auditing).
-- You can also set `TRAIN_SPEED=fast|balanced|full` and optionally `MAX_TRAIN_SAMPLES=<N>` via environment variables for automation.
+- You can also set `TRAIN_SPEED=turbo|fast|balanced|full` and optionally `MAX_TRAIN_SAMPLES=<N>` via environment variables for automation.
 
 Risk/edge feedback loop
 -----------------------
