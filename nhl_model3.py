@@ -1130,6 +1130,40 @@ class RealDataNHLModel:
         exposure_cap = float(getattr(self, 'risk_exposure_cap_pct', self.daily_exposure_cap_pct))
         if exposure_cap <= 0:
             return
+
+        def _team_tokens(team_value: Optional[str]) -> Set[str]:
+            tokens: Set[str] = set()
+            candidates = [
+                str(team_value or '').strip(),
+                get_team_abbreviation(team_value),
+                format_team_display(team_value)
+            ]
+            for candidate in candidates:
+                token = str(candidate or '').strip()
+                if token and token.lower() != 'tbd':
+                    tokens.add(token.lower())
+            return tokens
+
+        def _infer_ml_side(pred: OverUnderPrediction) -> Optional[str]:
+            attr = str(getattr(pred, 'moneyline_recommendation_side', '') or '').strip().lower()
+            if attr in ('home', 'away'):
+                return attr
+            rec_val = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
+            if not rec_val or rec_val.lower() == 'no bet':
+                return None
+            rec_lower = rec_val.lower()
+            if rec_lower.startswith('home'):
+                return 'home'
+            if rec_lower.startswith('away'):
+                return 'away'
+            home_tokens = _team_tokens(getattr(pred, 'home_team', None))
+            if any(token and token in rec_lower for token in home_tokens):
+                return 'home'
+            away_tokens = _team_tokens(getattr(pred, 'away_team', None))
+            if any(token and token in rec_lower for token in away_tokens):
+                return 'away'
+            return None
+
         recs: List[OverUnderPrediction] = [
             p for p in predictions
             if p.recommendation != 'No Bet' and isinstance(getattr(p, 'kelly_bet_size', None), (int, float))
@@ -1157,10 +1191,10 @@ class RealDataNHLModel:
             current = float(max(0.0, getattr(p, 'moneyline_bet_size', 0.0)))
             new_size = current * scale
             p.moneyline_bet_size = new_size
-            side = str(getattr(p, 'moneyline_recommendation', '')).strip().upper()
-            if side.startswith('HOME') and isinstance(getattr(p, 'home_moneyline_kelly', None), (int, float)):
+            ml_side = _infer_ml_side(p)
+            if ml_side == 'home' and isinstance(getattr(p, 'home_moneyline_kelly', None), (int, float)):
                 p.home_moneyline_kelly = new_size
-            elif side.startswith('AWAY') and isinstance(getattr(p, 'away_moneyline_kelly', None), (int, float)):
+            elif ml_side == 'away' and isinstance(getattr(p, 'away_moneyline_kelly', None), (int, float)):
                 p.away_moneyline_kelly = new_size
         self.risk_budget_last_scale = scale
         print(
@@ -3693,6 +3727,7 @@ class RealDataNHLModel:
         home_ml_edge = away_ml_edge = None
         home_ml_kelly_pct = away_ml_kelly_pct = None
         moneyline_recommendation = 'No Bet'
+        moneyline_recommendation_side: Optional[str] = None
         moneyline_no_bet_reason = None
         moneyline_bet_size = 0.0
 
@@ -3723,8 +3758,10 @@ class RealDataNHLModel:
             moneyline_recommendation = ml_candidates[-1][0]
             moneyline_no_bet_reason = None
             if moneyline_recommendation == 'HOME ML':
+                moneyline_recommendation_side = 'home'
                 moneyline_bet_size = float(max(0.0, home_ml_kelly_pct or 0.0))
             elif moneyline_recommendation == 'AWAY ML':
+                moneyline_recommendation_side = 'away'
                 moneyline_bet_size = float(max(0.0, away_ml_kelly_pct or 0.0))
             else:
                 moneyline_bet_size = 0.0
@@ -3901,6 +3938,7 @@ class RealDataNHLModel:
             'home_moneyline_kelly': home_ml_kelly_pct,
             'away_moneyline_kelly': away_ml_kelly_pct,
             'moneyline_recommendation': moneyline_recommendation,
+            'moneyline_recommendation_side': moneyline_recommendation_side,
             'moneyline_no_bet_reason': moneyline_no_bet_reason,
             'moneyline_bet_size': moneyline_bet_size
         }
@@ -8125,6 +8163,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     pred.game_id = game_id
                     pred.home_team = game.get('home_team', 'HOME')
                     pred.away_team = game.get('away_team', 'AWAY')
+                    ml_side = str(getattr(pred, 'moneyline_recommendation_side', '') or '').strip().lower()
+                    ml_value = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
+                    if ml_value and ml_value.lower() != 'no bet' and ml_side in ('home', 'away'):
+                        selected_team = pred.home_team if ml_side == 'home' else pred.away_team
+                        display_name = format_team_display(selected_team)
+                        display_name = display_name if display_name and display_name.upper() != 'TBD' else ''
+                        fallback_code = get_team_abbreviation(selected_team)
+                        fallback_code = fallback_code if fallback_code and fallback_code.upper() != 'TBD' else ''
+                        raw_label = str(selected_team or '').strip()
+                        if raw_label.upper() == 'TBD':
+                            raw_label = ''
+                        label = display_name or fallback_code or raw_label or ('HOME' if ml_side == 'home' else 'AWAY')
+                        pred.moneyline_recommendation = f"{label} ML"
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
                     pred.best_home_moneyline_book = best_home_ml_book
