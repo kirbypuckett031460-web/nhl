@@ -70,6 +70,11 @@ To push recommendation accuracy as high as possible, the training routine now ba
 
 Every prediction now carries `model_consensus_std`, `model_consensus_range`, and `edge_threshold_used` diagnostics, and `OverUnderPrediction.no_bet_reason` will surface `precision_guard` or `consensus_guard` whenever these high-precision filters suppress a wager. Together with the risk feedback loop, this provides a stacked safety system that only green-lights the most unanimous, high-edge positions.
 
+Moneyline probabilities
+-----------------------
+
+The same Poisson/flow goal simulations that power the totals market now emit implied win probabilities, EV, and Kelly sizing for both sides of the Moneyline. Provide `home_moneyline` / `away_moneyline` prices (or per-book arrays) in `odds.json` and the model will select the best available price, track consensus values, and surface the metrics everywhere predictions are written (CLI output, Excel/HTML exports, dashboard). Realtime odds fetches automatically request the `h2h` market so no config changes are required when using `--realtime-odds`.
+
 Automated MoneyPuck ETL
 -----------------------
 

@@ -1,7 +1,7 @@
 {
   "VGK@FLA": [
-    {"book": "PINN", "total": 6.0, "over": -112, "under": 100},
-    {"book": "DK",   "total": 6.0, "over": -110, "under": -105}
+    {"book": "PINN", "total": 6.0, "over": -112, "under": 100, "home_moneyline": -135, "away_moneyline": 120},
+    {"book": "DK",   "total": 6.0, "over": -110, "under": -105, "home_moneyline": -130, "away_moneyline": 115}
   ],
-  "demo_0": {"total": 6.5, "over": -110, "under": -110}
+  "demo_0": {"total": 6.5, "over": -110, "under": -110, "home_moneyline": -140, "away_moneyline": 125}
 }
