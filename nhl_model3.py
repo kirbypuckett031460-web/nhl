@@ -39,6 +39,7 @@ from sklearn.impute import SimpleImputer
 import warnings
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Optional, Set, Any
+from dataclasses import fields as dataclass_fields
 import io
 import csv
 import re
@@ -3326,6 +3327,14 @@ class RealDataNHLModel:
         if not self.total_model:
             raise ValueError("Model not trained")
 
+        ou_field_names: Set[str] = getattr(self, '_ou_prediction_fields', set())
+        if not ou_field_names:
+            try:
+                ou_field_names = {field.name for field in dataclass_fields(OverUnderPrediction)}
+            except Exception:
+                ou_field_names = set()
+            self._ou_prediction_fields = ou_field_names
+
         ref_goal_value: Optional[float] = None
         ref_goal_adjustment: float = 0.0
         ref_idx: Optional[int] = None
@@ -3840,42 +3849,74 @@ class RealDataNHLModel:
         except Exception:
             line_diff = None
 
-        return OverUnderPrediction(
-            game_id="", home_team="", away_team="",
-            predicted_total=predicted_total, betting_line=betting_line,
-            over_american_odds=over_american_odds, under_american_odds=under_american_odds,
-            over_probability=over_prob, under_probability=under_prob, push_probability=push_prob,
-            confidence=confidence, expected_value_over=ev_over, expected_value_under=ev_under,
-            recommendation=recommendation, edge=edge, kelly_bet_size=kelly_size,
-            ci_lower=ci_lower, ci_upper=ci_upper,
-            market_over_prob=imp_over, market_under_prob=imp_under,
-            fair_over_prob=fair_over, fair_under_prob=fair_under,
-            odds_source=odds_source,
-            ev_over_novig=ev_over_novig, ev_under_novig=ev_under_novig,
-            consensus_total=consensus_total, best_side_total=betting_line, line_diff=line_diff,
-            decision_line=decision_line_value, decision_side=line_decision_side,
-            ref_goals_gm=ref_goal_value, ref_goal_adjustment=ref_goal_adjustment,
-            model_consensus_std=consensus_std_val,
-            model_consensus_range=consensus_range_val,
-            edge_threshold_used=edge_threshold_used,
-            no_bet_reason=no_bet_reason,
-            forced_recommendation=forced_pick, forced_reason=forced_reason,
-            home_moneyline_odds=home_moneyline_odds,
-            away_moneyline_odds=away_moneyline_odds,
-            consensus_home_moneyline=consensus_home_moneyline,
-            consensus_away_moneyline=consensus_away_moneyline,
-            home_win_probability=home_win_prob,
-            away_win_probability=away_win_prob,
-            home_moneyline_ev=home_ml_ev,
-            away_moneyline_ev=away_ml_ev,
-            home_moneyline_edge=home_ml_edge,
-            away_moneyline_edge=away_ml_edge,
-            home_moneyline_kelly=home_ml_kelly_pct,
-            away_moneyline_kelly=away_ml_kelly_pct,
-            moneyline_recommendation=moneyline_recommendation,
-            moneyline_no_bet_reason=moneyline_no_bet_reason,
-            moneyline_bet_size=moneyline_bet_size
-        )
+        prediction_payload = {
+            'game_id': "",
+            'home_team': "",
+            'away_team': "",
+            'predicted_total': predicted_total,
+            'betting_line': betting_line,
+            'over_american_odds': over_american_odds,
+            'under_american_odds': under_american_odds,
+            'over_probability': over_prob,
+            'under_probability': under_prob,
+            'push_probability': push_prob,
+            'confidence': confidence,
+            'expected_value_over': ev_over,
+            'expected_value_under': ev_under,
+            'recommendation': recommendation,
+            'edge': edge,
+            'kelly_bet_size': kelly_size,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'market_over_prob': imp_over,
+            'market_under_prob': imp_under,
+            'fair_over_prob': fair_over,
+            'fair_under_prob': fair_under,
+            'odds_source': odds_source,
+            'ev_over_novig': ev_over_novig,
+            'ev_under_novig': ev_under_novig,
+            'consensus_total': consensus_total,
+            'best_side_total': betting_line,
+            'line_diff': line_diff,
+            'decision_line': decision_line_value,
+            'decision_side': line_decision_side,
+            'ref_goals_gm': ref_goal_value,
+            'ref_goal_adjustment': ref_goal_adjustment,
+            'model_consensus_std': consensus_std_val,
+            'model_consensus_range': consensus_range_val,
+            'edge_threshold_used': edge_threshold_used,
+            'no_bet_reason': no_bet_reason,
+            'forced_recommendation': forced_pick,
+            'forced_reason': forced_reason,
+            'home_moneyline_odds': home_moneyline_odds,
+            'away_moneyline_odds': away_moneyline_odds,
+            'consensus_home_moneyline': consensus_home_moneyline,
+            'consensus_away_moneyline': consensus_away_moneyline,
+            'home_win_probability': home_win_prob,
+            'away_win_probability': away_win_prob,
+            'home_moneyline_ev': home_ml_ev,
+            'away_moneyline_ev': away_ml_ev,
+            'home_moneyline_edge': home_ml_edge,
+            'away_moneyline_edge': away_ml_edge,
+            'home_moneyline_kelly': home_ml_kelly_pct,
+            'away_moneyline_kelly': away_ml_kelly_pct,
+            'moneyline_recommendation': moneyline_recommendation,
+            'moneyline_no_bet_reason': moneyline_no_bet_reason,
+            'moneyline_bet_size': moneyline_bet_size
+        }
+        if ou_field_names:
+            filtered_payload = {k: v for k, v in prediction_payload.items() if k in ou_field_names}
+            missing_fields = [k for k in prediction_payload.keys() if k not in ou_field_names]
+            if missing_fields and not getattr(self, '_ou_field_warning_printed', False):
+                print(
+                    "⚠️  OverUnderPrediction dataclass missing fields: "
+                    f"{', '.join(sorted(missing_fields))}. "
+                    "Update nhl_model/common.py to enable moneyline outputs."
+                )
+                self._ou_field_warning_printed = True
+        else:
+            filtered_payload = prediction_payload
+        return OverUnderPrediction(**filtered_payload)
 
     def get_betting_lines(self, todays_games: pd.DataFrame) -> Dict[str, float]:
         """[Backward compatible] Load only totals line as float."""
