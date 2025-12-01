@@ -180,5 +180,6 @@ class OverUnderPrediction:
     consensus_home_moneyline: Optional[int] = None
     consensus_away_moneyline: Optional[int] = None
     moneyline_recommendation: Optional[str] = None
+    moneyline_recommendation_side: Optional[str] = None
     moneyline_no_bet_reason: Optional[str] = None
     moneyline_bet_size: float = 0.0
