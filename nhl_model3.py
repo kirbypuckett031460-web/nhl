@@ -4165,7 +4165,8 @@ class RealDataNHLModel:
         params = {
             'apiKey': api_key,
             'regions': regions_clean,
-            'markets': 'totals',
+            # Request both totals (over/under) and h2h (moneyline) markets so ML recommendations have live prices
+            'markets': 'totals,h2h',
             'oddsFormat': 'american'
         }
         url = 'https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds'
