@@ -142,6 +142,8 @@ class OverUnderPrediction:
     # Best price book names
     best_over_book: Optional[str] = None
     best_under_book: Optional[str] = None
+    best_home_moneyline_book: Optional[str] = None
+    best_away_moneyline_book: Optional[str] = None
     # Environment / lineup summaries for dashboard
     env_info: Optional[str] = None
     lineup_info: Optional[str] = None
@@ -164,3 +166,18 @@ class OverUnderPrediction:
     # Whether the pick was forced/overridden after an initial conflict
     forced_recommendation: bool = False
     forced_reason: Optional[str] = None
+    # Moneyline plumbing
+    home_win_probability: Optional[float] = None
+    away_win_probability: Optional[float] = None
+    home_moneyline_odds: Optional[int] = None
+    away_moneyline_odds: Optional[int] = None
+    home_moneyline_ev: Optional[float] = None
+    away_moneyline_ev: Optional[float] = None
+    home_moneyline_edge: Optional[float] = None
+    away_moneyline_edge: Optional[float] = None
+    home_moneyline_kelly: Optional[float] = None
+    away_moneyline_kelly: Optional[float] = None
+    consensus_home_moneyline: Optional[int] = None
+    consensus_away_moneyline: Optional[int] = None
+    moneyline_recommendation: Optional[str] = None
+    moneyline_no_bet_reason: Optional[str] = None

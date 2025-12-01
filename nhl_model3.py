@@ -55,7 +55,7 @@ import errno
 import unicodedata
 from pathlib import Path
 import inspect
-from scipy.stats import norm, poisson, nbinom
+from scipy.stats import norm, poisson, nbinom, skellam
 from sklearn.isotonic import IsotonicRegression
 from nhl_model.common import (
     OverUnderPrediction,
@@ -3262,7 +3262,19 @@ class RealDataNHLModel:
             'consensus_guard_support': self.consensus_guard_support
         }
     
-    def predict_game(self, game_features: np.ndarray, betting_line: float = 6.5, over_american_odds: int = -110, under_american_odds: int = -110, odds_source: Optional[str] = None, consensus_total: Optional[float] = None) -> OverUnderPrediction:
+    def predict_game(
+        self,
+        game_features: np.ndarray,
+        betting_line: float = 6.5,
+        over_american_odds: int = -110,
+        under_american_odds: int = -110,
+        odds_source: Optional[str] = None,
+        consensus_total: Optional[float] = None,
+        home_moneyline_odds: Optional[int] = None,
+        away_moneyline_odds: Optional[int] = None,
+        consensus_home_moneyline: Optional[int] = None,
+        consensus_away_moneyline: Optional[int] = None
+    ) -> OverUnderPrediction:
         """Predict over/under for a single game"""
         
         if not self.total_model:
@@ -3401,6 +3413,8 @@ class RealDataNHLModel:
         except Exception:
             decision_line_value = None
         line_decision_side: Optional[str] = None
+        home_win_prob: Optional[float] = None
+        away_win_prob: Optional[float] = None
 
         def american_to_decimal(american: int) -> float:
             if american >= 100:
@@ -3483,6 +3497,8 @@ class RealDataNHLModel:
                 sims = 60000
                 choices = rng.choice(len(component_mus), size=sims, p=component_weights)
                 totals = np.zeros(sims)
+                home_scores = np.zeros(sims)
+                away_scores = np.zeros(sims)
                 for comp_idx, (mu_h, mu_a) in enumerate(component_mus):
                     mask = choices == comp_idx
                     if not mask.any():
@@ -3494,6 +3510,19 @@ class RealDataNHLModel:
                     home_goals = poisson.ppf(u[:, 0], mu_h)
                     away_goals = poisson.ppf(u[:, 1], mu_a)
                     totals[mask] = home_goals + away_goals
+                    home_scores[mask] = home_goals
+                    away_scores[mask] = away_goals
+                if home_scores.size and away_scores.size:
+                    try:
+                        tie_mask = home_scores == away_scores
+                        home_win_prob = float(np.mean(home_scores > away_scores))
+                        away_win_prob = float(np.mean(away_scores > home_scores))
+                        tie_share = float(np.mean(tie_mask))
+                        home_win_prob += 0.5 * tie_share
+                        away_win_prob += 0.5 * tie_share
+                    except Exception:
+                        home_win_prob = None
+                        away_win_prob = None
                 is_integer_line = abs(betting_line - round(betting_line)) < 1e-9
                 if is_integer_line:
                     push_prob = float(np.mean(totals == round(betting_line)))
@@ -3505,6 +3534,16 @@ class RealDataNHLModel:
                     over_prob = float(1.0 - under_prob)
             except Exception:
                 over_prob = under_prob = push_prob = None
+
+        if (home_win_prob is None or away_win_prob is None) and hm_lr is not None and am_lr is not None:
+            try:
+                home_win_prob = float(skellam.sf(0, hm_lr, am_lr))
+                tie_prob = float(skellam.pmf(0, hm_lr, am_lr))
+                home_win_prob += 0.5 * tie_prob
+                away_win_prob = float(max(0.0, 1.0 - home_win_prob))
+            except Exception:
+                home_win_prob = None
+                away_win_prob = None
 
         if over_prob is None or under_prob is None or push_prob is None:
             if poisson_mu is not None and poisson_mu > 0:
@@ -3586,6 +3625,54 @@ class RealDataNHLModel:
         # No-vig EV using fair probabilities
         ev_over_novig = fair_over * over_b - (1 - fair_over) * 1.0
         ev_under_novig = fair_under * under_b - (1 - fair_under) * 1.0
+
+        # Moneyline plumbing (probabilities already derived from goal simulations)
+        def kelly_fraction(prob: float, decimal_odds: float) -> float:
+            b = decimal_odds - 1.0
+            if b <= 0:
+                return 0.0
+            q = 1.0 - prob
+            return (prob * b - q) / b
+
+        home_ml_ev = away_ml_ev = None
+        home_ml_edge = away_ml_edge = None
+        home_ml_kelly_pct = away_ml_kelly_pct = None
+        moneyline_recommendation = 'No Bet'
+        moneyline_no_bet_reason = None
+
+        if home_win_prob is not None and home_moneyline_odds is not None:
+            home_ml_dec = american_to_decimal(home_moneyline_odds)
+            home_ml_edge = home_win_prob - decimal_to_implied_prob(home_ml_dec)
+            home_ml_ev = home_win_prob * (home_ml_dec - 1.0) - (1 - home_win_prob)
+            kf = kelly_fraction(home_win_prob, home_ml_dec)
+            home_ml_kelly_pct = max(0.0, kf) * 100.0
+        if away_win_prob is not None and away_moneyline_odds is not None:
+            away_ml_dec = american_to_decimal(away_moneyline_odds)
+            away_ml_edge = away_win_prob - decimal_to_implied_prob(away_ml_dec)
+            away_ml_ev = away_win_prob * (away_ml_dec - 1.0) - (1 - away_win_prob)
+            kf = kelly_fraction(away_win_prob, away_ml_dec)
+            away_ml_kelly_pct = max(0.0, kf) * 100.0
+
+        ml_edge_floor = float(getattr(self, 'moneyline_edge_floor', 0.02))
+        ml_prob_floor = float(getattr(self, 'moneyline_prob_floor', 0.0))
+        ml_candidates: List[Tuple[str, float, float]] = []
+        if home_ml_edge is not None and home_win_prob is not None and home_ml_ev is not None:
+            if home_win_prob >= ml_prob_floor and home_ml_edge >= ml_edge_floor:
+                ml_candidates.append(('HOME ML', home_ml_edge, home_ml_ev))
+        if away_ml_edge is not None and away_win_prob is not None and away_ml_ev is not None:
+            if away_win_prob >= ml_prob_floor and away_ml_edge >= ml_edge_floor:
+                ml_candidates.append(('AWAY ML', away_ml_edge, away_ml_ev))
+        if ml_candidates:
+            ml_candidates.sort(key=lambda x: (x[1], x[2]))
+            moneyline_recommendation = ml_candidates[-1][0]
+            moneyline_no_bet_reason = None
+        else:
+            if home_moneyline_odds is None and away_moneyline_odds is None:
+                moneyline_no_bet_reason = 'odds_missing'
+            elif home_win_prob is None or away_win_prob is None:
+                moneyline_no_bet_reason = 'prob_missing'
+            else:
+                moneyline_no_bet_reason = 'edge_guard'
         
         # Isotonic calibration of probability towards historical outcomes (if calibration fitted)
         try:
@@ -3721,7 +3808,21 @@ class RealDataNHLModel:
             model_consensus_range=consensus_range_val,
             edge_threshold_used=edge_threshold_used,
             no_bet_reason=no_bet_reason,
-            forced_recommendation=forced_pick, forced_reason=forced_reason
+            forced_recommendation=forced_pick, forced_reason=forced_reason,
+            home_moneyline_odds=home_moneyline_odds,
+            away_moneyline_odds=away_moneyline_odds,
+            consensus_home_moneyline=consensus_home_moneyline,
+            consensus_away_moneyline=consensus_away_moneyline,
+            home_win_probability=home_win_prob,
+            away_win_probability=away_win_prob,
+            home_moneyline_ev=home_ml_ev,
+            away_moneyline_ev=away_ml_ev,
+            home_moneyline_edge=home_ml_edge,
+            away_moneyline_edge=away_ml_edge,
+            home_moneyline_kelly=home_ml_kelly_pct,
+            away_moneyline_kelly=away_ml_kelly_pct,
+            moneyline_recommendation=moneyline_recommendation,
+            moneyline_no_bet_reason=moneyline_no_bet_reason
         )
 
     def get_betting_lines(self, todays_games: pd.DataFrame) -> Dict[str, float]:
@@ -3743,6 +3844,29 @@ class RealDataNHLModel:
         We choose consensus total as median of totals and best prices for over/under across books. Also return 'consensus_total' and 'source'.
         """
         odds: Dict[str, Dict[str, float]] = {}
+
+        def american_to_decimal(american: int) -> float:
+            try:
+                if american >= 100:
+                    return 1.0 + (american / 100.0)
+                return 1.0 + (100.0 / max(1, abs(american)))
+            except Exception:
+                return 1.0
+
+        def parse_moneyline(entry: Dict[str, Any], side: str) -> Optional[int]:
+            keys = [
+                f'{side}_moneyline',
+                f'{side}_ml',
+                side,
+                f'{side}_price'
+            ]
+            for key in keys:
+                if key in entry:
+                    try:
+                        return int(entry.get(key))
+                    except Exception:
+                        continue
+            return None
         odds_path = os.getenv('ODDS_JSON_PATH', 'odds.json')
         odds_data = None
         try:
@@ -3770,10 +3894,16 @@ class RealDataNHLModel:
                 totals = []
                 over_prices = []
                 under_prices = []
+                home_ml_prices = []
+                away_ml_prices = []
                 best_over = None
                 best_under = None
+                best_home_ml = None
+                best_away_ml = None
                 best_over_book = None
                 best_under_book = None
+                best_home_ml_book = None
+                best_away_ml_book = None
                 books_list = []
                 for entry in raw:
                     try:
@@ -3789,8 +3919,6 @@ class RealDataNHLModel:
                         under_prices.append(u)
                         # Select best price for bettor: highest decimal payout for the side
                         # For over: prefer higher decimal odds
-                        def american_to_decimal(american: int) -> float:
-                            return 1.0 + (american / 100.0) if american >= 100 else 1.0 + (100.0 / abs(american))
                         dec_o = american_to_decimal(o)
                         dec_u = american_to_decimal(u)
                         if best_over is None or dec_o > american_to_decimal(best_over):
@@ -3799,7 +3927,29 @@ class RealDataNHLModel:
                         if best_under is None or dec_u > american_to_decimal(best_under):
                             best_under = u
                             best_under_book = entry.get('book')
-                        books_list.append({'book': entry.get('book'), 'book_key': entry.get('book'), 'total': entry.get('total'), 'over': o, 'under': u})
+                        home_ml = parse_moneyline(entry, 'home')
+                        away_ml = parse_moneyline(entry, 'away')
+                        if home_ml is not None:
+                            home_ml_prices.append(home_ml)
+                            dec_home = american_to_decimal(home_ml)
+                            if best_home_ml is None or dec_home > american_to_decimal(best_home_ml):
+                                best_home_ml = home_ml
+                                best_home_ml_book = entry.get('book')
+                        if away_ml is not None:
+                            away_ml_prices.append(away_ml)
+                            dec_away = american_to_decimal(away_ml)
+                            if best_away_ml is None or dec_away > american_to_decimal(best_away_ml):
+                                best_away_ml = away_ml
+                                best_away_ml_book = entry.get('book')
+                        books_list.append({
+                            'book': entry.get('book'),
+                            'book_key': entry.get('book'),
+                            'total': entry.get('total'),
+                            'over': o,
+                            'under': u,
+                            'home_moneyline': home_ml,
+                            'away_moneyline': away_ml
+                        })
                     except Exception:
                         pass
                 consensus_total = float(np.median(totals)) if totals else 6.5
@@ -3807,6 +3957,16 @@ class RealDataNHLModel:
                 rec['total'] = consensus_total
                 rec['over'] = int(best_over if best_over is not None else (-110))
                 rec['under'] = int(best_under if best_under is not None else (-110))
+                if home_ml_prices:
+                    rec['home_moneyline'] = int(best_home_ml if best_home_ml is not None else home_ml_prices[0])
+                    rec['consensus_home_moneyline'] = int(np.median(home_ml_prices))
+                    if best_home_ml_book:
+                        rec['best_home_moneyline_book'] = best_home_ml_book
+                if away_ml_prices:
+                    rec['away_moneyline'] = int(best_away_ml if best_away_ml is not None else away_ml_prices[0])
+                    rec['consensus_away_moneyline'] = int(np.median(away_ml_prices))
+                    if best_away_ml_book:
+                        rec['best_away_moneyline_book'] = best_away_ml_book
                 if totals:
                     try:
                         rec['dispersion_total_std'] = float(np.std(totals))
@@ -3831,6 +3991,19 @@ class RealDataNHLModel:
                     rec['under'] = int(raw.get('under', -110))
                 except Exception:
                     rec['under'] = -110
+                home_ml = parse_moneyline(raw, 'home')
+                away_ml = parse_moneyline(raw, 'away')
+                if home_ml is not None:
+                    rec['home_moneyline'] = home_ml
+                if away_ml is not None:
+                    rec['away_moneyline'] = away_ml
+                if raw.get('book'):
+                    rec['best_over_book'] = rec.get('best_over_book') or raw.get('book')
+                    rec['best_under_book'] = rec.get('best_under_book') or raw.get('book')
+                    if home_ml is not None:
+                        rec['best_home_moneyline_book'] = raw.get('book')
+                    if away_ml is not None:
+                        rec['best_away_moneyline_book'] = raw.get('book')
             elif raw is not None:
                 # Probably a number-like total
                 try:
@@ -3849,6 +4022,8 @@ class RealDataNHLModel:
                 rec['over'] = -110
                 rec['under'] = -110
                 rec['odds_source'] = 'deterministic_fallback'
+                rec['home_moneyline'] = None
+                rec['away_moneyline'] = None
 
             odds[game_id] = rec
 
@@ -3951,6 +4126,7 @@ class RealDataNHLModel:
 
         # Aggregate odds for each matchup across all available books
         tmp: Dict[str, List[Dict[str, Any]]] = {}
+        moneyline_tmp: Dict[str, List[Dict[str, Any]]] = {}
         # Collect totals from all books (used for consensus/dispersion metrics)
         totals_all: Dict[str, List[float]] = {}
         matched_events = 0
@@ -3970,62 +4146,89 @@ class RealDataNHLModel:
                     book_title = book_title_raw or book_key_raw or 'Unknown'
                     last_update = bk.get('last_update')
                     for mkts in bk.get('markets', []) or []:
-                        if mkts.get('key') != 'totals':
-                            continue
-                        lines_by_point: Dict[float, Dict[str, int]] = {}
-                        points_recorded: Set[float] = set()
-                        for out in mkts.get('outcomes', []) or []:
-                            nm = (out.get('name') or out.get('description') or '').strip().lower()
-                            pt = out.get('point')
-                            pr = out.get('price')
-                            try:
-                                pt_val = float(pt) if pt is not None else None
-                            except Exception:
-                                pt_val = None
-                            if pt_val is not None:
-                                if dispersion_all and pt_val not in points_recorded:
-                                    totals_all.setdefault(mk, []).append(pt_val)
-                                    points_recorded.add(pt_val)
-                                line_entry = lines_by_point.setdefault(pt_val, {})
-                            else:
-                                line_entry = None
-                            try:
-                                pr_int = int(pr)
-                            except Exception:
-                                pr_int = None
-                            if pr_int is None or line_entry is None:
-                                continue
-                            if 'over' in nm:
-                                line_entry['over'] = pr_int
-                            elif 'under' in nm:
-                                line_entry['under'] = pr_int
-                        best_line = None
-                        best_hold = None
-                        for point, prices in lines_by_point.items():
-                            if 'over' not in prices or 'under' not in prices:
-                                continue
-                            hold = abs((1.0 / american_to_decimal(prices['over'])) + (1.0 / american_to_decimal(prices['under'])) - 1.0)
-                            if best_line is None or hold < best_hold:
-                                best_line = (point, prices['over'], prices['under'])
-                                best_hold = hold
-                        if best_line:
-                            total_point, over_price, under_price = best_line
-                            entry = {
-                                'total': total_point,
-                                'over': over_price,
-                                'under': under_price,
-                                'book_key': book_key,
-                                'book_title': book_title,
-                                'event_id': str(ev_id),
-                                'last_update': last_update
-                            }
-                            if dispersion_all:
-                                if total_point not in points_recorded:
+                        key = mkts.get('key')
+                        if key == 'totals':
+                            lines_by_point: Dict[float, Dict[str, int]] = {}
+                            points_recorded: Set[float] = set()
+                            for out in mkts.get('outcomes', []) or []:
+                                nm = (out.get('name') or out.get('description') or '').strip().lower()
+                                pt = out.get('point')
+                                pr = out.get('price')
+                                try:
+                                    pt_val = float(pt) if pt is not None else None
+                                except Exception:
+                                    pt_val = None
+                                if pt_val is not None:
+                                    if dispersion_all and pt_val not in points_recorded:
+                                        totals_all.setdefault(mk, []).append(pt_val)
+                                        points_recorded.add(pt_val)
+                                    line_entry = lines_by_point.setdefault(pt_val, {})
+                                else:
+                                    line_entry = None
+                                try:
+                                    pr_int = int(pr)
+                                except Exception:
+                                    pr_int = None
+                                if pr_int is None or line_entry is None:
+                                    continue
+                                if 'over' in nm:
+                                    line_entry['over'] = pr_int
+                                elif 'under' in nm:
+                                    line_entry['under'] = pr_int
+                            best_line = None
+                            best_hold = None
+                            for point, prices in lines_by_point.items():
+                                if 'over' not in prices or 'under' not in prices:
+                                    continue
+                                hold = abs((1.0 / american_to_decimal(prices['over'])) + (1.0 / american_to_decimal(prices['under'])) - 1.0)
+                                if best_line is None or hold < best_hold:
+                                    best_line = (point, prices['over'], prices['under'])
+                                    best_hold = hold
+                            if best_line:
+                                total_point, over_price, under_price = best_line
+                                entry = {
+                                    'total': total_point,
+                                    'over': over_price,
+                                    'under': under_price,
+                                    'book_key': book_key,
+                                    'book_title': book_title,
+                                    'event_id': str(ev_id),
+                                    'last_update': last_update
+                                }
+                                if dispersion_all:
+                                    if total_point not in points_recorded:
+                                        totals_all.setdefault(mk, []).append(float(total_point))
+                                else:
                                     totals_all.setdefault(mk, []).append(float(total_point))
-                            else:
-                                totals_all.setdefault(mk, []).append(float(total_point))
-                            tmp.setdefault(mk, []).append(entry)
-                            break
+                                tmp.setdefault(mk, []).append(entry)
+                                break
+                        elif key in ('h2h', 'moneyline'):
+                            home_price = None
+                            away_price = None
+                            for out in mkts.get('outcomes', []) or []:
+                                nm_raw = (out.get('name') or out.get('description') or '').strip()
+                                norm = normalize_team(nm_raw)
+                                price = out.get('price')
+                                try:
+                                    price_int = int(price)
+                                except Exception:
+                                    price_int = None
+                                if price_int is None:
+                                    continue
+                                norm_upper = norm.upper()
+                                if norm_upper == home:
+                                    home_price = price_int
+                                elif norm_upper == away:
+                                    away_price = price_int
+                            if home_price is not None and away_price is not None:
+                                moneyline_tmp.setdefault(mk, []).append({
+                                    'home': home_price,
+                                    'away': away_price,
+                                    'book_key': book_key,
+                                    'book_title': book_title,
+                                    'event_id': str(ev_id),
+                                    'last_update': last_update
+                                })
             except Exception:
                 continue
 
@@ -4082,6 +4285,28 @@ class RealDataNHLModel:
                     if ud > best_under_val:
                         best_under_val = ud
                         best_under_book = bk_name
+            # Moneyline aggregation
+            ml_entries = moneyline_tmp.get(mk, [])
+            home_ml_prices = [e.get('home') for e in ml_entries if e.get('home') is not None]
+            away_ml_prices = [e.get('away') for e in ml_entries if e.get('away') is not None]
+            best_home_ml_val = None
+            best_away_ml_val = None
+            best_home_ml_book = None
+            best_away_ml_book = None
+            for entry in ml_entries:
+                hp = entry.get('home')
+                ap = entry.get('away')
+                bk_name = entry.get('book_title') or entry.get('book_key')
+                if hp is not None:
+                    dec = american_to_decimal(hp)
+                    if best_home_ml_val is None or dec > american_to_decimal(best_home_ml_val):
+                        best_home_ml_val = hp
+                        best_home_ml_book = bk_name
+                if ap is not None:
+                    dec = american_to_decimal(ap)
+                    if best_away_ml_val is None or dec > american_to_decimal(best_away_ml_val):
+                        best_away_ml_val = ap
+                        best_away_ml_book = bk_name
             # include per-book list
             books = []
             for entry in arr:
@@ -4092,6 +4317,16 @@ class RealDataNHLModel:
                     'total': entry.get('total'),
                     'over': entry.get('over'),
                     'under': entry.get('under'),
+                    'last_update': entry.get('last_update')
+                })
+            moneyline_books = []
+            for entry in ml_entries:
+                moneyline_books.append({
+                    'book': entry.get('book_title') or entry.get('book_key'),
+                    'book_key': entry.get('book_key'),
+                    'event_id': entry.get('event_id'),
+                    'home_moneyline': entry.get('home'),
+                    'away_moneyline': entry.get('away'),
                     'last_update': entry.get('last_update')
                 })
             rec_out = {
@@ -4107,6 +4342,24 @@ class RealDataNHLModel:
                 'best_under_book': str(best_under_book) if best_under_book is not None else None,
                 'odds_source': 'the-odds-api:aggregate'
             }
+            if home_ml_prices:
+                rec_out['home_moneyline'] = int(best_home_ml_val if best_home_ml_val is not None else home_ml_prices[0])
+                try:
+                    rec_out['consensus_home_moneyline'] = int(np.median(home_ml_prices))
+                except Exception:
+                    rec_out['consensus_home_moneyline'] = int(home_ml_prices[0])
+                if best_home_ml_book is not None:
+                    rec_out['best_home_moneyline_book'] = best_home_ml_book
+            if away_ml_prices:
+                rec_out['away_moneyline'] = int(best_away_ml_val if best_away_ml_val is not None else away_ml_prices[0])
+                try:
+                    rec_out['consensus_away_moneyline'] = int(np.median(away_ml_prices))
+                except Exception:
+                    rec_out['consensus_away_moneyline'] = int(away_ml_prices[0])
+                if best_away_ml_book is not None:
+                    rec_out['best_away_moneyline_book'] = best_away_ml_book
+            if moneyline_books:
+                rec_out['moneyline_books'] = moneyline_books
             # Add dispersion metrics from all books if requested
             arr_all = totals_all.get(mk, []) if dispersion_all else totals
             if arr_all:
@@ -5718,10 +5971,26 @@ def save_predictions_excel(predictions: List[OverUnderPrediction], out_path: str
                 'under_american_odds': p.under_american_odds,
                 'ev_over_novig': p.ev_over_novig,
                 'ev_under_novig': p.ev_under_novig,
+                'home_win_prob': p.home_win_probability,
+                'away_win_prob': p.away_win_probability,
+                'home_moneyline_odds': p.home_moneyline_odds,
+                'away_moneyline_odds': p.away_moneyline_odds,
+                'home_moneyline_ev': p.home_moneyline_ev,
+                'away_moneyline_ev': p.away_moneyline_ev,
+                'home_moneyline_edge': p.home_moneyline_edge,
+                'away_moneyline_edge': p.away_moneyline_edge,
+                'home_moneyline_kelly_pct': p.home_moneyline_kelly,
+                'away_moneyline_kelly_pct': p.away_moneyline_kelly,
+                'moneyline_recommendation': p.moneyline_recommendation,
+                'moneyline_no_bet_reason': p.moneyline_no_bet_reason,
                 'consensus_total': p.consensus_total,
                 'line_diff_vs_consensus': p.line_diff,
+                'consensus_home_moneyline': p.consensus_home_moneyline,
+                'consensus_away_moneyline': p.consensus_away_moneyline,
                 'best_over_book': p.best_over_book,
                 'best_under_book': p.best_under_book,
+                'best_home_moneyline_book': p.best_home_moneyline_book,
+                'best_away_moneyline_book': p.best_away_moneyline_book,
                 'ref_goals_gm': p.ref_goals_gm,
                 'referee_crew': ", ".join(p.referee_crew) if getattr(p, 'referee_crew', None) else None,
                 'referee_avg_goals': p.referee_avg_goals,
@@ -5787,6 +6056,22 @@ def save_predictions_excel(predictions: List[OverUnderPrediction], out_path: str
 
 def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
     """Return a minimal HTML table of predictions with colored Recommendation cells."""
+    def format_moneyline(prob: Optional[float], odds: Optional[int], ev: Optional[float], book: Optional[str]) -> str:
+        if prob is None and odds is None:
+            return ''
+        parts: List[str] = []
+        if isinstance(prob, (int, float)):
+            parts.append(f"{prob:.0%}")
+        if isinstance(odds, (int, float)):
+            sign = f"{int(odds):+}"
+            parts.append(sign)
+        if book:
+            parts.append(f"({book})")
+        body = " ".join(parts)
+        if isinstance(ev, (int, float)) and np.isfinite(ev):
+            return f"{body}<div style='font-size: 0.75rem; color:#7f8c8d;'>EV {ev:+.2f}</div>"
+        return body
+
     rows_html = []
     for p in predictions:
         rec = (p.recommendation or 'No Bet')
@@ -5813,6 +6098,8 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         lineup_txt = getattr(p, 'lineup_info', '') or ''
         kelly_val = getattr(p, 'kelly_bet_size', None)
         kelly_txt = f"{kelly_val:.1f}%" if isinstance(kelly_val, (int, float)) else ''
+        home_ml_cell = format_moneyline(getattr(p, 'home_win_probability', None), getattr(p, 'home_moneyline_odds', None), getattr(p, 'home_moneyline_ev', None), getattr(p, 'best_home_moneyline_book', None))
+        away_ml_cell = format_moneyline(getattr(p, 'away_win_probability', None), getattr(p, 'away_moneyline_odds', None), getattr(p, 'away_moneyline_ev', None), getattr(p, 'best_away_moneyline_book', None))
         matchup_display = format_matchup_display(p.away_team, p.home_team)
         matchup_code = format_matchup_code(p.away_team, p.home_team)
         matchup_title = html_parser.escape(matchup_code, quote=True)
@@ -5822,6 +6109,8 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
             f"<td>{p.betting_line}</td>"
             f"<td>{pred_txt}</td>"
             f"<td>{edge_txt}</td>"
+            f"<td>{home_ml_cell}</td>"
+            f"<td>{away_ml_cell}</td>"
             f"<td>{over_txt}</td>"
             f"<td>{under_txt}</td>"
             f"<td>{conf_txt}</td>"
@@ -5843,7 +6132,7 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
         ".rec-no-bet { background:#f9e79f; color:#7d6608; font-weight:700; }\n"
         "tr:nth-child(even) { background:#fafafa; }\n"
         "</style></head><body>\n<table>\n<thead><tr>\n"
-        "<th>Matchup</th><th>Line</th><th>Predicted</th><th>Edge</th>\n"
+        "<th>Matchup</th><th>Line</th><th>Predicted</th><th>Edge</th><th>Home ML</th><th>Away ML</th>\n"
         "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
         "</tr></thead>\n<tbody>\n"
     )
@@ -6164,6 +6453,11 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                 <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O {'' if pred.ev_over_novig is None else f'{pred.ev_over_novig:+.2f}'} / U {'' if pred.ev_under_novig is None else f'{pred.ev_under_novig:+.2f}'}</div>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: {'' if pred.line_diff is None else f'{pred.line_diff:+.1f}'}</div>
             </td>
+            <td>
+                <div>Home: {'' if pred.home_win_probability is None else f'{pred.home_win_probability:.0%}'} {'' if pred.home_moneyline_odds is None else f'({pred.home_moneyline_odds:+})'} {'' if pred.best_home_moneyline_book is None else f'[{pred.best_home_moneyline_book}]'}</div>
+                <div>Away: {'' if pred.away_win_probability is None else f'{pred.away_win_probability:.0%}'} {'' if pred.away_moneyline_odds is None else f'({pred.away_moneyline_odds:+})'} {'' if pred.best_away_moneyline_book is None else f'[{pred.best_away_moneyline_book}]'}</div>
+                <div style="font-size:0.8rem; color:#7f8c8d;">ML EV: H {'' if pred.home_moneyline_ev is None else f'{pred.home_moneyline_ev:+.2f}'} / A {'' if pred.away_moneyline_ev is None else f'{pred.away_moneyline_ev:+.2f}'}</div>
+            </td>
             <td>{pred.over_probability:.0%}
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: {'' if pred.fair_over_prob is None else f'{pred.fair_over_prob:.0%}'}
                 </div>
@@ -6407,6 +6701,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <li><b>Line</b>: Market total for the game.</li>
                     <li><b>Prediction</b>: Model total with 90% CI.</li>
                     <li><b>Edge</b>: Predicted total minus line (positive favors OVER).</li>
+                    <li><b>Moneyline</b>: Win probability, best price, and EV for each side.</li>
                     <li><b>Over% / Under%</b>: Probability estimates for each side (Fair shows no‑vig).</li>
                     <li><b>Confidence</b>: Composite score (edge, calibration, dispersion, movement).</li>
                     <li><b>Env</b>: Outdoor flag, local start hour, temperature.</li>
@@ -6434,6 +6729,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                         <th>📊 Line</th>
                         <th>🔮 Prediction</th>
                         <th>⚡ Edge</th>
+                        <th>🏆 Moneyline</th>
                         <th>📈 Over %</th>
                         <th>📉 Under %</th>
                         <th>🔥 Confidence</th>
@@ -7615,6 +7911,26 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     consensus_total = float(odds_rec.get('consensus_total', betting_line))
                     best_over_book = odds_rec.get('best_over_book')
                     best_under_book = odds_rec.get('best_under_book')
+                    home_moneyline_price = odds_rec.get('home_moneyline')
+                    away_moneyline_price = odds_rec.get('away_moneyline')
+                    try:
+                        home_moneyline_price = int(home_moneyline_price) if home_moneyline_price is not None else None
+                    except Exception:
+                        home_moneyline_price = None
+                    try:
+                        away_moneyline_price = int(away_moneyline_price) if away_moneyline_price is not None else None
+                    except Exception:
+                        away_moneyline_price = None
+                    try:
+                        consensus_home_moneyline = int(odds_rec.get('consensus_home_moneyline')) if odds_rec.get('consensus_home_moneyline') is not None else None
+                    except Exception:
+                        consensus_home_moneyline = None
+                    try:
+                        consensus_away_moneyline = int(odds_rec.get('consensus_away_moneyline')) if odds_rec.get('consensus_away_moneyline') is not None else None
+                    except Exception:
+                        consensus_away_moneyline = None
+                    best_home_ml_book = odds_rec.get('best_home_moneyline_book')
+                    best_away_ml_book = odds_rec.get('best_away_moneyline_book')
 
                     # Pass through current market dispersion and stale-book factor for Kelly scaling
                     if isinstance(odds_rec.get('dispersion_total_std'), (int, float)):
@@ -7651,13 +7967,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     pred = model.predict_game(
                         np.array(feature_values), betting_line,
                         over_american_odds=over_price, under_american_odds=under_price,
-                        odds_source=odds_source, consensus_total=consensus_total
+                        odds_source=odds_source, consensus_total=consensus_total,
+                        home_moneyline_odds=home_moneyline_price,
+                        away_moneyline_odds=away_moneyline_price,
+                        consensus_home_moneyline=consensus_home_moneyline,
+                        consensus_away_moneyline=consensus_away_moneyline
                     )
                     pred.game_id = game_id
                     pred.home_team = game.get('home_team', 'HOME')
                     pred.away_team = game.get('away_team', 'AWAY')
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
+                    pred.best_home_moneyline_book = best_home_ml_book
+                    pred.best_away_moneyline_book = best_away_ml_book
 
                     ref_goal_val = game.get('ref_goals_gm')
                     if isinstance(ref_goal_val, (int, float)) and np.isfinite(ref_goal_val):
