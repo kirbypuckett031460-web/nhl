@@ -6530,8 +6530,19 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
 
         matchup_display = format_matchup_display(pred.away_team, pred.home_team)
         matchup_search = attr_escape(format_matchup_search_blob(pred.away_team, pred.home_team))
+        ml_rec_value = str(getattr(pred, 'moneyline_recommendation', '') or 'No Bet').strip() or 'No Bet'
+        ml_rec_slug = ml_rec_value.lower().replace(' ', '-').replace('/', '-')
+        ml_reason = str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip()
+        ml_bet_size_raw = getattr(pred, 'moneyline_bet_size', 0.0)
+        try:
+            ml_bet_size = float(ml_bet_size_raw)
+        except Exception:
+            ml_bet_size = 0.0
+        ml_bet_display = f"{ml_bet_size:.1f}% stake" if ml_bet_size > 0 else ''
+        ou_reason = str(getattr(pred, 'no_bet_reason', '') or '').strip()
         row = f"""
         <tr data-gid="{pred.game_id}" data-rec="{pred.recommendation}" data-matchup="{matchup_search}"
+            data-ml-rec="{attr_escape(ml_rec_value)}"
             data-ref-crew="{attr_escape(ref_crew_attr)}"
             data-ref-avg="{attr_escape(ref_avg_attr)}"
             data-ref-bias="{attr_escape(ref_bias_attr)}"
@@ -6572,6 +6583,14 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
             <td>{pred.lineup_info or ''}</td>
             <td>
                 <span class="rec-{pred.recommendation.lower().replace(' ', '-')}">{pred.recommendation}</span>
+                {'' if not ou_reason else f'<div class="rec-note">Reason: {attr_escape(ou_reason)}</div>'}
+            </td>
+            <td>
+                <span class="ml-rec-{ml_rec_slug}">{ml_rec_value}</span>
+                <div class="rec-note">
+                    {ml_bet_display}
+                    {'' if not ml_reason else f'ML reason: {attr_escape(ml_reason)}'}
+                </div>
             </td>
             <td>{pred.kelly_bet_size:.1f}%</td>
         </tr>"""
@@ -6733,6 +6752,39 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
             font-size: 0.8rem;
             font-weight: bold;
         }}
+        .ml-rec-home-ml {{
+            background: linear-gradient(135deg, #d6eaff, #a8d8ff);
+            color: #1f6feb;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .ml-rec-away-ml {{
+            background: linear-gradient(135deg, #ffe0f0, #f5b3d1);
+            color: #c2185b;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .ml-rec-no-bet {{
+            background: linear-gradient(135deg, #f2f6fc, #e5ebf5);
+            color: #566573;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .rec-note {{
+            font-size: 0.75rem;
+            color: #7f8c8d;
+            margin-top: 4px;
+            line-height: 1.3;
+        }}
         
         .status-bar {{
             background: linear-gradient(135deg, #e8f5e8, #d5f4e6);
@@ -6800,7 +6852,8 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <li><b>Confidence</b>: Composite score (edge, calibration, dispersion, movement).</li>
                     <li><b>Env</b>: Outdoor flag, local start hour, temperature.</li>
                     <li><b>Lineup</b>: Aggregate lineup strength (Home/Away).</li>
-                    <li><b>Recommendation</b>: OVER/UNDER/No Bet based on thresholds.</li>
+                    <li><b>O/U Rec</b>: Model side (Over/Under/No Bet) plus conflict reason.</li>
+                    <li><b>ML Rec</b>: Moneyline lean, bet size, and reason (if any).</li>
                     <li><b>Kelly%</b>: Suggested stake (scaled for risk/dispersion).</li>
                 </ul>
             </div>
@@ -6829,7 +6882,8 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                         <th>🔥 Confidence</th>
                         <th>🌤️ Env</th>
                         <th>👥 Lineup</th>
-                        <th>💡 Recommendation</th>
+                        <th>💡 O/U Rec</th>
+                        <th>🏅 ML Rec</th>
                         <th>💰 Kelly %</th>
                     </tr>
                 </thead>
