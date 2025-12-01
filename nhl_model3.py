@@ -1099,6 +1099,31 @@ class RealDataNHLModel:
         if isinstance(prediction.confidence, (int, float)):
             prediction.confidence = float(min(0.97, max(0.05, prediction.confidence + (mult - 1.0) * 0.08)))
 
+    def _apply_kelly_controls(self, kelly_fraction: float, extra_scale: float = 1.0) -> float:
+        """Apply shared Kelly multipliers/caps and return stake in % of bankroll."""
+        try:
+            base = float(kelly_fraction)
+        except Exception:
+            return 0.0
+        if not np.isfinite(base):
+            return 0.0
+        base = max(0.0, base)
+        if base <= 0:
+            return 0.0
+        try:
+            extra_scale_val = float(extra_scale)
+        except Exception:
+            extra_scale_val = 1.0
+        extra_scale_val = max(0.0, extra_scale_val)
+        kelly_mult = float(getattr(self, 'kelly_mult', 0.5))
+        risk_mult = float(getattr(self, 'risk_kelly_multiplier', 1.0))
+        scaled_fraction = base * kelly_mult * risk_mult * (extra_scale_val if extra_scale_val > 0 else 0.0)
+        cap_pct = float(getattr(self, 'kelly_cap_pct', 2.0))
+        cap_fraction = max(0.0, cap_pct) / 100.0
+        if cap_fraction > 0:
+            scaled_fraction = min(cap_fraction, scaled_fraction)
+        return float(max(0.0, scaled_fraction) * 100.0)
+
     def apply_risk_budget(self, predictions: List[OverUnderPrediction]) -> None:
         """Ensure aggregate Kelly exposure stays within the dynamic cap."""
         exposure_cap = float(getattr(self, 'risk_exposure_cap_pct', self.daily_exposure_cap_pct))
@@ -1108,18 +1133,39 @@ class RealDataNHLModel:
             p for p in predictions
             if p.recommendation != 'No Bet' and isinstance(getattr(p, 'kelly_bet_size', None), (int, float))
         ]
-        if not recs:
+        ml_recs: List[OverUnderPrediction] = [
+            p for p in predictions
+            if isinstance(getattr(p, 'moneyline_bet_size', None), (int, float))
+            and getattr(p, 'moneyline_bet_size', 0.0) > 0
+            and isinstance(getattr(p, 'moneyline_recommendation', None), str)
+            and str(p.moneyline_recommendation or '').strip().lower() not in ('', 'no bet')
+        ]
+        if not recs and not ml_recs:
             self.risk_budget_last_scale = 1.0
             return
         total = float(sum(max(0.0, float(p.kelly_bet_size)) for p in recs))
-        if total <= exposure_cap or total <= 0:
+        ml_total = float(sum(max(0.0, float(getattr(p, 'moneyline_bet_size', 0.0))) for p in ml_recs))
+        combined = total + ml_total
+        if combined <= exposure_cap or combined <= 0:
             self.risk_budget_last_scale = 1.0
             return
-        scale = float(max(0.2, exposure_cap / total))
+        scale = float(max(0.2, exposure_cap / combined))
         for p in recs:
             p.kelly_bet_size = float(max(0.0, p.kelly_bet_size * scale))
+        for p in ml_recs:
+            current = float(max(0.0, getattr(p, 'moneyline_bet_size', 0.0)))
+            new_size = current * scale
+            p.moneyline_bet_size = new_size
+            side = str(getattr(p, 'moneyline_recommendation', '')).strip().upper()
+            if side.startswith('HOME') and isinstance(getattr(p, 'home_moneyline_kelly', None), (int, float)):
+                p.home_moneyline_kelly = new_size
+            elif side.startswith('AWAY') and isinstance(getattr(p, 'away_moneyline_kelly', None), (int, float)):
+                p.away_moneyline_kelly = new_size
         self.risk_budget_last_scale = scale
-        print(f"🛡️  Risk budget enforced: scaled Kelly stakes by {scale:.2f} to cap exposure at {exposure_cap:.1f}% (was {total:.1f}%).")
+        print(
+            f"🛡️  Risk budget enforced: scaled stakes by {scale:.2f} to cap combined exposure at "
+            f"{exposure_cap:.1f}% (was totals {total:.1f}% + ML {ml_total:.1f}%)."
+        )
 
     def hydrate_training_context(
         self,
@@ -3639,19 +3685,20 @@ class RealDataNHLModel:
         home_ml_kelly_pct = away_ml_kelly_pct = None
         moneyline_recommendation = 'No Bet'
         moneyline_no_bet_reason = None
+        moneyline_bet_size = 0.0
 
         if home_win_prob is not None and home_moneyline_odds is not None:
             home_ml_dec = american_to_decimal(home_moneyline_odds)
             home_ml_edge = home_win_prob - decimal_to_implied_prob(home_ml_dec)
             home_ml_ev = home_win_prob * (home_ml_dec - 1.0) - (1 - home_win_prob)
             kf = kelly_fraction(home_win_prob, home_ml_dec)
-            home_ml_kelly_pct = max(0.0, kf) * 100.0
+            home_ml_kelly_pct = self._apply_kelly_controls(kf)
         if away_win_prob is not None and away_moneyline_odds is not None:
             away_ml_dec = american_to_decimal(away_moneyline_odds)
             away_ml_edge = away_win_prob - decimal_to_implied_prob(away_ml_dec)
             away_ml_ev = away_win_prob * (away_ml_dec - 1.0) - (1 - away_win_prob)
             kf = kelly_fraction(away_win_prob, away_ml_dec)
-            away_ml_kelly_pct = max(0.0, kf) * 100.0
+            away_ml_kelly_pct = self._apply_kelly_controls(kf)
 
         ml_edge_floor = float(getattr(self, 'moneyline_edge_floor', 0.02))
         ml_prob_floor = float(getattr(self, 'moneyline_prob_floor', 0.0))
@@ -3666,6 +3713,12 @@ class RealDataNHLModel:
             ml_candidates.sort(key=lambda x: (x[1], x[2]))
             moneyline_recommendation = ml_candidates[-1][0]
             moneyline_no_bet_reason = None
+            if moneyline_recommendation == 'HOME ML':
+                moneyline_bet_size = float(max(0.0, home_ml_kelly_pct or 0.0))
+            elif moneyline_recommendation == 'AWAY ML':
+                moneyline_bet_size = float(max(0.0, away_ml_kelly_pct or 0.0))
+            else:
+                moneyline_bet_size = 0.0
         else:
             if home_moneyline_odds is None and away_moneyline_odds is None:
                 moneyline_no_bet_reason = 'odds_missing'
@@ -3731,9 +3784,8 @@ class RealDataNHLModel:
             except Exception:
                 stale_factor = 1.0
             kelly_raw = float(max(0.0, k))
-            risk_mult = float(getattr(self, 'risk_kelly_multiplier', 1.0))
-            kelly_scaled = kelly_raw * float(getattr(self, 'kelly_mult', 0.5)) * dispersion_factor * stale_factor * risk_mult
-            kelly_size = float(min(float(getattr(self, 'kelly_cap_pct', 2.0))/100.0, kelly_scaled)) * 100.0
+            extra_scale = dispersion_factor * stale_factor
+            kelly_size = self._apply_kelly_controls(kelly_raw, extra_scale=extra_scale)
         elif edge < -min_edge and under_prob > min_prob:
             recommendation = 'UNDER'
             base_prob = fair_under if getattr(self, 'kelly_use_fair', False) else under_prob
@@ -3749,9 +3801,8 @@ class RealDataNHLModel:
             except Exception:
                 stale_factor = 1.0
             kelly_raw = float(max(0.0, k))
-            risk_mult = float(getattr(self, 'risk_kelly_multiplier', 1.0))
-            kelly_scaled = kelly_raw * float(getattr(self, 'kelly_mult', 0.5)) * dispersion_factor * stale_factor * risk_mult
-            kelly_size = float(min(float(getattr(self, 'kelly_cap_pct', 2.0))/100.0, kelly_scaled)) * 100.0
+            extra_scale = dispersion_factor * stale_factor
+            kelly_size = self._apply_kelly_controls(kelly_raw, extra_scale=extra_scale)
         else:
             recommendation = 'No Bet'
             no_bet_reason = 'model_conflict'
@@ -3822,7 +3873,8 @@ class RealDataNHLModel:
             home_moneyline_kelly=home_ml_kelly_pct,
             away_moneyline_kelly=away_ml_kelly_pct,
             moneyline_recommendation=moneyline_recommendation,
-            moneyline_no_bet_reason=moneyline_no_bet_reason
+            moneyline_no_bet_reason=moneyline_no_bet_reason,
+            moneyline_bet_size=moneyline_bet_size
         )
 
     def get_betting_lines(self, todays_games: pd.DataFrame) -> Dict[str, float]:
@@ -5983,6 +6035,7 @@ def save_predictions_excel(predictions: List[OverUnderPrediction], out_path: str
                 'away_moneyline_kelly_pct': p.away_moneyline_kelly,
                 'moneyline_recommendation': p.moneyline_recommendation,
                 'moneyline_no_bet_reason': p.moneyline_no_bet_reason,
+                'moneyline_kelly_pct': p.moneyline_bet_size,
                 'consensus_total': p.consensus_total,
                 'line_diff_vs_consensus': p.line_diff,
                 'consensus_home_moneyline': p.consensus_home_moneyline,
