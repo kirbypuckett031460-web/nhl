@@ -37,6 +37,9 @@ Command-line options
 - --train-speed: Choose `turbo`, `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
 - --fast-train: Shortcut for `--train-speed fast`
 - --max-train-samples: Cap how many historical games are used for training (useful for fast experimentation)
+- --model-path: Path to persist/load a serialized ensemble artifact (default `data/cache/trained_model.joblib`)
+- --save-trained-model: Persist the ensemble from the current run to `--model-path`
+- --use-saved-model: Skip retraining and hydrate the ensemble from `--model-path`
 - --historical-days: Limit how many days of completed games are downloaded before training (default `HISTORICAL_DAYS` env or 90)
 - --historical-cache-path: CSV cache for historical games (default `data/history/historical_games.csv`; set to empty to disable)
 - --historical-cache-refresh: Force-refresh the historical cache even if the file already exists
@@ -49,6 +52,13 @@ Faster training presets
 - `fast` further caps the training sample (600 games by default), skips stacking weight recalibration and walk-forward validation, and reduces each model search to two iterations for sub-10-minute runs.
 - `full` preserves the original exhaustive workflow (long rolling CV, eight-iteration searches, and walk-forward auditing).
 - You can also set `TRAIN_SPEED=turbo|fast|balanced|full` and optionally `MAX_TRAIN_SAMPLES=<N>` via environment variables for automation.
+
+Persisting trained ensembles
+----------------------------
+
+- Run `python nhl_model3.py --save-trained-model` after a full training cycle to write the ensemble (pipelines, weights, goal models, conformal stats) to `--model-path` (default `data/cache/trained_model.joblib`).
+- Subsequent prediction-only runs can skip the expensive training step via `python nhl_model3.py --use-saved-model`, which hydrates the cached ensemble but still refreshes historical data, context tables, and odds.
+- Override the default location globally with `TRAINED_MODEL_PATH=/path/to/model.joblib`, or pass a one-off path with `--model-path`.
 
 Risk/edge feedback loop
 -----------------------
@@ -136,6 +146,12 @@ python nhl_model3.py \
 
 ```bash
 python nhl_model3.py --environment-path environment.json --lineup-path lineup_strength.csv
+```
+
+5) Reuse a cached ensemble without retraining:
+
+```bash
+python nhl_model3.py --use-saved-model --model-path data/cache/trained_model.joblib
 ```
 
 `environment.json` schema (keyed by `game_id` or `AWAY@HOME`):

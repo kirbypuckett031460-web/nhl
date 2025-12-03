@@ -21,6 +21,7 @@ Probability calibration limited to isotonic-once – outcome calibration derives
 import pandas as pd
 import numpy as np
 import requests
+import pickle
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 try:
     from sklearn.experimental import enable_halving_search_cv  # type: ignore  # noqa: F401
@@ -91,6 +92,13 @@ try:
     BEAUTIFULSOUP_AVAILABLE = True
 except Exception:
     BEAUTIFULSOUP_AVAILABLE = False
+
+try:
+    import joblib
+    JOBLIB_AVAILABLE = True
+except Exception:
+    joblib = None
+    JOBLIB_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
 
@@ -496,6 +504,128 @@ class RealDataNHLModel:
             self.max_train_samples: Optional[int] = env_cap if env_cap > 0 else None
         except Exception:
             self.max_train_samples = None
+
+    def _model_artifact_payload(self) -> Dict[str, Any]:
+        """Build a serializable payload for the trained ensemble."""
+        payload: Dict[str, Any] = {
+            'version': 1,
+            'created_at': datetime.utcnow().isoformat(),
+            'train_speed_profile': self.train_speed_profile,
+            'feature_names': list(self.feature_names or []),
+            'total_model': self.total_model,
+            'goal_scaler': self.goal_scaler,
+            'market_calibration_snapshot': self.market_calibration_snapshot,
+            'risk_feedback_snapshot': self.risk_feedback_snapshot,
+        }
+        if isinstance(self.total_model, dict):
+            training_results = self.total_model.get('training_results')
+            if training_results:
+                payload['training_results'] = training_results
+        return payload
+
+    def save_trained_model(self, path: Optional[str]) -> Optional[str]:
+        """Persist the current trained ensemble to disk."""
+        if not self.total_model:
+            print("⚠️  No trained model is available to save.")
+            return None
+        target = ensure_local_write_path(path or os.getenv('TRAINED_MODEL_PATH', 'data/cache/trained_model.joblib'))
+        if not target:
+            print("⚠️  Model save path is not writable.")
+            return None
+        if isinstance(self.total_model, dict) and self.goal_scaler is not None:
+            self.total_model['goal_scaler'] = self.goal_scaler
+        payload = self._model_artifact_payload()
+        try:
+            if JOBLIB_AVAILABLE:
+                joblib.dump(payload, target)
+            else:
+                with open(target, 'wb') as fh:
+                    pickle.dump(payload, fh)
+            print(f"💾 Saved trained model to {target}")
+            return target
+        except Exception as exc:
+            print(f"⚠️  Could not save trained model to {target}: {exc}")
+            return None
+
+    def load_trained_model(self, path: Optional[str]) -> bool:
+        """Load a previously trained ensemble from disk."""
+        candidate = str(path or '').strip()
+        if not candidate:
+            print("⚠️  No model path provided for loading.")
+            return False
+        resolved = os.path.abspath(os.path.expanduser(os.path.expandvars(candidate)))
+        if not os.path.exists(resolved):
+            print(f"⚠️  Saved model not found at {resolved}")
+            return False
+        try:
+            if JOBLIB_AVAILABLE:
+                payload = joblib.load(resolved)
+            else:
+                with open(resolved, 'rb') as fh:
+                    payload = pickle.load(fh)
+        except Exception as exc:
+            print(f"⚠️  Failed to load saved model {resolved}: {exc}")
+            return False
+        if isinstance(payload, dict) and 'total_model' in payload:
+            total_model = payload['total_model']
+        elif isinstance(payload, dict) and 'models' in payload:
+            total_model = payload
+        else:
+            print(f"⚠️  Saved model at {resolved} is malformed.")
+            return False
+        if not isinstance(total_model, dict):
+            print(f"⚠️  Saved model at {resolved} is invalid.")
+            return False
+        self.total_model = total_model
+        loaded_feature_names = payload.get('feature_names') if isinstance(payload, dict) else None
+        if not loaded_feature_names and isinstance(total_model.get('feature_names'), list):
+            loaded_feature_names = total_model.get('feature_names')
+        if loaded_feature_names:
+            self.feature_names = list(loaded_feature_names)
+        goal_scaler = payload.get('goal_scaler') if isinstance(payload, dict) else None
+        if goal_scaler is None and total_model.get('goal_scaler') is not None:
+            goal_scaler = total_model.get('goal_scaler')
+        if goal_scaler is not None:
+            self.goal_scaler = goal_scaler
+            self.total_model['goal_scaler'] = goal_scaler
+        self.home_goal_mu_model = total_model.get('home_goal_mu_model')
+        self.away_goal_mu_model = total_model.get('away_goal_mu_model')
+        self.goal_flow_model = total_model.get('goal_flow_model')
+        self.conformal_q80 = total_model.get('conformal_q80')
+        self.conformal_q90 = total_model.get('conformal_q90')
+        self.conformal_radius = total_model.get('conformal_radius')
+        self.precision_edge_floor = total_model.get('precision_edge_floor')
+        self.precision_guard_accuracy = total_model.get('precision_guard_accuracy')
+        self.precision_guard_support = total_model.get('precision_guard_support')
+        self.consensus_std_cap = total_model.get('consensus_std_cap')
+        self.consensus_guard_accuracy = total_model.get('consensus_guard_accuracy')
+        self.consensus_guard_support = total_model.get('consensus_guard_support')
+        if isinstance(payload, dict):
+            self.market_calibration_snapshot = payload.get('market_calibration_snapshot', self.market_calibration_snapshot)
+            self.risk_feedback_snapshot = payload.get('risk_feedback_snapshot', self.risk_feedback_snapshot)
+        training_results = {}
+        if isinstance(payload, dict):
+            training_results = payload.get('training_results') or {}
+        if not training_results and isinstance(total_model.get('training_results'), dict):
+            training_results = total_model.get('training_results')
+        if training_results:
+            training_results = dict(training_results)
+            self.total_model['training_results'] = training_results
+        summary_bits: List[str] = []
+        rmse_val = None
+        acc_val = None
+        if isinstance(training_results, dict):
+            rmse_val = training_results.get('rmse')
+            acc_val = training_results.get('over_under_accuracy')
+        if isinstance(rmse_val, (int, float)) and np.isfinite(rmse_val):
+            summary_bits.append(f"RMSE {rmse_val:.3f}")
+        if isinstance(acc_val, (int, float)) and np.isfinite(acc_val):
+            summary_bits.append(f"Accuracy {acc_val:.1%}")
+        if summary_bits:
+            print(f"📦 Loaded trained model from {resolved} ({'; '.join(summary_bits)})")
+        else:
+            print(f"📦 Loaded trained model from {resolved}")
+        return True
 
     def _build_feature_pipeline(self) -> Pipeline:
         """Return a fresh feature transformation pipeline."""
@@ -2181,6 +2311,9 @@ class RealDataNHLModel:
                 ('scaler', StandardScaler())
             ])
             self.goal_scaler = goal_pipeline
+            if self.total_model is None:
+                self.total_model = {}
+            self.total_model['goal_scaler'] = goal_pipeline
             Xg_scaled = goal_pipeline.fit_transform(Xg)
             y_home = df['home_goals'].astype(float)
             y_away = df['away_goals'].astype(float)
@@ -3321,9 +3454,7 @@ class RealDataNHLModel:
         }
         if walk_metrics:
             model_state['walk_forward_metrics'] = walk_metrics
-        self.total_model = model_state
-
-        return {
+        training_summary = {
             'rmse': rmse,
             'mae': mae,
             'over_under_accuracy': ou_accuracy,
@@ -3342,6 +3473,11 @@ class RealDataNHLModel:
             'consensus_guard_accuracy': self.consensus_guard_accuracy,
             'consensus_guard_support': self.consensus_guard_support
         }
+        model_state['training_results'] = training_summary
+        model_state['trained_at'] = datetime.utcnow().isoformat()
+        self.total_model = model_state
+
+        return training_summary
     
     def predict_game(
         self,
@@ -7189,6 +7325,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             'lineup_path': getattr(cli_args, 'lineup_path', None) if cli_args else None,
             'environment_path': getattr(cli_args, 'environment_path', None) if cli_args else None
         }
+        default_model_path = os.getenv('TRAINED_MODEL_PATH', 'data/cache/trained_model.joblib')
+        artifact_candidate = getattr(cli_args, 'model_path', default_model_path) if cli_args else default_model_path
+        model_artifact_path = str(artifact_candidate).strip() if artifact_candidate else ''
+        if not model_artifact_path:
+            model_artifact_path = None
+        save_trained_model_flag = bool(
+            (getattr(cli_args, 'save_trained_model', False) if cli_args else False)
+            or str(os.getenv('SAVE_TRAINED_MODEL', '')).strip().lower() in truthy_flags
+        )
+        use_saved_model_flag = bool(
+            (getattr(cli_args, 'use_saved_model', False) if cli_args else False)
+            or str(os.getenv('USE_SAVED_MODEL', '')).strip().lower() in truthy_flags
+        )
         model.hydrate_training_context(**context_kwargs)
 
         if cli_args and getattr(cli_args, 'refresh_moneypuck', False):
@@ -7304,21 +7453,53 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         
         print(f"✅ Created {len(model.feature_names)} features from {len(X)} games")
         
-        print("\n🎯 Step 3: Training prediction model...")
-        training_results = model.train_model(X, y, dates)
-        # Train goal models for bivariate Poisson MC (optional for fastest preset)
-        if getattr(model, 'skip_goal_model_training', False):
-            print("⏭️  Skipping goal flow training for turbo preset")
+        print("\n🎯 Step 3: Train or load prediction model...")
+        training_results: Dict[str, Any] = {}
+        model_loaded_from_disk = False
+        if use_saved_model_flag:
+            if model_artifact_path:
+                model_loaded_from_disk = model.load_trained_model(model_artifact_path)
+                if model_loaded_from_disk:
+                    training_results = (model.total_model or {}).get('training_results', {}) or {}
+            else:
+                print("⚠️  --use-saved-model requested but no --model-path was provided.")
+        if not model_loaded_from_disk:
+            training_results = model.train_model(X, y, dates)
+            # Train goal models for bivariate Poisson MC (optional for fastest preset)
+            if getattr(model, 'skip_goal_model_training', False):
+                print("⏭️  Skipping goal flow training for turbo preset")
+            else:
+                try:
+                    model.train_goal_models(enhanced_data)
+                except Exception as e:
+                    print(f"⚠️  Skipped goal model training: {e}")
+            print("✅ Model trained successfully!")
+            if training_results:
+                rmse_val = training_results.get('rmse')
+                acc_val = training_results.get('over_under_accuracy')
+                train_rows = training_results.get('train_size')
+                if isinstance(rmse_val, (int, float)):
+                    print(f"   📊 RMSE: {rmse_val:.3f}")
+                if isinstance(acc_val, (int, float)):
+                    print(f"   🎯 O/U Accuracy: {acc_val:.1%}")
+                if isinstance(train_rows, (int, float)):
+                    print(f"   📈 Training samples: {int(train_rows)}")
+            if save_trained_model_flag:
+                if model_artifact_path:
+                    model.save_trained_model(model_artifact_path)
+                else:
+                    print("⚠️  --save-trained-model requested but no --model-path was provided.")
         else:
-            try:
-                model.train_goal_models(enhanced_data)
-            except Exception as e:
-                print(f"⚠️  Skipped goal model training: {e}")
-        
-        print(f"✅ Model trained successfully!")
-        print(f"   📊 RMSE: {training_results['rmse']:.3f}")
-        print(f"   🎯 O/U Accuracy: {training_results['over_under_accuracy']:.1%}")
-        print(f"   📈 Training samples: {training_results['train_size']}")
+            summary_bits = []
+            rmse_val = training_results.get('rmse')
+            acc_val = training_results.get('over_under_accuracy')
+            if isinstance(rmse_val, (int, float)):
+                summary_bits.append(f"RMSE {rmse_val:.3f}")
+            if isinstance(acc_val, (int, float)):
+                summary_bits.append(f"Accuracy {acc_val:.1%}")
+            descriptor = "; ".join(summary_bits) if summary_bits else "using cached ensemble"
+            origin = model_artifact_path or "preconfigured path"
+            print(f"📦 Using saved model from {origin} ({descriptor})")
 
         log_path_default = getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv'
         calibration_snapshot = model.update_market_calibration(
@@ -8589,7 +8770,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             print(f"📂 Please manually open: {dashboard_file}")
         
         print(f"\n🎉 SUCCESS!")
-        print(f"📊 Model Performance: RMSE {training_results['rmse']:.3f}, Accuracy {training_results['over_under_accuracy']:.1%}")
+        if training_results:
+            rmse_final = training_results.get('rmse')
+            acc_final = training_results.get('over_under_accuracy')
+            if isinstance(rmse_final, (int, float)) and isinstance(acc_final, (int, float)):
+                print(f"📊 Model Performance: RMSE {rmse_final:.3f}, Accuracy {acc_final:.1%}")
         
         betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
         print(f"🎯 Generated {len(predictions)} predictions with {len(betting_preds)} recommended bets")
@@ -8629,6 +8814,9 @@ if __name__ == "__main__":
     parser.add_argument('--train-speed', choices=['fast','balanced','full'], default=default_train_speed, help='Training speed preset: fast trims CV + samples, balanced is default, full matches legacy exhaustive search')
     parser.add_argument('--fast-train', action='store_true', help='Shortcut for --train-speed fast')
     parser.add_argument('--max-train-samples', type=int, default=int(os.getenv('MAX_TRAIN_SAMPLES', '0')), help='Cap how many historical games are used for training (0 = no cap)')
+    parser.add_argument('--model-path', type=str, default=os.getenv('TRAINED_MODEL_PATH', 'data/cache/trained_model.joblib'), help='Path to persist/load the trained ensemble artifact')
+    parser.add_argument('--save-trained-model', action='store_true', help='Persist the trained ensemble to --model-path after fitting')
+    parser.add_argument('--use-saved-model', action='store_true', help='Skip retraining and load the ensemble from --model-path')
     parser.add_argument('--offline', action='store_true', help='Use offline today games if provided and skip API calls')
     parser.add_argument('--hyper-cache-path', type=str, default=os.getenv('HYPERPARAM_CACHE_PATH', 'data/cache/model_hparams.json'), help='Path to store tuned hyperparameters for reuse')
     parser.add_argument('--force-hyper-search', action='store_true', help='Ignore cached hyperparameters and rerun searches')
