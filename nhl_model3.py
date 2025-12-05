@@ -6563,11 +6563,46 @@ def save_predictions_image(
             except Exception:
                 return '—'
 
+        def _safe_prob(value: Optional[float]) -> Optional[float]:
+            try:
+                val = float(value)
+                if not np.isfinite(val):
+                    return None
+                return val
+            except Exception:
+                return None
+
         recommendation = getattr(pred, 'recommendation', '') or ''
         if isinstance(recommendation, str):
-            pick_txt = recommendation.title()
+            pick_base = recommendation.strip()
         else:
-            pick_txt = str(recommendation)
+            pick_base = str(recommendation).strip()
+        rec_lower = pick_base.lower()
+        if not pick_base or rec_lower == 'no bet':
+            decision_side = str(getattr(pred, 'decision_side', '') or '').strip()
+            if decision_side:
+                pick_base = decision_side
+            else:
+                over_prob = _safe_prob(getattr(pred, 'over_probability', None))
+                under_prob = _safe_prob(getattr(pred, 'under_probability', None))
+                if over_prob is not None or under_prob is not None:
+                    over_val = over_prob if over_prob is not None else 0.0
+                    under_val = under_prob if under_prob is not None else 0.0
+                    pick_base = 'OVER' if over_val >= under_val else 'UNDER'
+        if not pick_base:
+            pick_base = 'OVER'
+        pick_txt = pick_base.title()
+
+        ml_raw = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
+        ml_upper = ml_raw.upper()
+        if not ml_upper or ml_upper == 'NO BET':
+            ml_txt = 'No Bet'
+        elif ml_upper == 'HOME ML':
+            ml_txt = 'Home ML'
+        elif ml_upper == 'AWAY ML':
+            ml_txt = 'Away ML'
+        else:
+            ml_txt = ml_raw.title() if ml_raw else 'No Bet'
 
         away_display = format_team_display(getattr(pred, 'away_team', None))
         home_display = format_team_display(getattr(pred, 'home_team', None))
@@ -6578,6 +6613,7 @@ def save_predictions_image(
             'Line': _fmt_float(getattr(pred, 'betting_line', None)),
             'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
             'Pick': pick_txt,
+            'Moneyline': ml_txt,
             'Conf%': _fmt_conf(getattr(pred, 'confidence', None)),
             '_sort_key': sort_key
         })
@@ -6589,6 +6625,7 @@ def save_predictions_image(
 
     df = df.sort_values(by=['_sort_key', 'Time']).drop(columns=['_sort_key'])
     df = df.replace({None: '—', np.nan: '—'})
+    columns = list(df.columns)
 
     fig_height = 0.27 * max(1, len(df)) + 1.0
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
@@ -6611,16 +6648,17 @@ def save_predictions_image(
         'Line': 0.08,
         'Predicted': 0.12,
         'Pick': 0.1,
+        'Moneyline': 0.12,
         'Conf%': 0.1
     }
     fallback_width = max(0.08, 1.0 / max(1, len(df.columns)))
-    col_widths = [default_col_widths.get(str(col), fallback_width) for col in df.columns]
+    col_widths = [default_col_widths.get(str(col), fallback_width) for col in columns]
     total_width = sum(col_widths)
     if total_width > 0:
         col_widths = [w / total_width for w in col_widths]
     table = plt.table(
         cellText=df.values,
-        colLabels=df.columns,
+        colLabels=columns,
         cellLoc='center',
         colWidths=col_widths,
         loc='upper center'
@@ -6636,7 +6674,8 @@ def save_predictions_image(
             cell.set_facecolor('#2c3e50')
             cell.set_text_props(color='white', weight='bold', fontsize=13)
         else:
-            if col_idx == 5:  # Pick column
+            col_name = columns[col_idx] if col_idx < len(columns) else ''
+            if col_name == 'Pick':
                 pick_val = str(df.iloc[row_idx - 1, col_idx]).upper()
                 if pick_val == 'OVER':
                     cell.set_facecolor('#27ae60')
@@ -6646,6 +6685,19 @@ def save_predictions_image(
                     cell.set_text_props(color='white', weight='bold')
                 else:
                     cell.set_facecolor('#ecf0f1')
+            elif col_name == 'Moneyline':
+                ml_val = str(df.iloc[row_idx - 1, col_idx]).upper()
+                if 'HOME' in ml_val:
+                    cell.set_facecolor('#2980b9')
+                    cell.set_text_props(color='white', weight='bold')
+                elif 'AWAY' in ml_val:
+                    cell.set_facecolor('#8e44ad')
+                    cell.set_text_props(color='white', weight='bold')
+                elif 'NO BET' in ml_val:
+                    cell.set_facecolor('#ecf0f1')
+                    cell.set_text_props(color='#2c3e50', weight='normal')
+                else:
+                    cell.set_facecolor('#fdf2e9')
             elif row_idx % 2 == 0:
                 cell.set_facecolor('#f8f9fa')
 
