@@ -6595,14 +6595,12 @@ def save_predictions_image(
 
         ml_raw = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
         ml_upper = ml_raw.upper()
-        if not ml_upper or ml_upper == 'NO BET':
-            ml_txt = 'No Bet'
-        elif ml_upper == 'HOME ML':
-            ml_txt = 'Home ML'
-        elif ml_upper == 'AWAY ML':
-            ml_txt = 'Away ML'
+        if 'HOME' in ml_upper:
+            ml_txt = 'Home'
+        elif 'AWAY' in ml_upper:
+            ml_txt = 'Away'
         else:
-            ml_txt = ml_raw.title() if ml_raw else 'No Bet'
+            ml_txt = '—'
 
         away_display = format_team_display(getattr(pred, 'away_team', None))
         home_display = format_team_display(getattr(pred, 'home_team', None))
@@ -6693,7 +6691,7 @@ def save_predictions_image(
                 elif 'AWAY' in ml_val:
                     cell.set_facecolor('#8e44ad')
                     cell.set_text_props(color='white', weight='bold')
-                elif 'NO BET' in ml_val:
+                elif 'NO BET' in ml_val or ml_val == '—':
                     cell.set_facecolor('#ecf0f1')
                     cell.set_text_props(color='#2c3e50', weight='normal')
                 else:
