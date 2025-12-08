@@ -179,7 +179,8 @@ class OverUnderPrediction:
     away_moneyline_kelly: Optional[float] = None
     consensus_home_moneyline: Optional[int] = None
     consensus_away_moneyline: Optional[int] = None
+    # Moneyline-specific recommendation metadata
     moneyline_recommendation: Optional[str] = None
-    moneyline_recommendation_side: Optional[str] = None
+    moneyline_recommendation_side: Optional[str] = None  # 'home', 'away', or None
     moneyline_no_bet_reason: Optional[str] = None
     moneyline_bet_size: float = 0.0
