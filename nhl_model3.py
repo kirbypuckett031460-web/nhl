@@ -6587,13 +6587,31 @@ def save_predictions_image(
         pick_txt = pick_base.title()
 
         ml_raw = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
-        ml_upper = ml_raw.upper()
+        ml_reason = str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip()
+        ml_bet_size = getattr(pred, 'moneyline_bet_size', 0.0)
+        ml_txt = ml_raw if ml_raw else 'No Bet'
+        ml_upper = ml_txt.upper()
+        ml_notes: List[str] = []
         if 'HOME' in ml_upper:
-            ml_txt = 'Home'
+            ml_odds = getattr(pred, 'home_moneyline_odds', None)
+            ml_book = getattr(pred, 'best_home_moneyline_book', None)
         elif 'AWAY' in ml_upper:
-            ml_txt = 'Away'
+            ml_odds = getattr(pred, 'away_moneyline_odds', None)
+            ml_book = getattr(pred, 'best_away_moneyline_book', None)
         else:
-            ml_txt = '—'
+            ml_odds = None
+            ml_book = None
+        if isinstance(ml_odds, (int, float)):
+            ml_notes.append(f"{int(ml_odds):+}")
+        if ml_book:
+            ml_notes.append(str(ml_book))
+        if isinstance(ml_bet_size, (int, float)) and ml_bet_size > 0:
+            ml_notes.append(f"{ml_bet_size:.1f}%")
+        if ml_notes and ml_upper not in {'NO BET', '—'}:
+            ml_txt = f"{ml_txt} ({', '.join(ml_notes)})"
+        elif ml_upper in {'NO BET', '—'} and ml_reason:
+            human_reason = ml_reason.replace('_', ' ')
+            ml_txt = f"No Bet ({human_reason})"
 
         away_display = format_team_display(getattr(pred, 'away_team', None))
         home_display = format_team_display(getattr(pred, 'home_team', None))
