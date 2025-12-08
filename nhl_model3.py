@@ -1456,7 +1456,8 @@ class RealDataNHLModel:
                     away_abbr=away_abbr
                 )
                 if not stats:
-                    stats = self._fallback_game_stats(game_data['home_goals'], game_data['away_goals'])
+                    print(f"⚠️  Skipping game {game_data['game_id']} due to incomplete stats")
+                    continue
                 game_data.update(stats)
                 game_data['home_saves'] = max(0, (game_data.get('away_shots') or 0) - (game_data.get('away_goals') or 0))
                 game_data['away_saves'] = max(0, (game_data.get('home_shots') or 0) - (game_data.get('home_goals') or 0))
@@ -1569,18 +1570,10 @@ class RealDataNHLModel:
             'home_goalie': _goalie_name(home_block),
             'away_goalie': _goalie_name(away_block)
         }
-        return {k: v for k, v in result.items() if v is not None}
-
-    def _fallback_game_stats(self, home_goals: int, away_goals: int) -> Dict[str, Any]:
-        """Fallback stats used when boxscore data is unavailable."""
-        return {
-            'home_shots': max(20, int(np.random.normal(32, 4))),
-            'away_shots': max(20, int(np.random.normal(30, 4))),
-            'home_pp_goals': min(home_goals, max(0, int(np.random.poisson(0.7)))),
-            'away_pp_goals': min(away_goals, max(0, int(np.random.poisson(0.7)))),
-            'home_pp_opps': max(1, int(np.random.poisson(3.0))),
-            'away_pp_opps': max(1, int(np.random.poisson(3.0)))
-        }
+        required = ['home_shots', 'away_shots', 'home_pp_goals', 'away_pp_goals', 'home_pp_opps', 'away_pp_opps']
+        if any(result.get(key) is None for key in required):
+            return {}
+        return result
     
     def create_realistic_sample_data(self) -> pd.DataFrame:
         """Create realistic sample data based on current NHL trends"""
