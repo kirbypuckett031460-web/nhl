@@ -1,17 +1,21 @@
-import pandas as pd
-import numpy as np
+import io
 import json
-import time
 import os
+import time
+import warnings
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
-import warnings
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 # Optional imports - will work without these if not available
 try:
     import requests
+
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
@@ -19,10 +23,61 @@ except ImportError:
 
 try:
     from bs4 import BeautifulSoup
+
     BEAUTIFULSOUP_AVAILABLE = True
 except ImportError:
     BEAUTIFULSOUP_AVAILABLE = False
     print("BeautifulSoup not available. Web scraping will be disabled.")
+
+try:
+    from nhl_model.common import TEAM_ABBREV_TO_NAME, TEAM_NAME_TO_ABBREV
+except Exception:
+    TEAM_ABBREV_TO_NAME = {}
+    TEAM_NAME_TO_ABBREV = {}
+
+
+def _normalize_team_abbr(value: Optional[str]) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    up = raw.upper()
+    if up in TEAM_ABBREV_TO_NAME:
+        return up
+    return TEAM_NAME_TO_ABBREV.get(up, up)
+
+
+def _season_from_date(dt: datetime) -> int:
+    """Return NHL season end year for a given datetime."""
+    return dt.year + 1 if dt.month >= 9 else dt.year
+
+
+def _toi_to_minutes(value: Optional[str]) -> float:
+    """Convert a time-on-ice string (MM:SS) to minutes as float."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    parts = str(value).strip().split(":")
+    if len(parts) == 2 and all(part.isdigit() for part in parts):
+        minutes, seconds = parts
+        total_seconds = (int(minutes) * 60) + int(seconds)
+        return total_seconds / 60.0
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _serialize_combos(forward_lines: List[List[str]], defense_pairs: List[List[str]]) -> str:
+    """Serialize on-ice combinations into a compact string for persistence."""
+    parts: List[str] = []
+    for idx, line in enumerate(forward_lines, start=1):
+        if len(line) == 3:
+            parts.append(f"L{idx}:{'-'.join(line)}")
+    for idx, pair in enumerate(defense_pairs, start=1):
+        if len(pair) == 2:
+            parts.append(f"D{idx}:{'-'.join(pair)}")
+    return " | ".join(parts)
 
 
 class GameStatsCache:
@@ -36,6 +91,8 @@ class GameStatsCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_csv = self.cache_dir / "nhl_games_cache.csv"
         self.manifest_path = self.cache_dir / "nhl_games_manifest.json"
+        self.team_stats_csv = self.cache_dir / "team_stats_per_game.csv"
+        self.player_stats_csv = self.cache_dir / "player_stats_per_game.csv"
         self.window_days = window_days
 
     def load(self) -> pd.DataFrame:
@@ -48,6 +105,23 @@ class GameStatsCache:
             except Exception:
                 return pd.DataFrame()
         return pd.DataFrame()
+
+    def _load_csv(self, path: Path) -> pd.DataFrame:
+        if not path.exists():
+            return pd.DataFrame()
+        try:
+            df = pd.read_csv(path)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    def load_team_stats(self) -> pd.DataFrame:
+        return self._load_csv(self.team_stats_csv)
+
+    def load_player_stats(self) -> pd.DataFrame:
+        return self._load_csv(self.player_stats_csv)
 
     def latest_cached_date(self, df: pd.DataFrame) -> Optional[datetime]:
         if df.empty or "date" not in df.columns:
@@ -93,6 +167,248 @@ class GameStatsCache:
         with open(self.manifest_path, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
 
+    @staticmethod
+    def _merge_by_keys(existing: pd.DataFrame, fresh: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+        if existing.empty:
+            combined = fresh.copy()
+        elif fresh.empty:
+            combined = existing.copy()
+        else:
+            combined = pd.concat([existing, fresh], ignore_index=True)
+        if combined.empty or not keys:
+            return combined
+        return combined.drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
+
+    def merge_team_stats(self, existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+        return self._merge_by_keys(existing, fresh, ["game_id", "team"])
+
+    def merge_player_stats(self, existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+        keys = ["game_id", "player_id"] if "player_id" in fresh.columns else ["game_id", "team", "player"]
+        return self._merge_by_keys(existing, fresh, keys)
+
+    def _persist_aux(self, df: pd.DataFrame, path: Path) -> None:
+        if df.empty:
+            return
+        to_write = df.copy()
+        if "date" in to_write.columns:
+            to_write["date"] = pd.to_datetime(to_write["date"]).dt.strftime("%Y-%m-%d")
+        to_write.to_csv(path, index=False)
+
+    def persist_team_stats(self, df: pd.DataFrame) -> None:
+        self._persist_aux(df, self.team_stats_csv)
+
+    def persist_player_stats(self, df: pd.DataFrame) -> None:
+        self._persist_aux(df, self.player_stats_csv)
+
+
+class MoneyPuckGameFeed:
+    """Lazy loader for MoneyPuck game-by-game team and player stats."""
+
+    BASE_URL = "https://moneypuck.com/moneypuck/playerData/gameByGame/{season}/{stage}/{dataset}.csv"
+    DATASETS = ("teams", "skaters")
+
+    def __init__(self, cache_dir: Path, stage: str = "regular"):
+        self.base_cache = Path(cache_dir) / "moneypuck"
+        self.base_cache.mkdir(parents=True, exist_ok=True)
+        self.stage = stage
+        self.session = requests.Session() if REQUESTS_AVAILABLE else None
+        if self.session:
+            self.session.headers.update(
+                {
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "text/csv,application/json",
+                }
+            )
+        self.enabled = self.session is not None
+        self._season_payloads: Dict[Tuple[int, str], Dict[str, Dict]] = {}
+
+    @staticmethod
+    def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.columns = [str(col).strip().lower() for col in df.columns]
+        return df
+
+    @staticmethod
+    def _find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+        lowered = [col.lower() for col in columns]
+        for candidate in candidates:
+            cand = candidate.lower()
+            if cand in lowered:
+                return columns[lowered.index(cand)]
+        for candidate in candidates:
+            cand = candidate.lower()
+            for original, lower_val in zip(columns, lowered):
+                if cand in lower_val:
+                    return original
+        return None
+
+    @staticmethod
+    def _safe_numeric(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def ensure_season(self, season: int) -> None:
+        if not self.enabled:
+            raise RuntimeError("MoneyPuck feed requires requests library.")
+        key = (season, self.stage)
+        if key in self._season_payloads:
+            return
+        payload: Dict[str, Dict] = {"team_lookup": {}, "player_lookup": defaultdict(list)}
+        for dataset in self.DATASETS:
+            df = self._load_dataset(season, dataset)
+            if dataset == "teams":
+                payload["team_lookup"] = self._build_team_lookup(df)
+            elif dataset == "skaters":
+                payload["player_lookup"] = self._build_player_lookup(df)
+        self._season_payloads[key] = payload
+
+    def _dataset_cache_path(self, season: int, dataset: str) -> Path:
+        filename = f"{dataset}_{season}_{self.stage}.csv"
+        return self.base_cache / filename
+
+    def _load_dataset(self, season: int, dataset: str) -> pd.DataFrame:
+        cache_path = self._dataset_cache_path(season, dataset)
+        if cache_path.exists():
+            return pd.read_csv(cache_path)
+        url = self.BASE_URL.format(season=season, stage=self.stage, dataset=dataset)
+        response = self.session.get(url, timeout=25)
+        response.raise_for_status()
+        cache_path.write_text(response.text, encoding="utf-8")
+        return pd.read_csv(io.StringIO(response.text))
+
+    def _build_team_lookup(self, df: pd.DataFrame) -> Dict[Tuple[str, str], Dict[str, Optional[float]]]:
+        if df.empty:
+            return {}
+        data = self._normalize_columns(df)
+        team_col = self._find_column(data.columns.tolist(), ["team", "teamname", "team_name"])
+        game_col = self._find_column(data.columns.tolist(), ["game_id", "gameid", "game"])
+        date_col = self._find_column(data.columns.tolist(), ["date", "game_date"])
+        shots_col = self._find_column(data.columns.tolist(), ["shotsongoalfor", "shots_on_goal_for", "shotsfor"])
+        xg_col = self._find_column(data.columns.tolist(), ["xgoalsfor", "xgfor", "expectedgoalsfor"])
+        pen_draw_col = self._find_column(data.columns.tolist(), ["penaltiesdrawn", "penalties_drawn"])
+        pen_taken_col = self._find_column(data.columns.tolist(), ["penaltiestaken", "penalties_taken"])
+        if not all([team_col, game_col, shots_col, xg_col, pen_draw_col, pen_taken_col]):
+            raise RuntimeError("MoneyPuck team dataset missing required columns.")
+        lookup: Dict[Tuple[str, str], Dict[str, Optional[float]]] = {}
+        for _, row in data.iterrows():
+            team_abbr = _normalize_team_abbr(row.get(team_col))
+            game_id = str(row.get(game_col))
+            if not team_abbr or not game_id:
+                continue
+            entry = {
+                "shots": self._safe_numeric(row.get(shots_col)),
+                "xg": self._safe_numeric(row.get(xg_col)),
+                "penalties_drawn": self._safe_numeric(row.get(pen_draw_col)),
+                "penalties_taken": self._safe_numeric(row.get(pen_taken_col)),
+                "date": row.get(date_col),
+            }
+            lookup[(game_id, team_abbr)] = entry
+        return lookup
+
+    def _build_player_lookup(self, df: pd.DataFrame) -> Dict[Tuple[str, str], List[Dict]]:
+        if df.empty:
+            return defaultdict(list)
+        data = self._normalize_columns(df)
+        team_col = self._find_column(data.columns.tolist(), ["team", "teamname", "team_name"])
+        game_col = self._find_column(data.columns.tolist(), ["game_id", "gameid", "game"])
+        player_col = self._find_column(data.columns.tolist(), ["player", "player_name"])
+        player_id_col = self._find_column(data.columns.tolist(), ["player_id", "playerid"])
+        position_col = self._find_column(data.columns.tolist(), ["position", "positioncode"])
+        toi_col = self._find_column(data.columns.tolist(), ["icetime", "time_on_ice"])
+        shots_col = self._find_column(data.columns.tolist(), ["shots", "shots_on_goal"])
+        xg_col = self._find_column(data.columns.tolist(), ["xgoals", "xg"])
+        pen_draw_col = self._find_column(data.columns.tolist(), ["penaltiesdrawn", "penalties_drawn"])
+        pen_taken_col = self._find_column(data.columns.tolist(), ["penaltiestaken", "penalties_taken"])
+        lookup: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
+        for _, row in data.iterrows():
+            team_abbr = _normalize_team_abbr(row.get(team_col))
+            game_id = str(row.get(game_col))
+            player_name = str(row.get(player_col) or "").strip()
+            if not team_abbr or not game_id or not player_name:
+                continue
+            lookup[(game_id, team_abbr)].append(
+                {
+                    "player": player_name,
+                    "player_id": row.get(player_id_col) or "",
+                    "position": str(row.get(position_col) or "").strip().upper(),
+                    "time_on_ice": row.get(toi_col),
+                    "shots": self._safe_numeric(row.get(shots_col)),
+                    "xg": self._safe_numeric(row.get(xg_col)),
+                    "penalties_drawn": self._safe_numeric(row.get(pen_draw_col)),
+                    "penalties_taken": self._safe_numeric(row.get(pen_taken_col)),
+                }
+            )
+        return lookup
+
+    def _get_payload(self, season: int) -> Dict[str, Dict]:
+        key = (season, self.stage)
+        payload = self._season_payloads.get(key)
+        if payload is None:
+            raise RuntimeError(f"MoneyPuck season {season} not loaded")
+        return payload
+
+    def team_entry(self, season: int, game_id: str, team_abbr: str) -> Optional[Dict]:
+        payload = self._get_payload(season)
+        return payload["team_lookup"].get((str(game_id), _normalize_team_abbr(team_abbr)))
+
+    def player_entries(self, season: int, game_id: str, team_abbr: str) -> List[Dict]:
+        payload = self._get_payload(season)
+        return payload["player_lookup"].get((str(game_id), _normalize_team_abbr(team_abbr)), [])
+
+
+def _annotate_line_assignments(player_rows: List[Dict]) -> Tuple[List[Dict], str]:
+    """Assign simple line/pair designations based on time on ice."""
+
+    def _copy_rows(rows: List[Dict]) -> List[Dict]:
+        return [{**row} for row in rows]
+
+    forwards = []
+    defense = []
+    others = []
+    for row in player_rows:
+        pos = row.get("position", "")
+        if pos in {"C", "LW", "RW", "F"}:
+            forwards.append(row)
+        elif pos in {"D", "LD", "RD"}:
+            defense.append(row)
+        else:
+            others.append(row)
+
+    forwards.sort(key=lambda r: _toi_to_minutes(r.get("time_on_ice")), reverse=True)
+    defense.sort(key=lambda r: _toi_to_minutes(r.get("time_on_ice")), reverse=True)
+
+    annotated = _copy_rows(forwards + defense + others)
+    # Map name to annotated row for easy updates.
+    row_map = {(row.get("player"), row.get("position"), row.get("player_id")): row for row in annotated}
+
+    forward_lines: List[List[str]] = []
+    defense_pairs: List[List[str]] = []
+
+    def _assign(rows: List[Dict], group_size: int, prefix: str, sink: List[List[str]]) -> None:
+        for idx in range(0, len(rows), group_size):
+            group = rows[idx : idx + group_size]
+            if len(group) < group_size:
+                continue
+            label = f"{prefix}{(idx // group_size) + 1}"
+            names = []
+            for player in group:
+                key = (player.get("player"), player.get("position"), player.get("player_id"))
+                target = row_map.get(key)
+                if target is not None:
+                    target["line_role"] = label
+                names.append(player.get("player", ""))
+            sink.append(names)
+
+    _assign(forwards, 3, "L", forward_lines)
+    _assign(defense, 2, "D", defense_pairs)
+
+    combo_str = _serialize_combos(forward_lines, defense_pairs)
+    return annotated, combo_str
+
 class RealNHLDataCollector:
     def __init__(self):
         self.session = None
@@ -102,6 +418,9 @@ class RealNHLDataCollector:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
         self.cache = GameStatsCache()
+        self.team_record_buffer: List[Dict] = []
+        self.player_record_buffer: List[Dict] = []
+        self.money_puck = MoneyPuckGameFeed(self.cache.cache_dir)
     
     def get_real_nhl_data(self, start_date='2024-10-10', end_date='2024-12-15', max_games=500):
         """
@@ -112,6 +431,9 @@ class RealNHLDataCollector:
 
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
         end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        self.team_record_buffer = []
+        self.player_record_buffer = []
+        self._ensure_money_puck_coverage(start_dt, end_dt)
 
         cached_df = self.cache.load()
         cached_df = self.cache.trim_window(cached_df, end_dt)
@@ -159,6 +481,7 @@ class RealNHLDataCollector:
 
         if not combined_df.empty:
             self.cache.persist(combined_df)
+        self._persist_stat_buffers()
 
         filtered = combined_df[
             (combined_df['date'] >= start_dt) & (combined_df['date'] <= end_dt)
@@ -256,20 +579,190 @@ class RealNHLDataCollector:
             
             game_info['total_goals'] = game_info['home_goals'] + game_info['away_goals']
             
-            # Try to get detailed stats from boxscore
             game_id = game.get('id')
-            if game_id:
-                detailed_stats = self._get_boxscore_stats(game_id)
-                game_info.update(detailed_stats)
-            
-            # Fill in missing data with estimates
-            game_info = self._fill_missing_stats(game_info)
-            
+            if not game_id:
+                return None
+
+            verified_stats = self._build_verified_stat_block(
+                game_id=game_id,
+                game_date=game_info['date'],
+                home_team=home_team,
+                away_team=away_team,
+                home_goals=game_info['home_goals'],
+                away_goals=game_info['away_goals']
+            )
+            if not verified_stats:
+                return None
+
+            game_info['game_id'] = str(game_id)
+            game_info.update(verified_stats)
             return game_info
             
         except Exception as e:
             return None
     
+    def _ensure_money_puck_coverage(self, start_dt: datetime, end_dt: datetime) -> None:
+        seasons: set[int] = set()
+        cursor = start_dt
+        while cursor <= end_dt:
+            seasons.add(_season_from_date(cursor))
+            cursor += timedelta(days=30)
+        seasons.add(_season_from_date(end_dt))
+        for season in sorted(seasons):
+            try:
+                self.money_puck.ensure_season(season)
+            except RuntimeError as exc:
+                raise RuntimeError(f"MoneyPuck stats unavailable for season {season}: {exc}") from exc
+
+    def _record_team_stats(
+        self,
+        game_id: str,
+        game_date: datetime,
+        home_team: str,
+        away_team: str,
+        home_entry: Dict,
+        away_entry: Dict,
+        box_stats: Dict,
+        home_combos: str,
+        away_combos: str,
+    ) -> None:
+        home_team = _normalize_team_abbr(home_team)
+        away_team = _normalize_team_abbr(away_team)
+        base = {
+            "game_id": game_id,
+            "date": game_date,
+        }
+        self.team_record_buffer.append(
+            {
+                **base,
+                "team": home_team,
+                "opponent": away_team,
+                "is_home": True,
+                "shots": box_stats.get("home_shots"),
+                "xg": home_entry.get("xg"),
+                "penalties_drawn": home_entry.get("penalties_drawn"),
+                "penalties_taken": home_entry.get("penalties_taken"),
+                "pp_goals": box_stats.get("home_pp_goals"),
+                "pp_opps": box_stats.get("home_pp_opps"),
+                "on_ice_combos": home_combos,
+            }
+        )
+        self.team_record_buffer.append(
+            {
+                **base,
+                "team": away_team,
+                "opponent": home_team,
+                "is_home": False,
+                "shots": box_stats.get("away_shots"),
+                "xg": away_entry.get("xg"),
+                "penalties_drawn": away_entry.get("penalties_drawn"),
+                "penalties_taken": away_entry.get("penalties_taken"),
+                "pp_goals": box_stats.get("away_pp_goals"),
+                "pp_opps": box_stats.get("away_pp_opps"),
+                "on_ice_combos": away_combos,
+            }
+        )
+
+    def _record_player_stats(
+        self,
+        game_id: str,
+        game_date: datetime,
+        team: str,
+        players: List[Dict],
+    ) -> None:
+        team = _normalize_team_abbr(team)
+        for player in players:
+            self.player_record_buffer.append(
+                {
+                    "game_id": game_id,
+                    "date": game_date,
+                    "team": team,
+                    "player": player.get("player"),
+                    "player_id": str(player.get("player_id") or "").strip(),
+                    "position": player.get("position"),
+                    "line_role": player.get("line_role"),
+                    "time_on_ice_minutes": _toi_to_minutes(player.get("time_on_ice")),
+                    "shots": player.get("shots"),
+                    "xg": player.get("xg"),
+                    "penalties_drawn": player.get("penalties_drawn"),
+                    "penalties_taken": player.get("penalties_taken"),
+                }
+            )
+
+    def _build_verified_stat_block(
+        self,
+        game_id: int,
+        game_date: datetime,
+        home_team: str,
+        away_team: str,
+        home_goals: int,
+        away_goals: int,
+    ) -> Optional[Dict]:
+        """Combine NHL boxscore + MoneyPuck stats. Returns None if incomplete."""
+        box_stats = self._get_boxscore_stats(game_id)
+        required_box = ['home_pp_goals', 'away_pp_goals', 'home_pp_opps', 'away_pp_opps']
+        if any(key not in box_stats for key in required_box):
+            return None
+
+        season = _season_from_date(pd.to_datetime(game_date).to_pydatetime())
+        home_entry = self.money_puck.team_entry(season, game_id, home_team)
+        away_entry = self.money_puck.team_entry(season, game_id, away_team)
+        if not home_entry or not away_entry:
+            return None
+
+        home_players = self.money_puck.player_entries(season, game_id, home_team)
+        away_players = self.money_puck.player_entries(season, game_id, away_team)
+        if not home_players or not away_players:
+            return None
+
+        annotated_home, home_combos = _annotate_line_assignments(home_players)
+        annotated_away, away_combos = _annotate_line_assignments(away_players)
+
+        for col, entry in [('home_shots', home_entry), ('away_shots', away_entry)]:
+            if box_stats.get(col) is None:
+                shots_val = entry.get("shots")
+                if shots_val is None:
+                    return None
+                box_stats[col] = int(shots_val)
+            else:
+                box_stats[col] = int(box_stats[col])
+
+        box_stats['home_xg'] = home_entry.get('xg')
+        box_stats['away_xg'] = away_entry.get('xg')
+        box_stats['home_penalties_drawn'] = home_entry.get('penalties_drawn')
+        box_stats['away_penalties_drawn'] = away_entry.get('penalties_drawn')
+        box_stats['home_penalties_taken'] = home_entry.get('penalties_taken')
+        box_stats['away_penalties_taken'] = away_entry.get('penalties_taken')
+        box_stats['home_on_ice_combos'] = home_combos
+        box_stats['away_on_ice_combos'] = away_combos
+
+        numeric_required = [
+            'home_shots', 'away_shots', 'home_xg', 'away_xg',
+            'home_penalties_drawn', 'away_penalties_drawn',
+            'home_penalties_taken', 'away_penalties_taken'
+        ]
+        if any(pd.isna(box_stats.get(col)) for col in numeric_required):
+            return None
+
+        box_stats['home_saves'] = max(0, box_stats['away_shots'] - away_goals)
+        box_stats['away_saves'] = max(0, box_stats['home_shots'] - home_goals)
+
+        self._record_team_stats(
+            game_id=str(game_id),
+            game_date=game_date,
+            home_team=home_team,
+            away_team=away_team,
+            home_entry=home_entry,
+            away_entry=away_entry,
+            box_stats=box_stats,
+            home_combos=home_combos,
+            away_combos=away_combos,
+        )
+        self._record_player_stats(str(game_id), game_date, home_team, annotated_home)
+        self._record_player_stats(str(game_id), game_date, away_team, annotated_away)
+
+        return box_stats
+
     def _get_boxscore_stats(self, game_id):
         """Get detailed stats from game boxscore"""
         try:
@@ -293,14 +786,20 @@ class RealNHLDataCollector:
             away_team = boxscore.get('awayTeam', {})
             
             # Shot data
-            stats['home_shots'] = home_team.get('sog', 30)
-            stats['away_shots'] = away_team.get('sog', 30)
+            if home_team.get('sog') is not None:
+                stats['home_shots'] = home_team.get('sog')
+            if away_team.get('sog') is not None:
+                stats['away_shots'] = away_team.get('sog')
             
             # Power play data
-            stats['home_pp_goals'] = home_team.get('powerPlayGoals', 0)
-            stats['away_pp_goals'] = away_team.get('powerPlayGoals', 0)
-            stats['home_pp_opps'] = home_team.get('powerPlayOpportunities', 3)
-            stats['away_pp_opps'] = away_team.get('powerPlayOpportunities', 3)
+            if home_team.get('powerPlayGoals') is not None:
+                stats['home_pp_goals'] = home_team.get('powerPlayGoals')
+            if away_team.get('powerPlayGoals') is not None:
+                stats['away_pp_goals'] = away_team.get('powerPlayGoals')
+            if home_team.get('powerPlayOpportunities') is not None:
+                stats['home_pp_opps'] = home_team.get('powerPlayOpportunities')
+            if away_team.get('powerPlayOpportunities') is not None:
+                stats['away_pp_opps'] = away_team.get('powerPlayOpportunities')
             
             # Goaltender info
             stats['home_goalie'] = self._get_starting_goalie(home_team)
@@ -322,6 +821,20 @@ class RealNHLDataCollector:
         except:
             pass
         return 'Unknown'
+
+    def _persist_stat_buffers(self) -> None:
+        if self.team_record_buffer:
+            team_df = pd.DataFrame(self.team_record_buffer)
+            existing = self.cache.load_team_stats()
+            merged = self.cache.merge_team_stats(existing, team_df)
+            self.cache.persist_team_stats(merged)
+            self.team_record_buffer = []
+        if self.player_record_buffer:
+            player_df = pd.DataFrame(self.player_record_buffer)
+            existing_players = self.cache.load_player_stats()
+            merged_players = self.cache.merge_player_stats(existing_players, player_df)
+            self.cache.persist_player_stats(merged_players)
+            self.player_record_buffer = []
     
     def _get_from_espn_api(self, start_date, end_date, max_games):
         """Get data from ESPN API (alternative source)"""
@@ -403,8 +916,25 @@ class RealNHLDataCollector:
             }
             
             game_info['total_goals'] = game_info['home_goals'] + game_info['away_goals']
-            game_info = self._fill_missing_stats(game_info)
-            
+            game_id = event.get('id')
+            try:
+                parsed_game_id = int(game_id)
+            except (TypeError, ValueError):
+                parsed_game_id = None
+            if not parsed_game_id:
+                return None
+            verified_stats = self._build_verified_stat_block(
+                game_id=parsed_game_id,
+                game_date=game_info['date'],
+                home_team=game_info['home_team'],
+                away_team=game_info['away_team'],
+                home_goals=game_info['home_goals'],
+                away_goals=game_info['away_goals']
+            )
+            if not verified_stats:
+                return None
+            game_info['game_id'] = str(parsed_game_id)
+            game_info.update(verified_stats)
             return game_info
             
         except Exception as e:
@@ -445,6 +975,30 @@ class RealNHLDataCollector:
                         start_dt = pd.to_datetime(start_date)
                         end_dt = pd.to_datetime(end_date)
                         df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)]
+                    required_cols = {
+                        'game_id', 'home_team', 'away_team', 'home_goals', 'away_goals',
+                        'home_shots', 'away_shots', 'home_pp_goals', 'away_pp_goals',
+                        'home_pp_opps', 'away_pp_opps', 'home_xg', 'away_xg',
+                        'home_penalties_drawn', 'away_penalties_drawn',
+                        'home_penalties_taken', 'away_penalties_taken'
+                    }
+                    if not required_cols.issubset(set(map(str, df.columns))):
+                        print(f"  ⚠️  Skipping {csv_file}: missing required stat columns")
+                        continue
+                    df['home_team'] = df['home_team'].apply(_normalize_team_abbr)
+                    df['away_team'] = df['away_team'].apply(_normalize_team_abbr)
+                    if 'total_goals' not in df.columns:
+                        df['total_goals'] = df['home_goals'] + df['away_goals']
+                    if 'home_saves' not in df.columns:
+                        df['home_saves'] = df['away_shots'] - df['away_goals']
+                    if 'away_saves' not in df.columns:
+                        df['away_saves'] = df['home_shots'] - df['home_goals']
+                    numeric_cols = [col for col in required_cols if col not in {'home_team', 'away_team', 'game_id'}]
+                    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+                    if df[numeric_cols].isna().any().any():
+                        print(f"  ⚠️  Skipping {csv_file}: numeric columns contain NaN after coercion")
+                        continue
+                    df['game_id'] = df['game_id'].astype(str)
                     
                     # Limit games
                     if len(df) > max_games:
@@ -467,78 +1021,6 @@ class RealNHLDataCollector:
         # Hockey Reference's specific HTML structure and anti-scraping measures
         print("  ⚠️  Hockey Reference scraping not fully implemented")
         raise Exception("Hockey Reference scraping not available")
-    
-    def _fill_missing_stats(self, game_info):
-        """Fill in missing statistics with realistic estimates"""
-        
-        # Calculate games played (rough estimate)
-        if 'games_played' not in game_info:
-            season_start = datetime(2024, 10, 1)
-            game_date = pd.to_datetime(game_info['date'])
-            days_passed = (game_date - season_start).days
-            game_info['games_played'] = max(1, days_passed // 2)
-        
-        # Estimate shots if missing
-        if 'home_shots' not in game_info:
-            # Rough correlation: ~10 shots per goal + base shots
-            home_goals = game_info.get('home_goals', 0)
-            game_info['home_shots'] = max(15, int(np.random.normal(30 + home_goals * 3, 4)))
-        
-        if 'away_shots' not in game_info:
-            away_goals = game_info.get('away_goals', 0)
-            game_info['away_shots'] = max(15, int(np.random.normal(28 + away_goals * 3, 4)))
-        
-        # Calculate saves
-        game_info['home_saves'] = max(0, game_info['away_shots'] - game_info['away_goals'])
-        game_info['away_saves'] = max(0, game_info['home_shots'] - game_info['home_goals'])
-        
-        # Estimate power play stats if missing
-        if 'home_pp_goals' not in game_info:
-            total_goals = game_info.get('home_goals', 0)
-            game_info['home_pp_goals'] = min(total_goals, int(np.random.poisson(0.6)))
-        
-        if 'away_pp_goals' not in game_info:
-            total_goals = game_info.get('away_goals', 0)
-            game_info['away_pp_goals'] = min(total_goals, int(np.random.poisson(0.6)))
-        
-        if 'home_pp_opps' not in game_info:
-            game_info['home_pp_opps'] = max(1, int(np.random.poisson(3.2)))
-        
-        if 'away_pp_opps' not in game_info:
-            game_info['away_pp_opps'] = max(1, int(np.random.poisson(3.2)))
-        
-        # Add goaltender names if missing
-        if 'home_goalie' not in game_info:
-            game_info['home_goalie'] = self._get_likely_goalie(game_info['home_team'])
-        
-        if 'away_goalie' not in game_info:
-            game_info['away_goalie'] = self._get_likely_goalie(game_info['away_team'])
-        
-        return game_info
-    
-    def _get_likely_goalie(self, team):
-        """Get likely starting goalie for a team"""
-        team_goalies = {
-            'TOR': ['Samsonov', 'Woll'], 'BOS': ['Ullmark', 'Swayman'], 
-            'NYR': ['Shesterkin', 'Quick'], 'PHI': ['Hart', 'Ersson'],
-            'PIT': ['Jarry', 'Nedeljkovic'], 'WSH': ['Lindgren', 'Kuemper'],
-            'CAR': ['Andersen', 'Kochetkov'], 'FLA': ['Bobrovsky', 'Knight'],
-            'TBL': ['Vasilevskiy', 'Johansson'], 'MTL': ['Allen', 'Montembeault'],
-            'OTT': ['Ullmark', 'Forsberg'], 'BUF': ['Luukkonen', 'Comrie'],
-            'DET': ['Husso', 'Talbot'], 'CBJ': ['Merzlikins', 'Tarasov'],
-            'NJD': ['Markstrom', 'Allen'], 'NYI': ['Sorokin', 'Varlamov'],
-            'COL': ['Georgiev', 'Wedgewood'], 'VGK': ['Hill', 'Samsonov'],
-            'EDM': ['Skinner', 'Pickard'], 'CGY': ['Markstrom', 'Wolf'],
-            'VAN': ['Demko', 'Silovs'], 'SEA': ['Grubauer', 'Daccord'],
-            'LAK': ['Kuemper', 'Rittich'], 'ANA': ['Gibson', 'Dostal'],
-            'SJS': ['Blackwood', 'Vanecek'], 'MIN': ['Fleury', 'Gustavsson'],
-            'WPG': ['Hellebuyck', 'Brossoit'], 'STL': ['Bennington', 'Hofer'],
-            'CHI': ['Mrazek', 'Soderblom'], 'DAL': ['Oettinger', 'DeSmith'],
-            'NSH': ['Saros', 'Annunen'], 'ARI': ['Ingram', 'Vejmelka']
-        }
-        
-        goalies = team_goalies.get(team, ['Starter'])
-        return np.random.choice(goalies)
     
     def _create_enhanced_sample_data(self, max_games):
         """Create enhanced sample data based on real NHL patterns"""
