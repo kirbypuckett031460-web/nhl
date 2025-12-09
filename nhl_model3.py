@@ -1524,6 +1524,18 @@ class RealDataNHLModel:
                 stats.update({k: v for k, v in obj.items() if k not in stats})
             return stats
 
+        def _as_int(value: Any) -> Optional[int]:
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+            if value is None:
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
         def _value(obj: Dict[str, Any], keys: List[str]) -> Optional[float]:
             for key in keys:
                 if key in obj and isinstance(obj[key], (int, float)):
@@ -1532,6 +1544,8 @@ class RealDataNHLModel:
 
         home_block = boxscore.get('homeTeam', {})
         away_block = boxscore.get('awayTeam', {})
+        home_team_id = home_block.get('id')
+        away_team_id = away_block.get('id')
         home_stats = _team_stats(home_block)
         away_stats = _team_stats(away_block)
 
@@ -1570,7 +1584,35 @@ class RealDataNHLModel:
             'home_goalie': _goalie_name(home_block),
             'away_goalie': _goalie_name(away_block)
         }
+
+        def _fallback_powerplay_stats() -> Dict[str, Optional[int]]:
+            stats: Dict[str, Optional[int]] = {}
+            if game_id is None:
+                return stats
+            team_stats = self.data_fetcher.get_team_powerplay_stats(game_id)
+            if not team_stats:
+                return stats
+
+            def _assign(prefix: str, team_id: Optional[int]) -> None:
+                if team_id is None:
+                    return
+                entry = team_stats.get(team_id)
+                if not isinstance(entry, dict):
+                    return
+                stats[f'{prefix}_pp_goals'] = _as_int(entry.get('powerPlayGoalsFor'))
+                stats[f'{prefix}_pp_opps'] = _as_int(entry.get('ppOpportunities'))
+
+            _assign('home', home_team_id)
+            _assign('away', away_team_id)
+            return stats
+
         required = ['home_shots', 'away_shots', 'home_pp_goals', 'away_pp_goals', 'home_pp_opps', 'away_pp_opps']
+
+        if any(result.get(key) is None for key in ['home_pp_goals', 'away_pp_goals', 'home_pp_opps', 'away_pp_opps']):
+            fallback_stats = _fallback_powerplay_stats()
+            for key, value in fallback_stats.items():
+                if result.get(key) is None and value is not None:
+                    result[key] = value
         if any(result.get(key) is None for key in required):
             return {}
         return result

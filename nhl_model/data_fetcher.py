@@ -208,3 +208,26 @@ class NHLDataFetcher:
                 return response.json()
             except Exception:
                 return {}
+
+    def get_team_powerplay_stats(self, game_id: int) -> Dict[int, Dict]:
+        """Fetch team-level power play stats for a single game."""
+        try:
+            response = requests.get(
+                f"{self.backup_url}/team/powerplay",
+                params={'cayenneExp': f"gameId={game_id}"},
+                timeout=10
+            )
+            response.raise_for_status()
+            entries = response.json().get('data', [])
+            results: Dict[int, Dict] = {}
+            for entry in entries:
+                team_id = entry.get('teamId')
+                if team_id is None:
+                    continue
+                try:
+                    results[int(team_id)] = entry
+                except (TypeError, ValueError):
+                    continue
+            return results
+        except Exception:
+            return {}
