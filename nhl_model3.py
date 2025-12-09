@@ -67,6 +67,7 @@ from nhl_model.common import (
     format_team_display,
     get_team_abbreviation,
     get_team_full_name,
+    get_team_nickname,
 )
 from nhl_model.data_fetcher import NHLDataFetcher
 from nhl_model.social import SocialMediaPoster
@@ -1266,7 +1267,8 @@ class RealDataNHLModel:
             candidates = [
                 str(team_value or '').strip(),
                 get_team_abbreviation(team_value),
-                format_team_display(team_value)
+                format_team_display(team_value),
+                get_team_nickname(team_value)
             ]
             for candidate in candidates:
                 token = str(candidate or '').strip()
@@ -6867,7 +6869,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                 <span class="ml-rec-{ml_rec_slug}">{ml_rec_value}</span>
                 <div class="rec-note">
                     {ml_bet_display}
-                    {'' if not ml_reason else f'ML reason: {attr_escape(ml_reason)}'}
+                    {'' if not ml_reason else f'Reason: {attr_escape(ml_reason)}'}
                 </div>
             </td>
             <td>{pred.kelly_bet_size:.1f}%</td>
@@ -8453,13 +8455,15 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         selected_team = pred.home_team if ml_side == 'home' else pred.away_team
                         display_name = format_team_display(selected_team)
                         display_name = display_name if display_name and display_name.upper() != 'TBD' else ''
+                        nickname_label = get_team_nickname(selected_team)
+                        nickname_label = nickname_label if nickname_label and nickname_label.upper() != 'TBD' else ''
                         fallback_code = get_team_abbreviation(selected_team)
                         fallback_code = fallback_code if fallback_code and fallback_code.upper() != 'TBD' else ''
                         raw_label = str(selected_team or '').strip()
                         if raw_label.upper() == 'TBD':
                             raw_label = ''
-                        label = display_name or fallback_code or raw_label or ('HOME' if ml_side == 'home' else 'AWAY')
-                        pred.moneyline_recommendation = f"{label} ML"
+                        label = nickname_label or display_name or fallback_code or raw_label or ('HOME' if ml_side == 'home' else 'AWAY')
+                        pred.moneyline_recommendation = label
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
                     pred.best_home_moneyline_book = best_home_ml_book
