@@ -40,6 +40,42 @@ TEAM_ABBREV_TO_NAME: Dict[str, str] = {
     'WSH': 'Washington Capitals'
 }
 
+TEAM_ABBREV_TO_NICKNAME: Dict[str, str] = {
+    'ANA': 'Ducks',
+    'ARI': 'Coyotes',
+    'BOS': 'Bruins',
+    'BUF': 'Sabres',
+    'CAR': 'Hurricanes',
+    'CBJ': 'Blue Jackets',
+    'CGY': 'Flames',
+    'CHI': 'Blackhawks',
+    'COL': 'Avalanche',
+    'DAL': 'Stars',
+    'DET': 'Red Wings',
+    'EDM': 'Oilers',
+    'FLA': 'Panthers',
+    'LAK': 'Kings',
+    'MIN': 'Wild',
+    'MTL': 'Canadiens',
+    'NJD': 'Devils',
+    'NSH': 'Predators',
+    'NYI': 'Islanders',
+    'NYR': 'Rangers',
+    'OTT': 'Senators',
+    'PHI': 'Flyers',
+    'PIT': 'Penguins',
+    'SEA': 'Kraken',
+    'SJS': 'Sharks',
+    'STL': 'Blues',
+    'TBL': 'Lightning',
+    'TOR': 'Maple Leafs',
+    'UTA': 'Mammoth',
+    'VAN': 'Canucks',
+    'VGK': 'Golden Knights',
+    'WPG': 'Jets',
+    'WSH': 'Capitals'
+}
+
 TEAM_NAME_TO_ABBREV: Dict[str, str] = {name.upper(): abbr for abbr, name in TEAM_ABBREV_TO_NAME.items()}
 
 
@@ -63,6 +99,19 @@ def get_team_full_name(team: Optional[str]) -> str:
 
 def get_team_abbreviation(team: Optional[str]) -> str:
     return _normalize_team_abbreviation(team)
+
+
+def get_team_nickname(team: Optional[str]) -> str:
+    abbr = _normalize_team_abbreviation(team)
+    if abbr and abbr in TEAM_ABBREV_TO_NICKNAME:
+        return TEAM_ABBREV_TO_NICKNAME[abbr]
+    full = get_team_full_name(team)
+    if full and full.upper() != 'TBD':
+        parts = full.split(' ', 1)
+        if len(parts) > 1:
+            return parts[1]
+    raw = str(team or '').strip()
+    return raw or 'TBD'
 
 
 def format_team_display(team: Optional[str]) -> str:
