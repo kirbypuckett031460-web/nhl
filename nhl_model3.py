@@ -6152,9 +6152,13 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
     summary: Dict[str, Any] = {
         'ytd_str': "YTD: 0.0% (0/0)",
         'last_week_str': "Last Week: 0.0% (0/0)",
+        'yesterday_str': "Yesterday: — (no bets)",
         'wins': None,
         'losses': None,
-        'total': None
+        'total': None,
+        'yesterday_wins': None,
+        'yesterday_losses': None,
+        'yesterday_total': None
     }
 
     log_candidates = [
@@ -6211,6 +6215,25 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
         if date_col:
             dates_utc = pd.to_datetime(df_log[date_col], utc=True, errors='coerce')
             if dates_utc.notna().any():
+                try:
+                    dates_local = dates_utc.dt.tz_convert('US/Eastern')
+                except TypeError:
+                    dates_local = dates_utc.dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+
+                if dates_local.notna().any():
+                    eastern_now = pd.Timestamp.now(tz='US/Eastern')
+                    yesterday_date = (eastern_now - pd.Timedelta(days=1)).date()
+                    yesterday_mask = dates_local.dt.date == yesterday_date
+                    yday_wins = int((win_mask & yesterday_mask).sum())
+                    yday_losses = int((loss_mask & yesterday_mask).sum())
+                    yday_total = yday_wins + yday_losses
+                    if yday_total > 0:
+                        yday_pct = (yday_wins / yday_total) * 100.0
+                        summary['yesterday_str'] = f"Yesterday: {yday_wins}-{yday_losses} ({yday_pct:.1f}%)"
+                        summary['yesterday_wins'] = yday_wins
+                        summary['yesterday_losses'] = yday_losses
+                        summary['yesterday_total'] = yday_total
+
                 cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7)
                 lw_mask = dates_utc >= cutoff
                 lw_wins = int((win_mask & lw_mask).sum())
@@ -6607,8 +6630,9 @@ def save_predictions_image(
         return None
 
     summary_stats = compute_bet_performance_summary(training_results)
-    ytd_str = summary_stats['ytd_str']
-    last_week_str = summary_stats['last_week_str']
+    ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
+    last_week_str = summary_stats.get('last_week_str', "Last Week: 0.0% (0/0)")
+    yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
 
     rows: List[Dict[str, str]] = []
     for pred in predictions:
@@ -6750,9 +6774,11 @@ def save_predictions_image(
     fig.patch.set_facecolor('white')
     ax.axis('off')
 
+    perf_line_segments = [segment for segment in [ytd_str, yesterday_str, last_week_str] if segment]
+    perf_line = " | ".join(perf_line_segments)
     title_text = (
         f"NHL Predictions\n"
-        # f"{ytd_str} | {last_week_str}\n"
+        f"{perf_line}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds aggregated from multiple books."
     )
@@ -6854,6 +6880,15 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         ytd_record_display = f"{wins_val}-{max(0, int(total_val) - int(wins_val))}"
     ytd_record_note = performance_summary.get('ytd_str', "YTD: 0.0% (0/0)")
     last_week_note = performance_summary.get('last_week_str', "Last Week: 0.0% (0/0)")
+    yesterday_note = performance_summary.get('yesterday_str', "Yesterday: — (no bets)")
+    yday_wins = performance_summary.get('yesterday_wins')
+    yday_losses = performance_summary.get('yesterday_losses')
+    yday_total = performance_summary.get('yesterday_total')
+    yesterday_record_display = 'No bets yesterday'
+    if isinstance(yday_wins, (int, np.integer)) and isinstance(yday_losses, (int, np.integer)):
+        yesterday_record_display = f"{yday_wins}-{yday_losses}"
+    elif isinstance(yday_wins, (int, np.integer)) and isinstance(yday_total, (int, np.integer)):
+        yesterday_record_display = f"{yday_wins}-{max(0, int(yday_total) - int(yday_wins))}"
     
     def attr_escape(value: Optional[str]) -> str:
         if value is None:
@@ -7199,6 +7234,12 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                     <h3>📗 YTD Bet Record</h3>
                     <div class="metric-value">{ytd_record_display}</div>
                     <div class="metric-subtext">{ytd_record_note}<br>{last_week_note}</div>
+                </div>
+
+                <div class="metric-card">
+                    <h3>🗓️ Yesterday's Record</h3>
+                    <div class="metric-value">{yesterday_record_display}</div>
+                    <div class="metric-subtext">{yesterday_note}</div>
                 </div>
                 
                 <div class="metric-card">
