@@ -3946,6 +3946,28 @@ class RealDataNHLModel:
                 moneyline_no_bet_reason = 'prob_missing'
             else:
                 moneyline_no_bet_reason = 'edge_guard'
+
+        if moneyline_recommendation == 'No Bet':
+            def _coerce_prob(value: Optional[float]) -> Optional[float]:
+                try:
+                    val = float(value)
+                    if np.isfinite(val):
+                        return val
+                except Exception:
+                    return None
+                return None
+
+            home_prob_val = _coerce_prob(home_win_prob)
+            away_prob_val = _coerce_prob(away_win_prob)
+            if home_prob_val is not None or away_prob_val is not None:
+                home_score = home_prob_val if home_prob_val is not None else -1.0
+                away_score = away_prob_val if away_prob_val is not None else -1.0
+                forced_side = 'home' if home_score >= away_score else 'away'
+                moneyline_recommendation_side = forced_side
+                moneyline_recommendation = 'HOME ML' if forced_side == 'home' else 'AWAY ML'
+                moneyline_bet_size = 0.0
+                if moneyline_no_bet_reason in (None, 'edge_guard'):
+                    moneyline_no_bet_reason = 'forced_decision'
         
         # Isotonic calibration of probability towards historical outcomes (if calibration fitted)
         try:
