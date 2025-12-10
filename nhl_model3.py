@@ -6750,9 +6750,10 @@ def save_predictions_image(
     fig.patch.set_facecolor('white')
     ax.axis('off')
 
+    record_line = f"{ytd_str} | {last_week_str}"
     title_text = (
         f"NHL Predictions\n"
-        # f"{ytd_str} | {last_week_str}\n"
+        f"{record_line}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds aggregated from multiple books."
     )
