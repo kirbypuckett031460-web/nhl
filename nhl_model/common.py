@@ -103,13 +103,17 @@ def get_team_abbreviation(team: Optional[str]) -> str:
 
 def get_team_nickname(team: Optional[str]) -> str:
     abbr = _normalize_team_abbreviation(team)
-    if abbr and abbr in TEAM_ABBREV_TO_NICKNAME:
-        return TEAM_ABBREV_TO_NICKNAME[abbr]
+    if abbr:
+        nickname = TEAM_ABBREV_TO_NICKNAME.get(abbr)
+        if nickname:
+            return nickname
     full = get_team_full_name(team)
     if full and full.upper() != 'TBD':
-        parts = full.split(' ', 1)
-        if len(parts) > 1:
-            return parts[1]
+        tokens = [token for token in full.split() if token]
+        if len(tokens) >= 2:
+            return " ".join(tokens[1:])
+        if tokens:
+            return tokens[-1]
     raw = str(team or '').strip()
     return raw or 'TBD'
 

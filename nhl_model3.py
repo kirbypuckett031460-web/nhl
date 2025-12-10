@@ -6811,6 +6811,10 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         matchup_display = format_matchup_display(pred.away_team, pred.home_team)
         matchup_search = attr_escape(format_matchup_search_blob(pred.away_team, pred.home_team))
         ml_rec_value = str(getattr(pred, 'moneyline_recommendation', '') or 'No Bet').strip() or 'No Bet'
+        if '(' in ml_rec_value:
+            ml_rec_value = ml_rec_value.split('(', 1)[0].strip()
+            if not ml_rec_value:
+                ml_rec_value = 'No Bet'
         ml_rec_slug = ml_rec_value.lower().replace(' ', '-').replace('/', '-')
         ml_reason = str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip()
         ml_bet_size_raw = getattr(pred, 'moneyline_bet_size', 0.0)
