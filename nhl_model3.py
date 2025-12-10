@@ -8453,16 +8453,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     ml_value = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
                     if ml_value and ml_value.lower() != 'no bet' and ml_side in ('home', 'away'):
                         selected_team = pred.home_team if ml_side == 'home' else pred.away_team
-                        display_name = format_team_display(selected_team)
-                        display_name = display_name if display_name and display_name.upper() != 'TBD' else ''
                         nickname_label = get_team_nickname(selected_team)
                         nickname_label = nickname_label if nickname_label and nickname_label.upper() != 'TBD' else ''
-                        fallback_code = get_team_abbreviation(selected_team)
-                        fallback_code = fallback_code if fallback_code and fallback_code.upper() != 'TBD' else ''
-                        raw_label = str(selected_team or '').strip()
-                        if raw_label.upper() == 'TBD':
-                            raw_label = ''
-                        label = nickname_label or display_name or fallback_code or raw_label or ('HOME' if ml_side == 'home' else 'AWAY')
+                        if not nickname_label:
+                            nickname_label = 'HOME' if ml_side == 'home' else 'AWAY'
+                        label = nickname_label
                         pred.moneyline_recommendation = label
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
