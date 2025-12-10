@@ -6146,6 +6146,100 @@ def _read_bets_log_dataframe(log_path: Optional[str]) -> Optional[pd.DataFrame]:
         return None
 
 
+def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> Dict[str, Any]:
+    """Return YTD/last-week bet performance strings and record counts."""
+
+    summary: Dict[str, Any] = {
+        'ytd_str': "YTD: 0.0% (0/0)",
+        'last_week_str': "Last Week: 0.0% (0/0)",
+        'wins': None,
+        'losses': None,
+        'total': None
+    }
+
+    log_candidates = [
+        os.getenv('NHL_ACCURACY_FILE'),
+        os.getenv('NHL_BETS_LOG'),
+        'bets_log.csv'
+    ]
+
+    for path in log_candidates:
+        if not path:
+            continue
+        df_log = _read_bets_log_dataframe(path)
+        if df_log is None:
+            try:
+                df_log = pd.read_csv(path)
+            except Exception:
+                continue
+        if df_log is None or df_log.empty:
+            continue
+
+        result_col = next(
+            (c for c in df_log.columns if str(c).lower() in {'result', 'outcome', 'grade', 'bet_result', 'graded_result'}),
+            None
+        )
+        if not result_col:
+            continue
+
+        df_log['_result_norm'] = (
+            df_log[result_col]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+
+        win_tokens = {'WIN', 'W', 'HIT', 'SUCCESS', 'CASH', 'TRUE'}
+        loss_tokens = {'LOSS', 'L', 'LOSE', 'FAILED', 'MISS', 'FALSE'}
+        win_mask = df_log['_result_norm'].isin(win_tokens)
+        loss_mask = df_log['_result_norm'].isin(loss_tokens)
+
+        total_scored = int(win_mask.sum() + loss_mask.sum())
+        if total_scored > 0:
+            total_wins = int(win_mask.sum())
+            total_losses = int(loss_mask.sum())
+            accuracy_pct = (total_wins / total_scored) * 100.0
+            summary['ytd_str'] = f"YTD: {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
+            summary['wins'] = total_wins
+            summary['losses'] = total_losses
+            summary['total'] = total_scored
+
+        date_col = next(
+            (c for c in df_log.columns if str(c).lower() in {'date', 'datetime', 'timestamp', 'created_at'}),
+            None
+        )
+        if date_col:
+            dates_utc = pd.to_datetime(df_log[date_col], utc=True, errors='coerce')
+            if dates_utc.notna().any():
+                cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7)
+                lw_mask = dates_utc >= cutoff
+                lw_wins = int((win_mask & lw_mask).sum())
+                lw_losses = int((loss_mask & lw_mask).sum())
+                lw_total = lw_wins + lw_losses
+                if lw_total > 0:
+                    lw_pct = (lw_wins / lw_total) * 100.0
+                    summary['last_week_str'] = f"Last Week: {lw_pct:.1f}% ({lw_wins}/{lw_total})"
+
+        if summary['total']:
+            return summary
+
+    if training_results:
+        try:
+            acc_pct = float(training_results.get('over_under_accuracy', 0.0)) * 100.0
+        except Exception:
+            acc_pct = 0.0
+        total_games = int(training_results.get('test_size') or training_results.get('train_size') or 0)
+        if total_games > 0:
+            wins = int(round((acc_pct / 100.0) * total_games))
+            losses = total_games - wins
+            summary['wins'] = wins
+            summary['losses'] = losses
+            summary['total'] = total_games
+            summary['ytd_str'] = f"YTD: {acc_pct:.1f}% ({wins}/{total_games})"
+
+    return summary
+
+
 def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.csv', closing_odds_path: Optional[str] = None) -> None:
     """Append recommended bets to a CSV and compute simple CLV if closing totals provided.
 
@@ -6512,91 +6606,9 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    def compute_accuracy_strings() -> Tuple[str, str]:
-        ytd_default = "YTD: 0.0% (0/0)"
-        last_week_default = "Last Week: 0.0% (0/0)"
-        log_candidates = [
-            os.getenv('NHL_ACCURACY_FILE'),
-            os.getenv('NHL_BETS_LOG'),
-            'bets_log.csv'
-        ]
-
-        for path in log_candidates:
-            if not path:
-                continue
-            if not os.path.exists(path) or os.path.getsize(path) == 0:
-                continue
-            df_log = _read_bets_log_dataframe(path)
-            if df_log is None:
-                try:
-                    df_log = pd.read_csv(path)
-                except Exception:
-                    continue
-            if df_log.empty:
-                continue
-
-            result_col = next(
-                (c for c in df_log.columns if str(c).lower() in {'result', 'outcome', 'grade', 'bet_result', 'graded_result'}),
-                None
-            )
-            if not result_col:
-                continue
-
-            df_log['_result_norm'] = (
-                df_log[result_col]
-                .astype(str)
-                .str.strip()
-                .str.upper()
-            )
-
-            win_tokens = {'WIN', 'W', 'HIT', 'SUCCESS', 'CASH', 'TRUE'}
-            loss_tokens = {'LOSS', 'L', 'LOSE', 'FAILED', 'MISS', 'FALSE'}
-            win_mask = df_log['_result_norm'].isin(win_tokens)
-            loss_mask = df_log['_result_norm'].isin(loss_tokens)
-
-            total_scored = int(win_mask.sum() + loss_mask.sum())
-            if total_scored > 0:
-                total_wins = int(win_mask.sum())
-                accuracy_pct = (total_wins / total_scored) * 100.0
-                ytd_str = f"YTD: {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
-            else:
-                ytd_str = ytd_default
-
-            date_col = next(
-                (c for c in df_log.columns if str(c).lower() in {'date', 'datetime', 'timestamp', 'created_at'}),
-                None
-            )
-            last_week_str = last_week_default
-            if date_col:
-                dates_utc = pd.to_datetime(df_log[date_col], utc=True, errors='coerce')
-                if dates_utc.notna().any():
-                    cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7)
-                    lw_mask = dates_utc >= cutoff
-                    lw_wins = int((win_mask & lw_mask).sum())
-                    lw_losses = int((loss_mask & lw_mask).sum())
-                    lw_total = lw_wins + lw_losses
-                    if lw_total > 0:
-                        lw_pct = (lw_wins / lw_total) * 100.0
-                        last_week_str = f"Last Week: {lw_pct:.1f}% ({lw_wins}/{lw_total})"
-
-            return ytd_str, last_week_str
-
-        if training_results:
-            try:
-                acc_pct = float(training_results.get('over_under_accuracy', 0.0)) * 100.0
-            except Exception:
-                acc_pct = 0.0
-            total_games = int(training_results.get('test_size') or training_results.get('train_size') or 0)
-            if total_games > 0:
-                wins = int(round((acc_pct / 100.0) * total_games))
-                ytd_str = f"YTD: {acc_pct:.1f}% ({wins}/{total_games})"
-            else:
-                ytd_str = f"YTD: {acc_pct:.1f}% (0/0)"
-            return ytd_str, last_week_default
-
-        return ytd_default, last_week_default
-
-    ytd_str, last_week_str = compute_accuracy_strings()
+    summary_stats = compute_bet_performance_summary(training_results)
+    ytd_str = summary_stats['ytd_str']
+    last_week_str = summary_stats['last_week_str']
 
     rows: List[Dict[str, str]] = []
     for pred in predictions:
@@ -6829,8 +6841,19 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         </body></html>
         """
     
+    performance_summary = compute_bet_performance_summary(training_results)
     betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
     avg_confidence = np.mean([p.confidence for p in betting_preds]) if betting_preds else 0
+    wins_val = performance_summary.get('wins')
+    losses_val = performance_summary.get('losses')
+    total_val = performance_summary.get('total')
+    ytd_record_display = 'No graded bets'
+    if isinstance(wins_val, (int, np.integer)) and isinstance(losses_val, (int, np.integer)):
+        ytd_record_display = f"{wins_val}-{losses_val}"
+    elif isinstance(wins_val, (int, np.integer)) and isinstance(total_val, (int, np.integer)):
+        ytd_record_display = f"{wins_val}-{max(0, int(total_val) - int(wins_val))}"
+    ytd_record_note = performance_summary.get('ytd_str', "YTD: 0.0% (0/0)")
+    last_week_note = performance_summary.get('last_week_str', "Last Week: 0.0% (0/0)")
     
     def attr_escape(value: Optional[str]) -> str:
         if value is None:
@@ -7040,6 +7063,12 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
             font-weight: bold;
             color: #27ae60;
         }}
+        .metric-subtext {{
+            font-size: 0.95rem;
+            color: #566573;
+            margin-top: 6px;
+            line-height: 1.3;
+        }}
         
         table {{
             width: 100%;
@@ -7164,6 +7193,12 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                 <div class="metric-card">
                     <h3>🎯 Over/Under Accuracy</h3>
                     <div class="metric-value">{training_results.get('over_under_accuracy', 0):.1%}</div>
+                </div>
+                
+                <div class="metric-card">
+                    <h3>📗 YTD Bet Record</h3>
+                    <div class="metric-value">{ytd_record_display}</div>
+                    <div class="metric-subtext">{ytd_record_note}<br>{last_week_note}</div>
                 </div>
                 
                 <div class="metric-card">
