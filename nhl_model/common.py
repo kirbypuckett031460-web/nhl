@@ -76,6 +76,44 @@ TEAM_ABBREV_TO_NICKNAME: Dict[str, str] = {
     'WSH': 'Capitals'
 }
 
+TEAM_PRIMARY_COLORS: Dict[str, str] = {
+    'ANA': '#F47A38',
+    'ARI': '#8C2633',
+    'BOS': '#FFB81C',
+    'BUF': '#003087',
+    'CAR': '#CC0000',
+    'CBJ': '#002654',
+    'CGY': '#C8102E',
+    'CHI': '#CF0A2C',
+    'COL': '#6F263D',
+    'DAL': '#006847',
+    'DET': '#CE1126',
+    'EDM': '#041E42',
+    'FLA': '#041E42',
+    'LAK': '#111111',
+    'MIN': '#154734',
+    'MTL': '#AF1E2D',
+    'NJD': '#CE1126',
+    'NSH': '#FFB81C',
+    'NYI': '#00539B',
+    'NYR': '#0038A8',
+    'OTT': '#C52032',
+    'PHI': '#F74902',
+    'PIT': '#FFB81C',
+    'SEA': '#001628',
+    'SJS': '#006D75',
+    'STL': '#003DA5',
+    'TBL': '#002868',
+    'TOR': '#00205B',
+    'UTA': '#4B2682',
+    'VAN': '#00843D',
+    'VGK': '#B4975A',
+    'WPG': '#041E42',
+    'WSH': '#C8102E'
+}
+
+DEFAULT_TEAM_PRIMARY_COLOR: str = '#2c3e50'
+
 TEAM_NAME_TO_ABBREV: Dict[str, str] = {name.upper(): abbr for abbr, name in TEAM_ABBREV_TO_NAME.items()}
 
 
@@ -99,6 +137,17 @@ def get_team_full_name(team: Optional[str]) -> str:
 
 def get_team_abbreviation(team: Optional[str]) -> str:
     return _normalize_team_abbreviation(team)
+
+
+def get_team_primary_color(team: Optional[str]) -> str:
+    """Return the team's primary brand color as a hex string."""
+
+    abbr = _normalize_team_abbreviation(team)
+    if abbr:
+        color = TEAM_PRIMARY_COLORS.get(abbr)
+        if color:
+            return color
+    return DEFAULT_TEAM_PRIMARY_COLOR
 
 
 def get_team_nickname(team: Optional[str]) -> str:
