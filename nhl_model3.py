@@ -68,6 +68,7 @@ from nhl_model.common import (
     get_team_abbreviation,
     get_team_full_name,
     get_team_nickname,
+    get_team_primary_color,
 )
 from nhl_model.data_fetcher import NHLDataFetcher
 from nhl_model.social import SocialMediaPoster
@@ -6453,6 +6454,26 @@ def save_predictions_image(
 ) -> Optional[str]:
     """Render a social image styled like the NFL predictions graphic."""
 
+    def _contrast_text_color(bg_hex: Optional[str]) -> str:
+        """Return black or white text depending on the background luminance."""
+
+        raw = str(bg_hex or '').strip()
+        if not raw:
+            return '#ffffff'
+        hex_value = raw.lstrip('#')
+        if len(hex_value) == 3:
+            hex_value = "".join(ch * 2 for ch in hex_value)
+        if len(hex_value) != 6:
+            return '#ffffff'
+        try:
+            r = int(hex_value[0:2], 16)
+            g = int(hex_value[2:4], 16)
+            b = int(hex_value[4:6], 16)
+        except ValueError:
+            return '#ffffff'
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        return '#000000' if luminance > 0.6 else '#ffffff'
+
     # Persist HTML table for reference even though the image is matplotlib-based
     try:
         html = build_predictions_table_html(predictions)
@@ -6631,31 +6652,33 @@ def save_predictions_image(
         pick_txt = pick_base.title()
 
         ml_raw = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
-        ml_reason = str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip()
-        ml_bet_size = getattr(pred, 'moneyline_bet_size', 0.0)
-        ml_txt = ml_raw if ml_raw else 'No Bet'
-        ml_upper = ml_txt.upper()
-        ml_notes: List[str] = []
-        if 'HOME' in ml_upper:
-            ml_odds = getattr(pred, 'home_moneyline_odds', None)
-            ml_book = getattr(pred, 'best_home_moneyline_book', None)
-        elif 'AWAY' in ml_upper:
-            ml_odds = getattr(pred, 'away_moneyline_odds', None)
-            ml_book = getattr(pred, 'best_away_moneyline_book', None)
+        ml_side = str(getattr(pred, 'moneyline_recommendation_side', '') or '').strip().lower()
+        ml_base_text = ml_raw if ml_raw else 'No Bet'
+        ml_upper = ml_base_text.upper()
+        if not ml_side:
+            if 'HOME' in ml_upper:
+                ml_side = 'home'
+            elif 'AWAY' in ml_upper:
+                ml_side = 'away'
+        ml_team = None
+        if ml_side == 'home':
+            ml_team = getattr(pred, 'home_team', None)
+        elif ml_side == 'away':
+            ml_team = getattr(pred, 'away_team', None)
+        ml_is_no_bet = ml_upper.startswith('NO BET') or ml_upper == '—'
+        ml_display = 'No Bet' if ml_is_no_bet else '—'
+        ml_bg_color = '#ecf0f1'
+        ml_text_color = '#2c3e50'
+        if ml_team and not ml_is_no_bet:
+            abbr = get_team_abbreviation(ml_team)
+            fallback_label = 'HOME' if ml_side == 'home' else 'AWAY'
+            ml_display = abbr or fallback_label
+            ml_bg_color = get_team_primary_color(ml_team)
+            ml_text_color = _contrast_text_color(ml_bg_color)
+        elif not ml_is_no_bet and ml_raw:
+            ml_display = ml_base_text
         else:
-            ml_odds = None
-            ml_book = None
-        if isinstance(ml_odds, (int, float)):
-            ml_notes.append(f"{int(ml_odds):+}")
-        if ml_book:
-            ml_notes.append(str(ml_book))
-        if isinstance(ml_bet_size, (int, float)) and ml_bet_size > 0:
-            ml_notes.append(f"{ml_bet_size:.1f}%")
-        if ml_notes and ml_upper not in {'NO BET', '—'}:
-            ml_txt = f"{ml_txt} ({', '.join(ml_notes)})"
-        elif ml_upper in {'NO BET', '—'} and ml_reason:
-            human_reason = ml_reason.replace('_', ' ')
-            ml_txt = f"No Bet ({human_reason})"
+            ml_display = 'No Bet'
 
         away_display = format_team_display(getattr(pred, 'away_team', None))
         home_display = format_team_display(getattr(pred, 'home_team', None))
@@ -6666,9 +6689,11 @@ def save_predictions_image(
             'Line': _fmt_float(getattr(pred, 'betting_line', None)),
             'Predicted': _fmt_float(getattr(pred, 'predicted_total', None)),
             'Pick': pick_txt,
-            'Moneyline': ml_txt,
+            'Moneyline': ml_display,
             'Conf%': _fmt_conf(getattr(pred, 'confidence', None)),
-            '_sort_key': sort_key
+            '_sort_key': sort_key,
+            '_MoneylineBg': ml_bg_color,
+            '_MoneylineText': ml_text_color
         })
 
     df = pd.DataFrame(rows)
@@ -6676,7 +6701,13 @@ def save_predictions_image(
         print("ℹ️  No rows constructed for predictions table.")
         return None
 
-    df = df.sort_values(by=['_sort_key', 'Time']).drop(columns=['_sort_key'])
+    df = df.sort_values(by=['_sort_key', 'Time'])
+    row_count = len(df)
+    moneyline_bg = df['_MoneylineBg'].tolist() if '_MoneylineBg' in df.columns else ['#ecf0f1'] * row_count
+    moneyline_text = df['_MoneylineText'].tolist() if '_MoneylineText' in df.columns else ['#2c3e50'] * row_count
+    drop_cols = [col for col in ['_sort_key', '_MoneylineBg', '_MoneylineText'] if col in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
     df = df.replace({None: '—', np.nan: '—'})
     columns = list(df.columns)
 
@@ -6739,18 +6770,19 @@ def save_predictions_image(
                 else:
                     cell.set_facecolor('#ecf0f1')
             elif col_name == 'Moneyline':
-                ml_val = str(df.iloc[row_idx - 1, col_idx]).upper()
-                if 'HOME' in ml_val:
-                    cell.set_facecolor('#2980b9')
-                    cell.set_text_props(color='white', weight='bold')
-                elif 'AWAY' in ml_val:
-                    cell.set_facecolor('#8e44ad')
-                    cell.set_text_props(color='white', weight='bold')
-                elif 'NO BET' in ml_val or ml_val == '—':
-                    cell.set_facecolor('#ecf0f1')
-                    cell.set_text_props(color='#2c3e50', weight='normal')
+                data_idx = row_idx - 1
+                ml_val = str(df.iloc[data_idx, col_idx]).strip() if data_idx < len(df) else ''
+                bg_color = moneyline_bg[data_idx] if data_idx < len(moneyline_bg) else '#ecf0f1'
+                text_color = moneyline_text[data_idx] if data_idx < len(moneyline_text) else '#2c3e50'
+                upper_val = ml_val.upper()
+                if not ml_val or upper_val == '—' or upper_val.startswith('NO BET'):
+                    bg_color = '#ecf0f1'
+                    text_color = '#2c3e50'
+                    font_weight = 'normal'
                 else:
-                    cell.set_facecolor('#fdf2e9')
+                    font_weight = 'bold'
+                cell.set_facecolor(bg_color)
+                cell.set_text_props(color=text_color, weight=font_weight)
             elif row_idx % 2 == 0:
                 cell.set_facecolor('#f8f9fa')
 
