@@ -6811,6 +6811,10 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         matchup_display = format_matchup_display(pred.away_team, pred.home_team)
         matchup_search = attr_escape(format_matchup_search_blob(pred.away_team, pred.home_team))
         ml_rec_value = str(getattr(pred, 'moneyline_recommendation', '') or 'No Bet').strip() or 'No Bet'
+        if '(' in ml_rec_value:
+            ml_rec_value = ml_rec_value.split('(', 1)[0].strip()
+            if not ml_rec_value:
+                ml_rec_value = 'No Bet'
         ml_rec_slug = ml_rec_value.lower().replace(' ', '-').replace('/', '-')
         ml_reason = str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip()
         ml_bet_size_raw = getattr(pred, 'moneyline_bet_size', 0.0)
@@ -8453,16 +8457,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     ml_value = str(getattr(pred, 'moneyline_recommendation', '') or '').strip()
                     if ml_value and ml_value.lower() != 'no bet' and ml_side in ('home', 'away'):
                         selected_team = pred.home_team if ml_side == 'home' else pred.away_team
-                        display_name = format_team_display(selected_team)
-                        display_name = display_name if display_name and display_name.upper() != 'TBD' else ''
                         nickname_label = get_team_nickname(selected_team)
                         nickname_label = nickname_label if nickname_label and nickname_label.upper() != 'TBD' else ''
-                        fallback_code = get_team_abbreviation(selected_team)
-                        fallback_code = fallback_code if fallback_code and fallback_code.upper() != 'TBD' else ''
-                        raw_label = str(selected_team or '').strip()
-                        if raw_label.upper() == 'TBD':
-                            raw_label = ''
-                        label = nickname_label or display_name or fallback_code or raw_label or ('HOME' if ml_side == 'home' else 'AWAY')
+                        if not nickname_label:
+                            nickname_label = 'HOME' if ml_side == 'home' else 'AWAY'
+                        label = nickname_label
                         pred.moneyline_recommendation = label
                     pred.best_over_book = best_over_book
                     pred.best_under_book = best_under_book
