@@ -6633,7 +6633,6 @@ def save_predictions_image(
 
     summary_stats = compute_bet_performance_summary(training_results)
     ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
-    last_week_str = summary_stats.get('last_week_str', "Last Week: 0.0% (0/0)")
     yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
 
     rows: List[Dict[str, str]] = []
@@ -6776,7 +6775,7 @@ def save_predictions_image(
     fig.patch.set_facecolor('white')
     ax.axis('off')
 
-    perf_line_segments = [segment for segment in [ytd_str, yesterday_str, last_week_str] if segment]
+    perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
     perf_line = " | ".join(perf_line_segments)
     title_text = (
         f"NHL Predictions\n"
@@ -6881,7 +6880,6 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
     elif isinstance(wins_val, (int, np.integer)) and isinstance(total_val, (int, np.integer)):
         ytd_record_display = f"{wins_val}-{max(0, int(total_val) - int(wins_val))}"
     ytd_record_note = performance_summary.get('ytd_str', "YTD: 0.0% (0/0)")
-    last_week_note = performance_summary.get('last_week_str', "Last Week: 0.0% (0/0)")
     yesterday_note = performance_summary.get('yesterday_str', "Yesterday: — (no bets)")
     yday_wins = performance_summary.get('yesterday_wins')
     yday_losses = performance_summary.get('yesterday_losses')
@@ -7235,7 +7233,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
                 <div class="metric-card">
                     <h3>📗 YTD Bet Record</h3>
                     <div class="metric-value">{ytd_record_display}</div>
-                    <div class="metric-subtext">{ytd_record_note}<br>{last_week_note}</div>
+                    <div class="metric-subtext">{ytd_record_note}</div>
                 </div>
 
                 <div class="metric-card">
