@@ -6270,6 +6270,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
     closing_odds_path JSON per game id or matchup may include:
     {"<game_id>": {"closing_total": 6.0, "closing_over": -115, "closing_under": -105}}
     """
+    # Resolve to an absolute path so callers can find the output even when the
+    # process working directory differs (cron/docker/service runners).
+    logfile_path = os.path.abspath(logfile) if logfile else logfile
     recs = [p for p in predictions if p.recommendation != 'No Bet']
     if not recs:
         print("ℹ️  No bets to log today.")
@@ -6357,22 +6360,28 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             df[col] = np.nan
     df = df[BET_LOG_COLUMNS]
 
-    header = not os.path.exists(logfile)
+    # Ensure parent directory exists (useful when logfile is a nested path).
+    try:
+        os.makedirs(os.path.dirname(logfile_path) or '.', exist_ok=True)
+    except Exception:
+        pass
+
+    header = not os.path.exists(logfile_path)
     if not header:
         try:
-            with open(logfile, newline='', encoding='utf-8') as handle:
+            with open(logfile_path, newline='', encoding='utf-8') as handle:
                 existing_header = next(csv.reader(handle))
         except Exception:
             existing_header = None
         if not existing_header or existing_header != BET_LOG_COLUMNS:
-            _repair_bets_log_file(logfile, ValueError("bets log schema mismatch"))
+            _repair_bets_log_file(logfile_path, ValueError("bets log schema mismatch"))
 
-    df.to_csv(logfile, mode='a', header=header, index=False)
-    print(f"✅ Logged {len(rows)} bets to {logfile}")
+    df.to_csv(logfile_path, mode='a', header=header, index=False)
+    print(f"✅ Logged {len(rows)} bets to {logfile_path}")
 
     # Daily summary
     try:
-        recent = _read_bets_log_dataframe(logfile)
+        recent = _read_bets_log_dataframe(logfile_path)
         if recent is None or recent.empty or 'date' not in recent.columns:
             return
         today = datetime.now().strftime('%Y-%m-%d')
@@ -8965,6 +8974,13 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 log_bets(predictions, logfile=getattr(cli_args, 'log_path', 'bets_log.csv'), closing_odds_path=closing_odds_path)
             except Exception as e:
                 print(f"⚠️  Could not log bets: {e}")
+        else:
+            log_path = getattr(cli_args, 'log_path', 'bets_log.csv')
+            try:
+                log_path_abs = os.path.abspath(log_path)
+            except Exception:
+                log_path_abs = str(log_path)
+            print(f"\nℹ️  Bets logging disabled (pass --log-bets to append to {log_path_abs}).")
 
         if not cli_args or cli_args.post_social:
             print("\n📲 Step 8: Posting to social media...")
