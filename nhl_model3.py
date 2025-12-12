@@ -111,6 +111,7 @@ BET_LOG_COLUMNS: List[str] = [
     'game_id',
     'matchup',
     'result',
+    'action',
     'side',
     'line',
     'price',
@@ -1070,6 +1071,21 @@ class RealDataNHLModel:
             return None
         if logs.empty:
             return None
+
+        # If the log contains both actionable bets and forced directional "PICK" rows,
+        # calibrate/risk-budget using only actionable bets to avoid contaminating the feedback loop.
+        if 'action' in logs.columns:
+            try:
+                action = logs['action'].astype(str).str.upper().str.strip()
+                bet_mask = action.eq('BET')
+                if bool(bet_mask.any()):
+                    logs = logs.loc[bet_mask].copy()
+                else:
+                    # Backward-compat: if no action labels, proceed with full log.
+                    pass
+            except Exception:
+                pass
+
         logs['date'] = pd.to_datetime(logs.get('date'), errors='coerce')
         logs = logs.dropna(subset=['date'])
         if logs.empty:
@@ -6273,9 +6289,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
     # Resolve to an absolute path so callers can find the output even when the
     # process working directory differs (cron/docker/service runners).
     logfile_path = os.path.abspath(logfile) if logfile else logfile
-    recs = [p for p in predictions if p.recommendation != 'No Bet']
-    if not recs:
-        print("ℹ️  No bets to log today.")
+
+    if not predictions:
+        print("ℹ️  No predictions to log today.")
         return
 
     closing = None
@@ -6287,10 +6303,33 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             closing = None
 
     rows = []
-    for p in recs:
+    for p in predictions:
         gid = p.game_id
         matchup = f"{p.away_team}@{p.home_team}"
-        rec_side = p.recommendation
+        # Always log a directional pick (OVER/UNDER) so YTD/weekly records can be updated
+        # even when the model would otherwise recommend "No Bet".
+        rec_side = (p.recommendation or '').strip().upper()
+        action = 'BET'
+        if rec_side not in {'OVER', 'UNDER'}:
+            action = 'PICK'
+            over_prob = getattr(p, 'over_probability', None)
+            under_prob = getattr(p, 'under_probability', None)
+            try:
+                over_prob_f = float(over_prob) if over_prob is not None else None
+            except Exception:
+                over_prob_f = None
+            try:
+                under_prob_f = float(under_prob) if under_prob is not None else None
+            except Exception:
+                under_prob_f = None
+            if isinstance(over_prob_f, (int, float)) and isinstance(under_prob_f, (int, float)):
+                rec_side = 'OVER' if over_prob_f >= under_prob_f else 'UNDER'
+            else:
+                try:
+                    rec_side = 'OVER' if float(getattr(p, 'predicted_total', 0.0)) >= float(getattr(p, 'betting_line', 0.0)) else 'UNDER'
+                except Exception:
+                    rec_side = 'OVER'
+
         my_line = p.betting_line
         close_total = None
         closing_price = None
@@ -6323,18 +6362,28 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             closing_price = closing_over_price
         else:
             closing_price = closing_under_price
+
+        # For non-actionable picks, force Kelly to 0 to avoid contaminating risk-budget math downstream.
+        kelly_pct = p.kelly_bet_size
+        if action != 'BET':
+            try:
+                kelly_pct = 0.0
+            except Exception:
+                kelly_pct = 0.0
+
         rows.append({
             'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'game_id': gid,
             'matchup': matchup,
             'result': '',
+            'action': action,
             'side': rec_side,
             'line': my_line,
             'price': p.over_american_odds if rec_side == 'OVER' else p.under_american_odds,
             'pred_total': p.predicted_total,
             'edge': p.edge,
             'confidence': p.confidence,
-            'kelly_pct': p.kelly_bet_size,
+            'kelly_pct': kelly_pct,
             'model_prob': p.over_probability if rec_side == 'OVER' else p.under_probability,
             'market_prob': p.market_over_prob if rec_side == 'OVER' else p.market_under_prob,
             'fair_prob': p.fair_over_prob if rec_side == 'OVER' else p.fair_under_prob,
