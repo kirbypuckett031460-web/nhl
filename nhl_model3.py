@@ -226,6 +226,66 @@ def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
         print(f"⚠️  Could not prepare output path {path}: {e}")
         return None
 
+def resolve_local_read_path(path: Optional[str]) -> Optional[str]:
+    """Resolve a readable local file path across Windows/WSL/Linux environments.
+
+    This is intentionally forgiving because many users run the model on Windows
+    (logging to paths like ``C:\\nhl\\bets_log.csv``) but view dashboards inside
+    a Linux container/WSL where that path is not directly accessible.
+
+    Resolution strategy:
+    - Expand env vars and ~
+    - If on POSIX and the path looks like a Windows drive path, try /mnt/<drive>/...
+    - If the resolved path does not exist, try a local fallback by basename in:
+      - current working directory
+      - ~/nhl_model_data/
+    """
+
+    if path is None:
+        return None
+    raw = str(path).strip()
+    if not raw:
+        return None
+
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    candidate_paths: List[str] = []
+
+    # Direct candidate first (relative or absolute as provided).
+    candidate_paths.append(expanded)
+
+    # Handle Windows-style drive paths when running on POSIX environments (e.g., WSL or Linux containers).
+    if os.name != 'nt':
+        win_match = re.match(r'^([a-zA-Z]):[\\/](.*)$', expanded)
+        if win_match:
+            drive_letter = win_match.group(1).lower()
+            remainder = win_match.group(2).replace('\\', '/').lstrip('/')
+            wsl_root = f"/mnt/{drive_letter}"
+            if os.path.exists(wsl_root):
+                candidate_paths.append(os.path.join(wsl_root, remainder))
+
+            # If the Windows drive isn't mounted, try basename fallbacks.
+            base = os.path.basename(remainder)
+            if base:
+                candidate_paths.append(os.path.abspath(os.path.join(os.getcwd(), base)))
+                candidate_paths.append(os.path.abspath(os.path.join(os.path.expanduser("~"), "nhl_model_data", base)))
+
+    # Also try basename fallback even for non-Windows paths (helps when the log is copied into the repo dir).
+    base = os.path.basename(expanded)
+    if base and base != expanded:
+        candidate_paths.append(os.path.abspath(os.path.join(os.getcwd(), base)))
+        candidate_paths.append(os.path.abspath(os.path.join(os.path.expanduser("~"), "nhl_model_data", base)))
+
+    for cand in candidate_paths:
+        try:
+            if not cand:
+                continue
+            if os.path.exists(cand) and os.path.isfile(cand):
+                return os.path.abspath(cand)
+        except Exception:
+            continue
+
+    return None
+
 def gather_referee_output_paths(primary_path: Optional[str]) -> List[str]:
     """Build an ordered list of referee CSV output paths, including mirrors."""
 
@@ -6144,22 +6204,21 @@ def _repair_bets_log_file(log_path: str, parse_err: Exception) -> Optional[pd.Da
 def _read_bets_log_dataframe(log_path: Optional[str]) -> Optional[pd.DataFrame]:
     """Read the bets log, repairing schema drift automatically when detected."""
 
-    if not log_path:
-        return None
-    if not os.path.exists(log_path):
+    resolved_path = resolve_local_read_path(log_path)
+    if not resolved_path:
         return None
     try:
-        if os.path.getsize(log_path) == 0:
+        if os.path.getsize(resolved_path) == 0:
             return None
     except OSError:
         return None
 
     try:
-        return pd.read_csv(log_path)
+        return pd.read_csv(resolved_path)
     except pd.errors.ParserError as parse_err:
-        return _repair_bets_log_file(log_path, parse_err)
+        return _repair_bets_log_file(resolved_path, parse_err)
     except Exception as err:
-        print(f"⚠️  Unable to read {log_path}: {err}")
+        print(f"⚠️  Unable to read {resolved_path}: {err}")
         return None
 
 
@@ -6183,6 +6242,19 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
         os.getenv('NHL_BETS_LOG'),
         'bets_log.csv'
     ]
+
+    # YTD should represent the current season's picks, not the model's last training split.
+    # Default season start requested: Oct 7, 2025 (inclusive).
+    season_start_str = str(os.getenv('NHL_SEASON_START', '2025-10-07')).strip() or '2025-10-07'
+    season_start_eastern: Optional[pd.Timestamp] = None
+    try:
+        candidate = pd.Timestamp(season_start_str)
+        if candidate.tzinfo is None:
+            season_start_eastern = candidate.tz_localize('US/Eastern')
+        else:
+            season_start_eastern = candidate.tz_convert('US/Eastern')
+    except Exception:
+        season_start_eastern = None
 
     for path in log_candidates:
         if not path:
@@ -6215,20 +6287,13 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
         win_mask = df_log['_result_norm'].isin(win_tokens)
         loss_mask = df_log['_result_norm'].isin(loss_tokens)
 
-        total_scored = int(win_mask.sum() + loss_mask.sum())
-        if total_scored > 0:
-            total_wins = int(win_mask.sum())
-            total_losses = int(loss_mask.sum())
-            accuracy_pct = (total_wins / total_scored) * 100.0
-            summary['ytd_str'] = f"YTD: {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
-            summary['wins'] = total_wins
-            summary['losses'] = total_losses
-            summary['total'] = total_scored
-
         date_col = next(
             (c for c in df_log.columns if str(c).lower() in {'date', 'datetime', 'timestamp', 'created_at'}),
             None
         )
+        dates_utc = None
+        dates_local = None
+        season_mask = None
         if date_col:
             dates_utc = pd.to_datetime(df_log[date_col], utc=True, errors='coerce')
             if dates_utc.notna().any():
@@ -6238,6 +6303,11 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
                     dates_local = dates_utc.dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
 
                 if dates_local.notna().any():
+                    if season_start_eastern is not None:
+                        try:
+                            season_mask = dates_local >= season_start_eastern
+                        except Exception:
+                            season_mask = None
                     eastern_now = pd.Timestamp.now(tz='US/Eastern')
                     yesterday_date = (eastern_now - pd.Timedelta(days=1)).date()
                     yesterday_mask = dates_local.dt.date == yesterday_date
@@ -6260,6 +6330,27 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
                     lw_pct = (lw_wins / lw_total) * 100.0
                     summary['last_week_str'] = f"Last Week: {lw_pct:.1f}% ({lw_wins}/{lw_total})"
 
+        # Compute YTD (season-to-date) from the picks log, filtered from season start if possible.
+        if season_mask is not None:
+            ytd_win_mask = win_mask & season_mask
+            ytd_loss_mask = loss_mask & season_mask
+        else:
+            ytd_win_mask = win_mask
+            ytd_loss_mask = loss_mask
+
+        total_scored = int(ytd_win_mask.sum() + ytd_loss_mask.sum())
+        if total_scored > 0:
+            total_wins = int(ytd_win_mask.sum())
+            total_losses = int(ytd_loss_mask.sum())
+            accuracy_pct = (total_wins / total_scored) * 100.0
+            if season_start_eastern is not None:
+                summary['ytd_str'] = f"YTD (since {season_start_eastern.date().isoformat()}): {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
+            else:
+                summary['ytd_str'] = f"YTD: {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
+            summary['wins'] = total_wins
+            summary['losses'] = total_losses
+            summary['total'] = total_scored
+
         if summary['total']:
             return summary
 
@@ -6275,7 +6366,8 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
             summary['wins'] = wins
             summary['losses'] = losses
             summary['total'] = total_games
-            summary['ytd_str'] = f"YTD: {acc_pct:.1f}% ({wins}/{total_games})"
+            # Make it explicit this is *not* picks history, just model evaluation.
+            summary['ytd_str'] = f"Model (eval): {acc_pct:.1f}% ({wins}/{total_games})"
 
     return summary
 
