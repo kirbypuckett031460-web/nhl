@@ -6282,6 +6282,25 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
             .str.upper()
         )
 
+        side_col = next(
+            (c for c in df_log.columns if str(c).lower() in {'side', 'pick', 'selection', 'bet_side'}),
+            None
+        )
+        if not side_col:
+            # Some historical logs may store direction under "recommendation".
+            side_col = next((c for c in df_log.columns if str(c).lower() in {'recommendation'}), None)
+
+        direction_mask = pd.Series(True, index=df_log.index)
+        if side_col:
+            df_log['_side_norm'] = (
+                df_log[side_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            # Count only actual directional picks, never "NO BET"/blank/etc.
+            direction_mask = df_log['_side_norm'].isin({'OVER', 'UNDER'})
+
         win_tokens = {'WIN', 'W', 'HIT', 'SUCCESS', 'CASH', 'TRUE'}
         loss_tokens = {'LOSS', 'L', 'LOSE', 'FAILED', 'MISS', 'FALSE'}
         win_mask = df_log['_result_norm'].isin(win_tokens)
@@ -6295,36 +6314,62 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
         dates_local = None
         season_mask = None
         if date_col:
-            dates_utc = pd.to_datetime(df_log[date_col], utc=True, errors='coerce')
-            if dates_utc.notna().any():
+            # The bets log timestamps are often written as naive local times (no timezone).
+            # Interpreting them as UTC will shift dates and break "Yesterday" stats.
+            schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+            parsed = pd.to_datetime(df_log[date_col], errors='coerce')
+            if parsed.notna().any() and hasattr(parsed, 'dt'):
                 try:
-                    dates_local = dates_utc.dt.tz_convert('US/Eastern')
-                except TypeError:
-                    dates_local = dates_utc.dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+                    tz_info = getattr(parsed.dt, 'tz', None)
+                except Exception:
+                    tz_info = None
+                try:
+                    if tz_info is None:
+                        dates_local = parsed.dt.tz_localize(schedule_tz, ambiguous='NaT', nonexistent='NaT')
+                    else:
+                        dates_local = parsed.dt.tz_convert(schedule_tz)
+                except Exception:
+                    dates_local = None
+            if dates_local is not None and dates_local.notna().any():
+                # Maintain a UTC series for any UTC-based comparisons if needed.
+                try:
+                    dates_utc = dates_local.dt.tz_convert('UTC')
+                except Exception:
+                    dates_utc = None
 
-                if dates_local.notna().any():
-                    if season_start_eastern is not None:
+            if dates_local is not None and dates_local.notna().any():
+                if season_start_eastern is not None:
+                    try:
+                        # season_start is anchored to US/Eastern by default; convert if schedule_tz differs.
+                        season_start_local = season_start_eastern
                         try:
-                            season_mask = dates_local >= season_start_eastern
+                            season_start_local = season_start_local.tz_convert(dates_local.dt.tz)
                         except Exception:
-                            season_mask = None
-                    eastern_now = pd.Timestamp.now(tz='US/Eastern')
-                    yesterday_date = (eastern_now - pd.Timedelta(days=1)).date()
-                    yesterday_mask = dates_local.dt.date == yesterday_date
-                    yday_wins = int((win_mask & yesterday_mask).sum())
-                    yday_losses = int((loss_mask & yesterday_mask).sum())
-                    yday_total = yday_wins + yday_losses
-                    if yday_total > 0:
-                        yday_pct = (yday_wins / yday_total) * 100.0
-                        summary['yesterday_str'] = f"Yesterday: {yday_wins}-{yday_losses} ({yday_pct:.1f}%)"
-                        summary['yesterday_wins'] = yday_wins
-                        summary['yesterday_losses'] = yday_losses
-                        summary['yesterday_total'] = yday_total
+                            season_start_local = season_start_eastern
+                        season_mask = dates_local >= season_start_local
+                    except Exception:
+                        season_mask = None
 
-                cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7)
-                lw_mask = dates_utc >= cutoff
-                lw_wins = int((win_mask & lw_mask).sum())
-                lw_losses = int((loss_mask & lw_mask).sum())
+                now_local = pd.Timestamp.now(tz=dates_local.dt.tz)
+                yesterday_date = (now_local - pd.Timedelta(days=1)).date()
+                yesterday_mask = dates_local.dt.date == yesterday_date
+
+                # Yesterday stats should reflect what the model actually picked (OVER/UNDER),
+                # and should never count "NO BET" rows.
+                yday_wins = int((win_mask & direction_mask & yesterday_mask).sum())
+                yday_losses = int((loss_mask & direction_mask & yesterday_mask).sum())
+                yday_total = yday_wins + yday_losses
+                if yday_total > 0:
+                    yday_pct = (yday_wins / yday_total) * 100.0
+                    summary['yesterday_str'] = f"Yesterday: {yday_wins}-{yday_losses} ({yday_pct:.1f}%)"
+                    summary['yesterday_wins'] = yday_wins
+                    summary['yesterday_losses'] = yday_losses
+                    summary['yesterday_total'] = yday_total
+
+                cutoff_local = now_local - pd.Timedelta(days=7)
+                lw_mask = dates_local >= cutoff_local
+                lw_wins = int((win_mask & direction_mask & lw_mask).sum())
+                lw_losses = int((loss_mask & direction_mask & lw_mask).sum())
                 lw_total = lw_wins + lw_losses
                 if lw_total > 0:
                     lw_pct = (lw_wins / lw_total) * 100.0
@@ -6332,11 +6377,11 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
 
         # Compute YTD (season-to-date) from the picks log, filtered from season start if possible.
         if season_mask is not None:
-            ytd_win_mask = win_mask & season_mask
-            ytd_loss_mask = loss_mask & season_mask
+            ytd_win_mask = win_mask & direction_mask & season_mask
+            ytd_loss_mask = loss_mask & direction_mask & season_mask
         else:
-            ytd_win_mask = win_mask
-            ytd_loss_mask = loss_mask
+            ytd_win_mask = win_mask & direction_mask
+            ytd_loss_mask = loss_mask & direction_mask
 
         total_scored = int(ytd_win_mask.sum() + ytd_loss_mask.sum())
         if total_scored > 0:
