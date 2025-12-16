@@ -1123,11 +1123,12 @@ class RealDataNHLModel:
         self.market_calibration_snapshot = None
         self.book_confidence_multipliers = {}
         self.month_confidence_multipliers = {}
-        if not log_path or not os.path.exists(log_path):
+        resolved_log_path = resolve_local_read_path(log_path)
+        if not resolved_log_path:
             return None
-        logs = _read_bets_log_dataframe(log_path)
+        logs = _read_bets_log_dataframe(resolved_log_path)
         if logs is None:
-            print(f"⚠️  Market calibration skipped: unable to read {log_path}.")
+            print(f"⚠️  Market calibration skipped: unable to read {resolved_log_path}.")
             return None
         if logs.empty:
             return None
@@ -6222,7 +6223,10 @@ def _read_bets_log_dataframe(log_path: Optional[str]) -> Optional[pd.DataFrame]:
         return None
 
 
-def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> Dict[str, Any]:
+def compute_bet_performance_summary(
+    training_results: Optional[Dict] = None,
+    log_path: Optional[str] = None
+) -> Dict[str, Any]:
     """Return YTD/last-week bet performance strings and record counts."""
 
     summary: Dict[str, Any] = {
@@ -6237,11 +6241,25 @@ def compute_bet_performance_summary(training_results: Optional[Dict] = None) -> 
         'yesterday_total': None
     }
 
-    log_candidates = [
+    log_candidates_raw = [
+        log_path,
         os.getenv('NHL_ACCURACY_FILE'),
         os.getenv('NHL_BETS_LOG'),
         'bets_log.csv'
     ]
+    log_candidates: List[str] = []
+    seen_paths: Set[str] = set()
+    for candidate in log_candidates_raw:
+        if not candidate:
+            continue
+        normalized = str(candidate).strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        log_candidates.append(normalized)
 
     # YTD should represent the current season's picks, not the model's last training split.
     # Default season start requested: Oct 7, 2025 (inclusive).
@@ -6785,6 +6803,7 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
 def save_predictions_image(
     predictions: List[OverUnderPrediction],
     training_results: Optional[Dict] = None,
+    log_path: Optional[str] = None,
     html_path: str = 'predictions_table.html',
     image_path: str = 'predictions.png'
 ) -> Optional[str]:
@@ -6826,7 +6845,7 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    summary_stats = compute_bet_performance_summary(training_results)
+    summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
     ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
     yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
 
@@ -7052,7 +7071,12 @@ def save_predictions_image(
 
     return None
 
-def create_dashboard_html(predictions: List[OverUnderPrediction], training_results: Dict, betting_odds: Optional[Dict] = None) -> str:
+def create_dashboard_html(
+    predictions: List[OverUnderPrediction],
+    training_results: Dict,
+    betting_odds: Optional[Dict] = None,
+    log_path: Optional[str] = None
+) -> str:
     """Create enhanced dashboard HTML"""
     
     if not predictions:
@@ -7063,7 +7087,7 @@ def create_dashboard_html(predictions: List[OverUnderPrediction], training_resul
         </body></html>
         """
     
-    performance_summary = compute_bet_performance_summary(training_results)
+    performance_summary = compute_bet_performance_summary(training_results, log_path=log_path)
     betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
     avg_confidence = np.mean([p.confidence for p in betting_preds]) if betting_preds else 0
     wins_val = performance_summary.get('wins')
@@ -9108,7 +9132,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 print("\n💡 No betting opportunities identified today")
         
         print("\n📱 Step 6: Creating dashboard...")
-        dashboard_html = create_dashboard_html(predictions, training_results, betting_odds=betting_odds)
+        dashboard_html = create_dashboard_html(
+            predictions,
+            training_results,
+            betting_odds=betting_odds,
+            log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+        )
         
         dashboard_file = "nhl_real_data_dashboard.html"
         tmp_path = dashboard_file + ".tmp"
@@ -9144,6 +9173,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     img = save_predictions_image(
                         predictions,
                         training_results=training_results,
+                        log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None,
                         html_path='predictions_table.html',
                         image_path='predictions.png'
                     )
@@ -9178,6 +9208,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     img_path = save_predictions_image(
                         predictions,
                         training_results=training_results,
+                        log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None,
                         html_path='predictions_table.html',
                         image_path='predictions.png'
                     )
