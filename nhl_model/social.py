@@ -59,8 +59,13 @@ except Exception:
 class SocialMediaPoster:
     """Handles posting predictions to X (Twitter) and Discord."""
 
-    def __init__(self, image_renderer: Optional[Callable[..., Optional[str]]] = None) -> None:
+    def __init__(
+        self,
+        image_renderer: Optional[Callable[..., Optional[str]]] = None,
+        log_path: Optional[str] = None
+    ) -> None:
         self.image_renderer = image_renderer
+        self.log_path = log_path
         self.twitter_api = None
         self.discord_webhook_url = None
         self.discord_verify = True
@@ -513,12 +518,24 @@ class SocialMediaPoster:
             img_path = None
             if self.image_renderer:
                 try:
-                    img_path = self.image_renderer(
-                        predictions,
-                        training_results=training_results,
-                        html_path='predictions_table.html',
-                        image_path='predictions.png'
-                    )
+                    # Prefer passing the bets log path through so YTD/Yesterday stats
+                    # come from the full picks history (not a fallback training window).
+                    try:
+                        img_path = self.image_renderer(
+                            predictions,
+                            training_results=training_results,
+                            log_path=self.log_path,
+                            html_path='predictions_table.html',
+                            image_path='predictions.png'
+                        )
+                    except TypeError:
+                        # Backward compatibility for older renderer signatures.
+                        img_path = self.image_renderer(
+                            predictions,
+                            training_results=training_results,
+                            html_path='predictions_table.html',
+                            image_path='predictions.png'
+                        )
                 except Exception as exc:
                     print(f"⚠️  Rendering predictions image failed: {exc}")
 

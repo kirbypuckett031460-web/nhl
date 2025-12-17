@@ -250,8 +250,12 @@ def resolve_local_read_path(path: Optional[str]) -> Optional[str]:
     expanded = os.path.expanduser(os.path.expandvars(raw))
     candidate_paths: List[str] = []
 
-    # Direct candidate first (relative or absolute as provided).
+    # Direct candidate first (relative or absolute as provided), plus its absolute form.
     candidate_paths.append(expanded)
+    try:
+        candidate_paths.append(os.path.abspath(expanded))
+    except Exception:
+        pass
 
     # Handle Windows-style drive paths when running on POSIX environments (e.g., WSL or Linux containers).
     if os.name != 'nt':
@@ -275,6 +279,14 @@ def resolve_local_read_path(path: Optional[str]) -> Optional[str]:
         candidate_paths.append(os.path.abspath(os.path.join(os.getcwd(), base)))
         candidate_paths.append(os.path.abspath(os.path.join(os.path.expanduser("~"), "nhl_model_data", base)))
 
+    # Special case: when a Windows path like "C:\nhl\bets_log.csv" is treated as a *relative*
+    # filename on POSIX, it may be written as "<cwd>/C:\nhl\bets_log.csv". If that happened,
+    # try resolving that too so downstream readers can still find the log.
+    try:
+        candidate_paths.append(os.path.abspath(os.path.join(os.getcwd(), expanded)))
+    except Exception:
+        pass
+
     for cand in candidate_paths:
         try:
             if not cand:
@@ -283,6 +295,59 @@ def resolve_local_read_path(path: Optional[str]) -> Optional[str]:
                 return os.path.abspath(cand)
         except Exception:
             continue
+
+    # Last-chance discovery: look in common local directories for a bets log.
+    # This helps when runs in containers write logs under ./data/** or ~/nhl_model_data.
+    try:
+        base = os.path.basename(expanded)
+        search_dirs = [
+            os.path.abspath(os.getcwd()),
+            os.path.abspath(os.path.join(os.getcwd(), 'data')),
+            os.path.abspath(os.path.join(os.getcwd(), 'data', 'latest')),
+            os.path.abspath(os.path.join(os.getcwd(), 'data', 'cache')),
+            os.path.abspath(os.path.join(os.path.expanduser("~"), "nhl_model_data")),
+        ]
+
+        # If we were given a directory, include it too.
+        if os.path.isdir(expanded):
+            search_dirs.insert(0, os.path.abspath(expanded))
+
+        # Prefer an exact basename match if we have one.
+        if base:
+            for d in search_dirs:
+                try:
+                    cand = os.path.join(d, base)
+                    if os.path.exists(cand) and os.path.isfile(cand):
+                        return os.path.abspath(cand)
+                except Exception:
+                    continue
+
+        # Otherwise pick the newest "*bets*log*.csv" in those directories.
+        newest = None
+        newest_mtime = None
+        for d in search_dirs:
+            try:
+                if not os.path.isdir(d):
+                    continue
+                for name in os.listdir(d):
+                    low = str(name).lower()
+                    if not (low.endswith('.csv') and 'bet' in low and 'log' in low):
+                        continue
+                    cand = os.path.join(d, name)
+                    try:
+                        st = os.stat(cand)
+                        mtime = float(st.st_mtime)
+                    except Exception:
+                        continue
+                    if newest is None or newest_mtime is None or mtime > newest_mtime:
+                        newest = cand
+                        newest_mtime = mtime
+            except Exception:
+                continue
+        if newest and os.path.exists(newest) and os.path.isfile(newest):
+            return os.path.abspath(newest)
+    except Exception:
+        pass
 
     return None
 
@@ -6441,9 +6506,8 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
     closing_odds_path JSON per game id or matchup may include:
     {"<game_id>": {"closing_total": 6.0, "closing_over": -115, "closing_under": -105}}
     """
-    # Resolve to an absolute path so callers can find the output even when the
-    # process working directory differs (cron/docker/service runners).
-    logfile_path = os.path.abspath(logfile) if logfile else logfile
+    # Resolve to a safe local path (handles Windows paths when running on Linux/WSL).
+    logfile_path = ensure_local_write_path(logfile) or (os.path.abspath(logfile) if logfile else logfile)
 
     if not predictions:
         print("ℹ️  No predictions to log today.")
@@ -9157,7 +9221,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         # Optional: deploy to www.thepointou.com (HTTP/S3/SFTP)
         try:
             if not cli_args or getattr(cli_args, 'deploy', False):
-                smp = SocialMediaPoster(image_renderer=save_predictions_image)
+                smp = SocialMediaPoster(
+                    image_renderer=save_predictions_image,
+                    log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+                )
                 smp.deploy_dashboard_html(dashboard_file, cli_args=cli_args)
         except Exception as e:
             print(f"⚠️  Deployment step skipped/failed: {e}")
@@ -9168,7 +9235,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 excel_path = getattr(cli_args, 'excel_path', 'predictions.xls') if cli_args else 'predictions.xls'
                 saved = save_predictions_excel(predictions, out_path=excel_path)
                 if saved and (not cli_args or getattr(cli_args, 'post_excel', False)):
-                    smp = SocialMediaPoster(image_renderer=save_predictions_image)
+                    smp = SocialMediaPoster(
+                        image_renderer=save_predictions_image,
+                        log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+                    )
                     # Also render a clean image and attach alongside Excel
                     img = save_predictions_image(
                         predictions,
@@ -9200,7 +9270,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
 
         if not cli_args or cli_args.post_social:
             print("\n📲 Step 8: Posting to social media...")
-            social_poster = SocialMediaPoster(image_renderer=save_predictions_image)
+            social_poster = SocialMediaPoster(
+                image_renderer=save_predictions_image,
+                log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+            )
             social_results = {'twitter': False, 'discord': False}
             try:
                 # Only post predictions image to Twitter (no text summary)
