@@ -9157,7 +9157,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         # Optional: deploy to www.thepointou.com (HTTP/S3/SFTP)
         try:
             if not cli_args or getattr(cli_args, 'deploy', False):
-                smp = SocialMediaPoster(image_renderer=save_predictions_image)
+                smp = SocialMediaPoster(
+                    image_renderer=save_predictions_image,
+                    log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+                )
                 smp.deploy_dashboard_html(dashboard_file, cli_args=cli_args)
         except Exception as e:
             print(f"⚠️  Deployment step skipped/failed: {e}")
@@ -9168,7 +9171,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 excel_path = getattr(cli_args, 'excel_path', 'predictions.xls') if cli_args else 'predictions.xls'
                 saved = save_predictions_excel(predictions, out_path=excel_path)
                 if saved and (not cli_args or getattr(cli_args, 'post_excel', False)):
-                    smp = SocialMediaPoster(image_renderer=save_predictions_image)
+                    smp = SocialMediaPoster(
+                        image_renderer=save_predictions_image,
+                        log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+                    )
                     # Also render a clean image and attach alongside Excel
                     img = save_predictions_image(
                         predictions,
@@ -9200,7 +9206,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
 
         if not cli_args or cli_args.post_social:
             print("\n📲 Step 8: Posting to social media...")
-            social_poster = SocialMediaPoster(image_renderer=save_predictions_image)
+            social_poster = SocialMediaPoster(
+                image_renderer=save_predictions_image,
+                log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None
+            )
             social_results = {'twitter': False, 'discord': False}
             try:
                 # Only post predictions image to Twitter (no text summary)
