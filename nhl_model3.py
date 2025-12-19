@@ -138,6 +138,232 @@ BET_LOG_COLUMNS: List[str] = [
     'clv_vs_closing'
 ]
 
+
+def grade_bets_log(
+    log_path: str,
+    historical_frame: Optional[pd.DataFrame] = None,
+    *,
+    force: bool = False,
+    backup: bool = True,
+) -> Dict[str, Any]:
+    """Fill missing bet results (WIN/LOSS/PUSH) in the bets log.
+
+    A row is gradable when:
+    - side is OVER/UNDER
+    - line is numeric
+    - we can resolve a final total goals for the game (from historical_frame or NHL schedule API)
+
+    This writes back to the same CSV (optionally creating a .bak backup).
+    """
+
+    summary: Dict[str, Any] = {
+        'resolved_path': None,
+        'rows_total': 0,
+        'rows_candidate': 0,
+        'rows_graded': 0,
+        'rows_skipped': 0,
+        'rows_missing_final': 0,
+    }
+
+    if not log_path:
+        return summary
+
+    resolved_read = resolve_local_read_path(log_path)
+    if not resolved_read:
+        # If the caller passed a relative path that will be written later,
+        # try a direct absolute candidate as a last resort.
+        try:
+            abs_candidate = os.path.abspath(str(log_path))
+            if os.path.exists(abs_candidate) and os.path.isfile(abs_candidate):
+                resolved_read = abs_candidate
+        except Exception:
+            resolved_read = None
+    if not resolved_read:
+        return summary
+
+    # Ensure we can write back to the same file (or a safe fallback if needed).
+    resolved_write = ensure_local_write_path(resolved_read) or resolved_read
+    summary['resolved_path'] = resolved_write
+
+    df = _read_bets_log_dataframe(resolved_read)
+    if df is None or df.empty:
+        return summary
+
+    summary['rows_total'] = int(len(df))
+
+    # Normalize required columns.
+    if 'result' not in df.columns:
+        df['result'] = ''
+    if 'side' not in df.columns:
+        df['side'] = ''
+    if 'line' not in df.columns:
+        df['line'] = np.nan
+    if 'game_id' not in df.columns:
+        df['game_id'] = ''
+    if 'matchup' not in df.columns:
+        df['matchup'] = ''
+
+    # Candidate rows: OVER/UNDER picks with blank (or force) result.
+    side_norm = df['side'].astype(str).str.strip().str.upper()
+    result_norm = df['result'].astype(str).str.strip().str.upper()
+    is_pick = side_norm.isin({'OVER', 'UNDER'})
+    needs_grade = result_norm.eq('') | result_norm.isna()
+    if force:
+        needs_grade = pd.Series(True, index=df.index)
+    candidates = is_pick & needs_grade
+    summary['rows_candidate'] = int(candidates.sum())
+    if not bool(candidates.any()):
+        return summary
+
+    df['line'] = pd.to_numeric(df['line'], errors='coerce')
+    game_id_series = df['game_id'].astype(str).str.strip()
+
+    # Attempt 1: fill final_total using historical_frame (fast, no extra API calls).
+    final_total = pd.Series(np.nan, index=df.index, dtype='float64')
+    if historical_frame is not None and not historical_frame.empty:
+        try:
+            hist = historical_frame.copy()
+            if 'game_id' in hist.columns and 'total_goals' in hist.columns:
+                hist_gid = hist['game_id'].astype(str).str.strip()
+                hist_tot = pd.to_numeric(hist['total_goals'], errors='coerce')
+                totals_by_gid = dict(zip(hist_gid.tolist(), hist_tot.tolist()))
+                final_total = game_id_series.map(totals_by_gid)
+        except Exception:
+            pass
+
+    # Attempt 2: for any still-missing finals, query schedule API by date range.
+    missing_mask = candidates & (final_total.isna() | ~np.isfinite(final_total))
+    if bool(missing_mask.any()):
+        try:
+            # Parse log dates and build a list of unique local dates to fetch.
+            schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+            parsed_dt = pd.to_datetime(df.get('date'), errors='coerce', utc=False)
+            # Handle naive timestamps consistently: assume schedule_tz.
+            try:
+                if hasattr(parsed_dt, 'dt') and getattr(parsed_dt.dt, 'tz', None) is None:
+                    parsed_dt = parsed_dt.dt.tz_localize(schedule_tz, ambiguous='NaT', nonexistent='NaT')
+            except Exception:
+                pass
+            try:
+                if hasattr(parsed_dt, 'dt') and getattr(parsed_dt.dt, 'tz', None) is not None:
+                    parsed_dt = parsed_dt.dt.tz_convert(schedule_tz)
+            except Exception:
+                pass
+            date_only = None
+            try:
+                date_only = parsed_dt.dt.date
+            except Exception:
+                date_only = None
+
+            # If we can't parse dates, fall back to a small window around "now".
+            dates_to_fetch: List[str] = []
+            if date_only is not None:
+                unique_dates = sorted({d for d in date_only[missing_mask].tolist() if d is not None and str(d) != 'NaT'})
+                dates_to_fetch = [pd.Timestamp(d).strftime('%Y-%m-%d') for d in unique_dates]
+            if not dates_to_fetch:
+                now_local = pd.Timestamp.now(tz=schedule_tz)
+                dates_to_fetch = [
+                    (now_local - pd.Timedelta(days=14)).strftime('%Y-%m-%d'),
+                    now_local.strftime('%Y-%m-%d'),
+                ]
+
+            fetcher = NHLDataFetcher()
+            final_by_gid: Dict[str, float] = {}
+            # If we got an explicit list of dates, fetch each day individually.
+            if len(dates_to_fetch) > 2:
+                for day in dates_to_fetch:
+                    games = fetcher.get_schedule(day, day)
+                    for g in games:
+                        try:
+                            gid = str(g.get('gamePk') or '').strip()
+                            state = str(g.get('status', {}).get('detailedState', '')).strip().lower()
+                            if state != 'final':
+                                continue
+                            home = (g.get('teams') or {}).get('home') or {}
+                            away = (g.get('teams') or {}).get('away') or {}
+                            hs = home.get('score')
+                            as_ = away.get('score')
+                            if hs is None or as_ is None:
+                                continue
+                            final_by_gid[gid] = float(int(hs) + int(as_))
+                        except Exception:
+                            continue
+            else:
+                # Treat the two values as start/end.
+                start_dt = dates_to_fetch[0]
+                end_dt = dates_to_fetch[-1]
+                games = fetcher.get_schedule(start_dt, end_dt)
+                for g in games:
+                    try:
+                        gid = str(g.get('gamePk') or '').strip()
+                        state = str(g.get('status', {}).get('detailedState', '')).strip().lower()
+                        if state != 'final':
+                            continue
+                        home = (g.get('teams') or {}).get('home') or {}
+                        away = (g.get('teams') or {}).get('away') or {}
+                        hs = home.get('score')
+                        as_ = away.get('score')
+                        if hs is None or as_ is None:
+                            continue
+                        final_by_gid[gid] = float(int(hs) + int(as_))
+                    except Exception:
+                        continue
+
+            if final_by_gid:
+                api_totals = game_id_series.map(final_by_gid)
+                final_total = final_total.fillna(api_totals)
+        except Exception:
+            pass
+
+    # Compute grades.
+    can_grade = candidates & df['line'].notna() & final_total.notna()
+    missing_final = candidates & (~can_grade)
+    summary['rows_missing_final'] = int(missing_final.sum())
+
+    # Determine market outcome vs line.
+    outcome = pd.Series('', index=df.index, dtype='object')
+    outcome.loc[can_grade & (final_total > df['line'])] = 'OVER'
+    outcome.loc[can_grade & (final_total < df['line'])] = 'UNDER'
+    outcome.loc[can_grade & (final_total == df['line'])] = 'PUSH'
+
+    # Grade relative to pick.
+    new_result = df['result'].astype(str).fillna('').astype(str)
+    pick = side_norm
+    win_mask = can_grade & outcome.isin({'OVER', 'UNDER'}) & (outcome == pick)
+    loss_mask = can_grade & outcome.isin({'OVER', 'UNDER'}) & (outcome != pick)
+    push_mask = can_grade & outcome.eq('PUSH')
+
+    new_result.loc[win_mask] = 'WIN'
+    new_result.loc[loss_mask] = 'LOSS'
+    new_result.loc[push_mask] = 'PUSH'
+
+    # Apply updates back to dataframe.
+    df['result'] = new_result
+    # Store final totals when helpful (non-schema column; safe to add).
+    if 'final_total' not in df.columns:
+        df['final_total'] = np.nan
+    try:
+        df['final_total'] = pd.to_numeric(df['final_total'], errors='coerce')
+    except Exception:
+        df['final_total'] = np.nan
+    df.loc[can_grade, 'final_total'] = final_total.loc[can_grade].astype(float)
+
+    graded_count = int((win_mask | loss_mask | push_mask).sum())
+    summary['rows_graded'] = graded_count
+    summary['rows_skipped'] = int(summary['rows_candidate'] - graded_count)
+
+    # Write back to disk with a backup.
+    try:
+        if backup:
+            backup_path = f"{resolved_write}.bak"
+            if not os.path.exists(backup_path):
+                shutil.copyfile(resolved_read, backup_path)
+        df.to_csv(resolved_write, index=False)
+    except Exception as write_err:
+        summary['write_error'] = str(write_err)
+
+    return summary
+
 def ensure_local_write_path(path: Optional[str]) -> Optional[str]:
     """Ensure the parent directory exists before writing to a local file path.
 
@@ -8019,6 +8245,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             cache_path=cache_path,
             force_refresh=force_cache_refresh
         )
+
+        # Optional: grade bets log using completed game totals so YTD/Yesterday populate.
+        if cli_args and (getattr(cli_args, 'grade_bets', False) or getattr(cli_args, 'grade_bets_only', False)):
+            log_path_for_grading = getattr(cli_args, 'log_path', 'bets_log.csv')
+            print("\n🧾 Grading bets log (WIN/LOSS/PUSH) from final scores...")
+            grade_summary = grade_bets_log(log_path_for_grading, historical_frame=historical_data, force=False, backup=True)
+            graded_n = int(grade_summary.get('rows_graded') or 0)
+            cand_n = int(grade_summary.get('rows_candidate') or 0)
+            missing_n = int(grade_summary.get('rows_missing_final') or 0)
+            resolved_path = grade_summary.get('resolved_path')
+            print(f"✅ Bets log grading: graded {graded_n}/{cand_n} candidates; missing finals for {missing_n}. ({resolved_path})")
+            if getattr(cli_args, 'grade_bets_only', False):
+                return model, predictions, dashboard_file
         
         if len(historical_data) < 20:
             extended_days = max(hist_days * 2, 120)
@@ -9415,6 +9654,8 @@ if __name__ == "__main__":
     parser.add_argument('--closing-odds-path', type=str, default=os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json'), help='Path to closing odds JSON for CLV logging')
     parser.add_argument('--log-bets', action='store_true', help='Enable logging bets to CSV')
     parser.add_argument('--log-path', type=str, default='bets_log.csv', help='Path to bets log CSV')
+    parser.add_argument('--grade-bets', action='store_true', help='Grade existing bets_log.csv rows (fill result=WIN/LOSS/PUSH) before rendering outputs')
+    parser.add_argument('--grade-bets-only', action='store_true', help='Only grade the bets log and exit (no training/predictions)')
     parser.add_argument('--post-social', action='store_true', help='Enable social media posting')
     parser.add_argument('--date', type=str, default=None, help='ISO date YYYY-MM-DD for which to fetch/predict games (default: today)')
     parser.add_argument('--today-games-path', type=str, default=None, help='Path to offline today games JSON to bypass API')
