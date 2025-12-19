@@ -6734,6 +6734,183 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
     except Exception:
         pass
 
+
+def grade_bets_log(
+    log_path: str = 'bets_log.csv',
+    historical_days: int = 90,
+    historical_cache_path: Optional[str] = None,
+    force_refresh: bool = False
+) -> Dict[str, Any]:
+    """Grade/settle ungraded OVER/UNDER picks in a bets log.
+
+    This updates *only* the existing ``result`` column (WIN/LOSS/PUSH) to avoid
+    breaking the fixed bets log schema (``BET_LOG_COLUMNS``), which is appended
+    to daily by ``log_bets``.
+    """
+
+    summary: Dict[str, Any] = {
+        'log_path': log_path,
+        'graded': 0,
+        'skipped': 0,
+        'ungraded_before': 0,
+        'ungraded_after': 0
+    }
+
+    resolved_log_path = resolve_local_read_path(log_path) or (os.path.abspath(log_path) if log_path else None)
+    if not resolved_log_path or not os.path.exists(resolved_log_path):
+        print(f"⚠️  Bets log not found: {log_path}")
+        return summary
+
+    df_log = _read_bets_log_dataframe(resolved_log_path)
+    if df_log is None:
+        try:
+            df_log = pd.read_csv(resolved_log_path)
+        except Exception as e:
+            print(f"⚠️  Unable to read bets log {resolved_log_path}: {e}")
+            return summary
+    if df_log.empty:
+        print(f"ℹ️  Bets log {resolved_log_path} is empty — nothing to grade.")
+        return summary
+
+    if 'result' not in df_log.columns:
+        df_log['result'] = ''
+
+    # Normalize needed fields
+    side_col = next((c for c in df_log.columns if str(c).lower() in {'side', 'pick', 'selection', 'bet_side', 'recommendation'}), None)
+    if not side_col:
+        print("⚠️  Bets log has no side/pick column — cannot grade.")
+        return summary
+
+    side = df_log[side_col].astype(str).str.strip().str.upper()
+    line = pd.to_numeric(df_log.get('line'), errors='coerce')
+    result_raw = df_log['result']
+    result_norm = result_raw.astype(str).str.strip().str.upper()
+
+    ungraded_tokens = {'', 'NAN', 'NONE', 'NULL', 'UNGRADED', '—', '-', 'NA'}
+    ungraded_mask = result_raw.isna() | result_norm.isin(ungraded_tokens)
+    actionable_mask = side.isin({'OVER', 'UNDER'}) & line.notna()
+    candidate_mask = ungraded_mask & actionable_mask
+    summary['ungraded_before'] = int(candidate_mask.sum())
+
+    # Load historical finals from cache if possible; fall back to API fetch.
+    hist_df: Optional[pd.DataFrame] = None
+    if historical_cache_path:
+        resolved_hist_path = resolve_local_read_path(historical_cache_path) or os.path.abspath(str(historical_cache_path))
+        if resolved_hist_path and (not force_refresh) and os.path.exists(resolved_hist_path):
+            try:
+                hist_df = pd.read_csv(resolved_hist_path)
+            except Exception:
+                hist_df = None
+    if hist_df is None or hist_df.empty or force_refresh:
+        try:
+            model = RealDataNHLModel()
+            hist_df = model.fetch_historical_games(
+                days_back=int(historical_days or 90),
+                cache_path=historical_cache_path,
+                force_refresh=bool(force_refresh)
+            )
+        except Exception as e:
+            print(f"⚠️  Unable to fetch historical finals for grading: {e}")
+            hist_df = None
+
+    if hist_df is None or hist_df.empty or 'total_goals' not in hist_df.columns:
+        print("⚠️  No historical finals available — cannot grade bets log.")
+        return summary
+
+    # Build lookup tables
+    hist = hist_df.copy()
+    if 'game_id' in hist.columns:
+        hist['game_id'] = hist['game_id'].astype(str)
+    else:
+        hist['game_id'] = ''
+    hist['total_goals'] = pd.to_numeric(hist['total_goals'], errors='coerce')
+    if 'date' in hist.columns:
+        hist['date_only'] = pd.to_datetime(hist['date'], errors='coerce').dt.date
+    else:
+        hist['date_only'] = None
+    if 'home_team' in hist.columns and 'away_team' in hist.columns:
+        hist['matchup'] = hist['away_team'].astype(str).str.upper().str.strip() + '@' + hist['home_team'].astype(str).str.upper().str.strip()
+    else:
+        hist['matchup'] = ''
+
+    gid_to_total = {
+        str(row['game_id']): float(row['total_goals'])
+        for _, row in hist.dropna(subset=['game_id', 'total_goals']).iterrows()
+        if str(row.get('game_id') or '').strip()
+    }
+    matchup_date_to_total: Dict[Tuple[str, Any], float] = {}
+    for _, row in hist.dropna(subset=['matchup', 'date_only', 'total_goals']).iterrows():
+        key = (str(row['matchup']).strip().upper(), row['date_only'])
+        if key[0] and key[1] is not None:
+            matchup_date_to_total[key] = float(row['total_goals'])
+
+    # Parse log dates and matchups for fallback matching
+    date_only = None
+    if 'date' in df_log.columns:
+        parsed_dates = pd.to_datetime(df_log['date'], errors='coerce')
+        if hasattr(parsed_dates, 'dt'):
+            date_only = parsed_dates.dt.date
+    matchup_series = df_log['matchup'].astype(str).str.upper().str.strip() if 'matchup' in df_log.columns else pd.Series('', index=df_log.index)
+    game_id_series = df_log['game_id'].astype(str) if 'game_id' in df_log.columns else pd.Series('', index=df_log.index)
+
+    graded = 0
+    skipped = 0
+    for idx in df_log.index[candidate_mask]:
+        gid = str(game_id_series.loc[idx] or '').strip()
+        total = None
+        if gid and gid in gid_to_total:
+            total = gid_to_total.get(gid)
+        if total is None and date_only is not None:
+            m = str(matchup_series.loc[idx] or '').strip().upper()
+            d = date_only.loc[idx] if hasattr(date_only, 'loc') else None
+            if m and d is not None:
+                total = matchup_date_to_total.get((m, d))
+        if total is None:
+            skipped += 1
+            continue
+
+        try:
+            line_val = float(line.loc[idx])
+        except Exception:
+            skipped += 1
+            continue
+        side_val = str(side.loc[idx] or '').strip().upper()
+        if side_val not in {'OVER', 'UNDER'}:
+            skipped += 1
+            continue
+
+        if total > line_val:
+            outcome = 'OVER'
+        elif total < line_val:
+            outcome = 'UNDER'
+        else:
+            outcome = 'PUSH'
+
+        if outcome == 'PUSH':
+            df_log.at[idx, 'result'] = 'PUSH'
+        elif outcome == side_val:
+            df_log.at[idx, 'result'] = 'WIN'
+        else:
+            df_log.at[idx, 'result'] = 'LOSS'
+        graded += 1
+
+    summary['graded'] = graded
+    summary['skipped'] = skipped
+
+    # Recompute after-mask
+    result_norm_after = df_log['result'].astype(str).str.strip().str.upper()
+    ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log['result'].isna()
+    summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
+
+    target_path = ensure_local_write_path(resolved_log_path) or resolved_log_path
+    try:
+        df_log.to_csv(target_path, index=False)
+        print(f"✅ Graded {graded} bet(s) (skipped {skipped}). Updated log: {target_path}")
+    except Exception as e:
+        print(f"⚠️  Failed to write updated bets log to {target_path}: {e}")
+
+    return summary
+
 def save_predictions_excel(predictions: List[OverUnderPrediction], out_path: str = 'predictions.xlsx') -> Optional[str]:
     """Save predictions to an Excel file with a flat schema for sharing."""
     try:
@@ -9415,6 +9592,7 @@ if __name__ == "__main__":
     parser.add_argument('--closing-odds-path', type=str, default=os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json'), help='Path to closing odds JSON for CLV logging')
     parser.add_argument('--log-bets', action='store_true', help='Enable logging bets to CSV')
     parser.add_argument('--log-path', type=str, default='bets_log.csv', help='Path to bets log CSV')
+    parser.add_argument('--grade-bets', action='store_true', help='Grade/settle ungraded picks in --log-path using historical finals, then exit')
     parser.add_argument('--post-social', action='store_true', help='Enable social media posting')
     parser.add_argument('--date', type=str, default=None, help='ISO date YYYY-MM-DD for which to fetch/predict games (default: today)')
     parser.add_argument('--today-games-path', type=str, default=None, help='Path to offline today games JSON to bypass API')
@@ -9498,6 +9676,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
+        if getattr(args, 'grade_bets', False):
+            grade_bets_log(
+                log_path=getattr(args, 'log_path', 'bets_log.csv'),
+                historical_days=getattr(args, 'historical_days', 90),
+                historical_cache_path=getattr(args, 'historical_cache_path', None),
+                force_refresh=bool(getattr(args, 'historical_cache_refresh', False))
+            )
+            raise SystemExit(0)
+
         model, predictions, dashboard_file = main(args)
         
         if model is not None:
