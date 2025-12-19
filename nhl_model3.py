@@ -6359,20 +6359,6 @@ def compute_bet_performance_summary(
         if df_log is None or df_log.empty:
             continue
 
-        result_col = next(
-            (c for c in df_log.columns if str(c).lower() in {'result', 'outcome', 'grade', 'bet_result', 'graded_result'}),
-            None
-        )
-        if not result_col:
-            continue
-
-        df_log['_result_norm'] = (
-            df_log[result_col]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-        )
-
         side_col = next(
             (c for c in df_log.columns if str(c).lower() in {'side', 'pick', 'selection', 'bet_side'}),
             None
@@ -6391,6 +6377,28 @@ def compute_bet_performance_summary(
             )
             # Count only actual directional picks, never "NO BET"/blank/etc.
             direction_mask = df_log['_side_norm'].isin({'OVER', 'UNDER'})
+        else:
+            # Without a side/pick column we cannot attribute picks to OVER/UNDER.
+            # Skip this file so we don't mistakenly suppress model-eval fallback.
+            continue
+
+        # Prefer graded results when present, but do not require them:
+        # many users log picks immediately and grade later, and we still want the
+        # dashboard image to reflect that the log was found.
+        result_col = next(
+            (c for c in df_log.columns if str(c).lower() in {'result', 'outcome', 'grade', 'bet_result', 'graded_result'}),
+            None
+        )
+
+        if result_col:
+            df_log['_result_norm'] = (
+                df_log[result_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+        else:
+            df_log['_result_norm'] = ''
 
         win_tokens = {'WIN', 'W', 'HIT', 'SUCCESS', 'CASH', 'TRUE'}
         loss_tokens = {'LOSS', 'L', 'LOSE', 'FAILED', 'MISS', 'FALSE'}
@@ -6404,6 +6412,8 @@ def compute_bet_performance_summary(
         dates_utc = None
         dates_local = None
         season_mask = None
+        yesterday_mask = None
+        last_week_mask = None
         if date_col:
             # The bets log timestamps are often written as naive local times (no timezone).
             # Interpreting them as UTC will shift dates and break "Yesterday" stats.
@@ -6473,23 +6483,40 @@ def compute_bet_performance_summary(
                     summary['yesterday_wins'] = yday_wins
                     summary['yesterday_losses'] = yday_losses
                     summary['yesterday_total'] = yday_total
+                else:
+                    # If nothing is graded yet, still show that picks existed yesterday.
+                    try:
+                        yday_picks = int((direction_mask & yesterday_mask).sum())
+                    except Exception:
+                        yday_picks = 0
+                    if yday_picks > 0:
+                        summary['yesterday_str'] = f"Yesterday: {yday_picks} pick(s) (ungraded)"
 
                 cutoff_local = now_local - pd.Timedelta(days=7)
-                lw_mask = dates_local >= cutoff_local
-                lw_wins = int((win_mask & direction_mask & lw_mask).sum())
-                lw_losses = int((loss_mask & direction_mask & lw_mask).sum())
+                last_week_mask = dates_local >= cutoff_local
+                lw_wins = int((win_mask & direction_mask & last_week_mask).sum())
+                lw_losses = int((loss_mask & direction_mask & last_week_mask).sum())
                 lw_total = lw_wins + lw_losses
                 if lw_total > 0:
                     lw_pct = (lw_wins / lw_total) * 100.0
                     summary['last_week_str'] = f"Last Week: {lw_pct:.1f}% ({lw_wins}/{lw_total})"
+                else:
+                    try:
+                        lw_picks = int((direction_mask & last_week_mask).sum())
+                    except Exception:
+                        lw_picks = 0
+                    if lw_picks > 0:
+                        summary['last_week_str'] = f"Last Week: {lw_picks} pick(s) (ungraded)"
 
         # Compute YTD (season-to-date) from the picks log, filtered from season start if possible.
         if season_mask is not None:
             ytd_win_mask = win_mask & direction_mask & season_mask
             ytd_loss_mask = loss_mask & direction_mask & season_mask
+            ytd_pick_mask = direction_mask & season_mask
         else:
             ytd_win_mask = win_mask & direction_mask
             ytd_loss_mask = loss_mask & direction_mask
+            ytd_pick_mask = direction_mask
 
         total_scored = int(ytd_win_mask.sum() + ytd_loss_mask.sum())
         if total_scored > 0:
@@ -6503,8 +6530,27 @@ def compute_bet_performance_summary(
             summary['wins'] = total_wins
             summary['losses'] = total_losses
             summary['total'] = total_scored
+            return summary
 
-        if summary['total']:
+        # If we found a log and it contains picks but none are graded yet, do NOT fall back
+        # to model evaluation (which is misleading and often shows the last test split size).
+        try:
+            total_picks = int(ytd_pick_mask.sum())
+        except Exception:
+            total_picks = 0
+        if total_picks > 0:
+            if season_start_eastern is not None:
+                summary['ytd_str'] = (
+                    f"YTD (since {season_start_eastern.date().isoformat()}): — "
+                    f"({total_picks} pick(s) logged, 0 graded)"
+                )
+            else:
+                summary['ytd_str'] = f"YTD: — ({total_picks} pick(s) logged, 0 graded)"
+            # Preserve wins/losses/total as None so the dashboard can still show
+            # "No graded bets" while the social line confirms the log is being read.
+            summary['wins'] = None
+            summary['losses'] = None
+            summary['total'] = None
             return summary
 
     if training_results:
