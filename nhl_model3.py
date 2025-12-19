@@ -300,11 +300,19 @@ def resolve_local_read_path(path: Optional[str]) -> Optional[str]:
     # This helps when runs in containers write logs under ./data/** or ~/nhl_model_data.
     try:
         base = os.path.basename(expanded)
+        try:
+            script_dir = os.path.abspath(os.path.dirname(__file__))
+        except Exception:
+            script_dir = None
         search_dirs = [
             os.path.abspath(os.getcwd()),
+            *( [script_dir] if script_dir else [] ),
             os.path.abspath(os.path.join(os.getcwd(), 'data')),
             os.path.abspath(os.path.join(os.getcwd(), 'data', 'latest')),
             os.path.abspath(os.path.join(os.getcwd(), 'data', 'cache')),
+            *( [os.path.abspath(os.path.join(script_dir, 'data'))] if script_dir else [] ),
+            *( [os.path.abspath(os.path.join(script_dir, 'data', 'latest'))] if script_dir else [] ),
+            *( [os.path.abspath(os.path.join(script_dir, 'data', 'cache'))] if script_dir else [] ),
             os.path.abspath(os.path.join(os.path.expanduser("~"), "nhl_model_data")),
         ]
 
@@ -6408,7 +6416,22 @@ def compute_bet_performance_summary(
                     tz_info = None
                 try:
                     if tz_info is None:
-                        dates_local = parsed.dt.tz_localize(schedule_tz, ambiguous='NaT', nonexistent='NaT')
+                        # Heuristic: some environments log naive timestamps in UTC (server default),
+                        # while others log in local (schedule_tz). Prefer schedule_tz, but fall back
+                        # to UTC->schedule_tz if that yields plausible "yesterday" matches.
+                        local_assuming_schedule = parsed.dt.tz_localize(schedule_tz, ambiguous='NaT', nonexistent='NaT')
+                        local_assuming_utc = parsed.dt.tz_localize('UTC', ambiguous='NaT', nonexistent='NaT').dt.tz_convert(schedule_tz)
+
+                        try:
+                            now_local_tmp = pd.Timestamp.now(tz=schedule_tz)
+                            yesterday_date_tmp = (now_local_tmp - pd.Timedelta(days=1)).date()
+                            sched_hits = int((local_assuming_schedule.dt.date == yesterday_date_tmp).sum())
+                            utc_hits = int((local_assuming_utc.dt.date == yesterday_date_tmp).sum())
+                        except Exception:
+                            sched_hits = 0
+                            utc_hits = 0
+
+                        dates_local = local_assuming_utc if (utc_hits > sched_hits) else local_assuming_schedule
                     else:
                         dates_local = parsed.dt.tz_convert(schedule_tz)
                 except Exception:
@@ -6433,7 +6456,9 @@ def compute_bet_performance_summary(
                     except Exception:
                         season_mask = None
 
-                now_local = pd.Timestamp.now(tz=dates_local.dt.tz)
+                # Anchor "yesterday" to the schedule timezone for stable calendar boundaries.
+                # (dates_local is already in schedule_tz unless parsing failed.)
+                now_local = pd.Timestamp.now(tz=schedule_tz)
                 yesterday_date = (now_local - pd.Timedelta(days=1)).date()
                 yesterday_mask = dates_local.dt.date == yesterday_date
 
