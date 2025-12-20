@@ -6781,8 +6781,45 @@ def grade_bets_log(
         print(f"ℹ️  Bets log {resolved_log_path} is empty — nothing to grade.")
         return summary
 
-    if 'result' not in df_log.columns:
+    def _norm_game_id(value: Any) -> str:
+        """Normalize game ids so 2025021234.0 and 2025021234 match."""
+        if value is None:
+            return ''
+        try:
+            if isinstance(value, (float, np.floating)):
+                if not np.isfinite(value):
+                    return ''
+                rounded = round(float(value))
+                if abs(float(value) - rounded) < 1e-6:
+                    return str(int(rounded))
+                return str(value).strip()
+            if isinstance(value, (int, np.integer)):
+                return str(int(value))
+        except Exception:
+            pass
+        s = str(value).strip()
+        if not s or s.lower() in {'nan', 'none', 'null'}:
+            return ''
+        # Common CSV parsing artifact
+        if re.fullmatch(r'\d+\.0+', s):
+            s = s.split('.', 1)[0]
+        # Scientific notation fallback
+        try:
+            f = float(s)
+            if np.isfinite(f):
+                rounded = round(f)
+                if abs(f - rounded) < 1e-6:
+                    return str(int(rounded))
+        except Exception:
+            pass
+        return s
+
+    # Determine which result column(s) to grade (support older schemas too).
+    result_cols = [c for c in ('result', 'outcome', 'grade', 'bet_result', 'graded_result') if c in df_log.columns]
+    if not result_cols:
         df_log['result'] = ''
+        result_cols = ['result']
+    result_col = 'result' if 'result' in result_cols else result_cols[0]
 
     # Normalize needed fields
     side_col = next((c for c in df_log.columns if str(c).lower() in {'side', 'pick', 'selection', 'bet_side', 'recommendation'}), None)
@@ -6792,7 +6829,7 @@ def grade_bets_log(
 
     side = df_log[side_col].astype(str).str.strip().str.upper()
     line = pd.to_numeric(df_log.get('line'), errors='coerce')
-    result_raw = df_log['result']
+    result_raw = df_log[result_col]
     result_norm = result_raw.astype(str).str.strip().str.upper()
 
     ungraded_tokens = {'', 'NAN', 'NONE', 'NULL', 'UNGRADED', '—', '-', 'NA'}
@@ -6842,11 +6879,15 @@ def grade_bets_log(
     else:
         hist['matchup'] = ''
 
-    gid_to_total = {
-        str(row['game_id']): float(row['total_goals'])
-        for _, row in hist.dropna(subset=['game_id', 'total_goals']).iterrows()
-        if str(row.get('game_id') or '').strip()
-    }
+    gid_to_total: Dict[str, float] = {}
+    for _, row in hist.dropna(subset=['game_id', 'total_goals']).iterrows():
+        key = _norm_game_id(row.get('game_id'))
+        if not key:
+            continue
+        try:
+            gid_to_total[key] = float(row['total_goals'])
+        except Exception:
+            continue
     matchup_date_to_total: Dict[Tuple[str, Any], float] = {}
     for _, row in hist.dropna(subset=['matchup', 'date_only', 'total_goals']).iterrows():
         key = (str(row['matchup']).strip().upper(), row['date_only'])
@@ -6860,7 +6901,10 @@ def grade_bets_log(
         if hasattr(parsed_dates, 'dt'):
             date_only = parsed_dates.dt.date
     matchup_series = df_log['matchup'].astype(str).str.upper().str.strip() if 'matchup' in df_log.columns else pd.Series('', index=df_log.index)
-    game_id_series = df_log['game_id'].astype(str) if 'game_id' in df_log.columns else pd.Series('', index=df_log.index)
+    if 'game_id' in df_log.columns:
+        game_id_series = df_log['game_id'].apply(_norm_game_id)
+    else:
+        game_id_series = pd.Series('', index=df_log.index)
 
     graded = 0
     skipped = 0
@@ -6895,28 +6939,53 @@ def grade_bets_log(
         else:
             outcome = 'PUSH'
 
+        grade_val = None
         if outcome == 'PUSH':
-            df_log.at[idx, 'result'] = 'PUSH'
+            grade_val = 'PUSH'
         elif outcome == side_val:
-            df_log.at[idx, 'result'] = 'WIN'
+            grade_val = 'WIN'
         else:
-            df_log.at[idx, 'result'] = 'LOSS'
+            grade_val = 'LOSS'
+        for col in result_cols:
+            try:
+                df_log.at[idx, col] = grade_val
+            except Exception:
+                continue
         graded += 1
 
     summary['graded'] = graded
     summary['skipped'] = skipped
 
     # Recompute after-mask
-    result_norm_after = df_log['result'].astype(str).str.strip().str.upper()
+    result_norm_after = df_log[result_col].astype(str).str.strip().str.upper()
     ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log['result'].isna()
     summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
 
     target_path = ensure_local_write_path(resolved_log_path) or resolved_log_path
+    wrote = False
     try:
         df_log.to_csv(target_path, index=False)
+        wrote = True
         print(f"✅ Graded {graded} bet(s) (skipped {skipped}). Updated log: {target_path}")
     except Exception as e:
         print(f"⚠️  Failed to write updated bets log to {target_path}: {e}")
+
+    # If the original path is not writable (common on Windows due to permissions/locks),
+    # fall back to a user-writable location while keeping the same filename.
+    if not wrote:
+        try:
+            basename = os.path.basename(str(resolved_log_path)) or os.path.basename(str(log_path)) or 'bets_log.csv'
+        except Exception:
+            basename = 'bets_log.csv'
+        fallback_candidate = os.path.join(os.path.expanduser("~"), "nhl_model_data", basename)
+        fallback_path = ensure_local_write_path(fallback_candidate) or ensure_local_write_path(basename)
+        if fallback_path and os.path.abspath(fallback_path) != os.path.abspath(str(target_path)):
+            try:
+                df_log.to_csv(fallback_path, index=False)
+                wrote = True
+                print(f"✅ Updated log written to fallback path: {fallback_path}")
+            except Exception as e:
+                print(f"⚠️  Failed to write fallback bets log to {fallback_path}: {e}")
 
     return summary
 
