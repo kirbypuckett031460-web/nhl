@@ -6912,11 +6912,30 @@ def grade_bets_log(
     summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
 
     target_path = ensure_local_write_path(resolved_log_path) or resolved_log_path
+    wrote = False
     try:
         df_log.to_csv(target_path, index=False)
+        wrote = True
         print(f"✅ Graded {graded} bet(s) (skipped {skipped}). Updated log: {target_path}")
     except Exception as e:
         print(f"⚠️  Failed to write updated bets log to {target_path}: {e}")
+
+    # If the original path is not writable (common on Windows due to permissions/locks),
+    # fall back to a user-writable location while keeping the same filename.
+    if not wrote:
+        try:
+            basename = os.path.basename(str(resolved_log_path)) or os.path.basename(str(log_path)) or 'bets_log.csv'
+        except Exception:
+            basename = 'bets_log.csv'
+        fallback_candidate = os.path.join(os.path.expanduser("~"), "nhl_model_data", basename)
+        fallback_path = ensure_local_write_path(fallback_candidate) or ensure_local_write_path(basename)
+        if fallback_path and os.path.abspath(fallback_path) != os.path.abspath(str(target_path)):
+            try:
+                df_log.to_csv(fallback_path, index=False)
+                wrote = True
+                print(f"✅ Updated log written to fallback path: {fallback_path}")
+            except Exception as e:
+                print(f"⚠️  Failed to write fallback bets log to {fallback_path}: {e}")
 
     return summary
 
