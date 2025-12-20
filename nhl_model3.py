@@ -4508,10 +4508,12 @@ class RealDataNHLModel:
         return odds
 
     def get_betting_odds_realtime(self, todays_games: pd.DataFrame, api_key_env: str = 'ODDS_API_KEY', regions: str = 'us', timeout_s: int = 25, retries: int = 3, dispersion_all: bool = False) -> Dict[str, Dict[str, float]]:
-        """Fetch realtime totals odds from The Odds API (or compatible) and map to our schema, aggregating all US-region sportsbooks by default (override via `regions`).
+        """Fetch realtime totals/h2h odds from The Odds API and map to our schema.
 
         Requires an API key in environment variable specified by api_key_env. This example uses
         The Odds API v4 (https://the-odds-api.com/) for demonstration and may need adjustments to your provider.
+
+        This project is configured to use FanDuel lines only (no multi-book aggregation).
         """
         api_key = os.getenv(api_key_env)
         if not api_key:
@@ -4552,7 +4554,9 @@ class RealDataNHLModel:
             'regions': regions_clean,
             # Request both totals (over/under) and h2h (moneyline) markets so ML recommendations have live prices
             'markets': 'totals,h2h',
-            'oddsFormat': 'american'
+            'oddsFormat': 'american',
+            # Provider-side filter; we still enforce a FanDuel-only filter while parsing.
+            'bookmakers': 'fanduel'
         }
         url = 'https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds'
         data = None
@@ -4603,10 +4607,10 @@ class RealDataNHLModel:
             except Exception:
                 return 1.0
 
-        # Aggregate odds for each matchup across all available books
+        # FanDuel-only odds for each matchup
         tmp: Dict[str, List[Dict[str, Any]]] = {}
         moneyline_tmp: Dict[str, List[Dict[str, Any]]] = {}
-        # Collect totals from all books (used for consensus/dispersion metrics)
+        # Collect totals for dispersion metrics (will be 1 book unless provider returns alternates)
         totals_all: Dict[str, List[float]] = {}
         matched_events = 0
         for ev in data if isinstance(data, list) else []:
@@ -4621,6 +4625,11 @@ class RealDataNHLModel:
                 for bk in ev.get('bookmakers', []) or []:
                     book_key_raw = (bk.get('key') or '').strip()
                     book_title_raw = (bk.get('title') or '').strip()
+                    book_key_norm = book_key_raw.strip().lower()
+                    book_title_norm = book_title_raw.strip().lower().replace(' ', '')
+                    is_fanduel = (book_key_norm == 'fanduel') or (book_title_norm == 'fanduel')
+                    if not is_fanduel:
+                        continue
                     book_key = book_key_raw or book_title_raw or 'unknown'
                     book_title = book_title_raw or book_key_raw or 'Unknown'
                     last_update = bk.get('last_update')
@@ -4819,7 +4828,7 @@ class RealDataNHLModel:
                 'consensus_under': consensus_under,
                 'best_over_book': str(best_over_book) if best_over_book is not None else None,
                 'best_under_book': str(best_under_book) if best_under_book is not None else None,
-                'odds_source': 'the-odds-api:aggregate'
+                'odds_source': 'the-odds-api:fanduel'
             }
             if home_ml_prices:
                 rec_out['home_moneyline'] = int(best_home_ml_val if best_home_ml_val is not None else home_ml_prices[0])
@@ -7307,7 +7316,7 @@ def save_predictions_image(
         f"NHL Predictions\n"
         f"{perf_line}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
-        "Odds aggregated from multiple books."
+        "Odds from FanDuel."
     )
     ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
 
@@ -9045,7 +9054,13 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     betting_line = float(odds_rec.get('total', 6.5))
                     over_price = int(odds_rec.get('over', -110))
                     under_price = int(odds_rec.get('under', -110))
-                    odds_source = str(odds_rec.get('source')) if 'source' in odds_rec else None
+                    odds_source = None
+                    if isinstance(odds_rec, dict):
+                        src_val = odds_rec.get('odds_source')
+                        if src_val is None:
+                            src_val = odds_rec.get('source')
+                        if src_val is not None:
+                            odds_source = str(src_val)
                     consensus_total = float(odds_rec.get('consensus_total', betting_line))
                     best_over_book = odds_rec.get('best_over_book')
                     best_under_book = odds_rec.get('best_under_book')
