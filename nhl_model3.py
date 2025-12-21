@@ -6821,6 +6821,51 @@ def grade_bets_log(
         result_cols = ['result']
     result_col = 'result' if 'result' in result_cols else result_cols[0]
 
+    def _norm_matchup(value: Any) -> str:
+        """Normalize matchup strings to AWAY@HOME."""
+        if value is None:
+            return ''
+        s = str(value).strip().upper()
+        if not s or s in {'NAN', 'NONE', 'NULL'}:
+            return ''
+        # Common display formats: "TOR @ BOS", "TOR at BOS", "TOR vs BOS"
+        s = re.sub(r'\s+AT\s+', '@', s)
+        s = re.sub(r'\s+VS\.?\s+', '@', s)
+        s = s.replace(' @ ', '@').replace(' @', '@').replace('@ ', '@')
+        # Some users use "AWAY-HOME" or "AWAY/HOME"
+        s = s.replace('/', '@').replace('-', '@')
+        # Collapse multiple separators
+        s = re.sub(r'@+', '@', s)
+        # Remove remaining whitespace
+        s = re.sub(r'\s+', '', s)
+        # If reversed "HOME@AWAY" accidentally, we can't reliably detect here.
+        return s
+
+    def _parse_date_only(series: pd.Series) -> Optional[pd.Series]:
+        """Parse bet timestamps, preferring schedule timezone for day boundaries."""
+        if series is None:
+            return None
+        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+        parsed = pd.to_datetime(series, errors='coerce')
+        if not hasattr(parsed, 'dt'):
+            return None
+        try:
+            tz_info = getattr(parsed.dt, 'tz', None)
+        except Exception:
+            tz_info = None
+        try:
+            if tz_info is None:
+                # Most logs are naive local; treat as schedule_tz.
+                local = parsed.dt.tz_localize(schedule_tz, ambiguous='NaT', nonexistent='NaT')
+            else:
+                local = parsed.dt.tz_convert(schedule_tz)
+            return local.dt.date
+        except Exception:
+            try:
+                return parsed.dt.date
+            except Exception:
+                return None
+
     # Normalize needed fields
     side_col = next((c for c in df_log.columns if str(c).lower() in {'side', 'pick', 'selection', 'bet_side', 'recommendation'}), None)
     if not side_col:
@@ -6838,6 +6883,29 @@ def grade_bets_log(
     candidate_mask = ungraded_mask & actionable_mask
     summary['ungraded_before'] = int(candidate_mask.sum())
 
+    # Parse bet dates and matchup strings now (used for both matching and picking a sufficient history window).
+    bet_date_only = None
+    if 'date' in df_log.columns:
+        bet_date_only = _parse_date_only(df_log['date'])
+    if 'matchup' in df_log.columns:
+        matchup_series = df_log['matchup'].apply(_norm_matchup)
+    else:
+        matchup_series = pd.Series('', index=df_log.index)
+
+    # If user logs older than the default window, widen history automatically.
+    days_back_required = int(historical_days or 90)
+    try:
+        if bet_date_only is not None:
+            earliest = pd.Series(bet_date_only)[candidate_mask].dropna()
+            if len(earliest):
+                earliest_date = min(earliest.tolist())
+                now_local = pd.Timestamp.now(tz=os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern').date()
+                delta_days = (now_local - earliest_date).days
+                if delta_days > 0:
+                    days_back_required = max(days_back_required, int(delta_days + 3))
+    except Exception:
+        pass
+
     # Load historical finals from cache if possible; fall back to API fetch.
     hist_df: Optional[pd.DataFrame] = None
     if historical_cache_path:
@@ -6847,11 +6915,22 @@ def grade_bets_log(
                 hist_df = pd.read_csv(resolved_hist_path)
             except Exception:
                 hist_df = None
+    # Refresh if cache doesn't cover needed window.
+    if hist_df is not None and not hist_df.empty and bet_date_only is not None and 'date' in hist_df.columns:
+        try:
+            hist_dates = pd.to_datetime(hist_df['date'], errors='coerce').dt.date
+            earliest_needed = pd.Series(bet_date_only)[candidate_mask].dropna()
+            if len(hist_dates.dropna()) and len(earliest_needed):
+                if min(hist_dates.dropna().tolist()) > min(earliest_needed.tolist()):
+                    force_refresh = True
+        except Exception:
+            pass
+
     if hist_df is None or hist_df.empty or force_refresh:
         try:
             model = RealDataNHLModel()
             hist_df = model.fetch_historical_games(
-                days_back=int(historical_days or 90),
+                days_back=int(days_back_required),
                 cache_path=historical_cache_path,
                 force_refresh=bool(force_refresh)
             )
@@ -6890,17 +6969,11 @@ def grade_bets_log(
             continue
     matchup_date_to_total: Dict[Tuple[str, Any], float] = {}
     for _, row in hist.dropna(subset=['matchup', 'date_only', 'total_goals']).iterrows():
-        key = (str(row['matchup']).strip().upper(), row['date_only'])
+        key = (_norm_matchup(row['matchup']), row['date_only'])
         if key[0] and key[1] is not None:
             matchup_date_to_total[key] = float(row['total_goals'])
 
-    # Parse log dates and matchups for fallback matching
-    date_only = None
-    if 'date' in df_log.columns:
-        parsed_dates = pd.to_datetime(df_log['date'], errors='coerce')
-        if hasattr(parsed_dates, 'dt'):
-            date_only = parsed_dates.dt.date
-    matchup_series = df_log['matchup'].astype(str).str.upper().str.strip() if 'matchup' in df_log.columns else pd.Series('', index=df_log.index)
+    date_only = bet_date_only
     if 'game_id' in df_log.columns:
         game_id_series = df_log['game_id'].apply(_norm_game_id)
     else:
@@ -6908,18 +6981,31 @@ def grade_bets_log(
 
     graded = 0
     skipped = 0
+    matched_by_gid = 0
+    matched_by_matchup_date = 0
+    examples_unmatched: List[str] = []
     for idx in df_log.index[candidate_mask]:
         gid = str(game_id_series.loc[idx] or '').strip()
         total = None
         if gid and gid in gid_to_total:
             total = gid_to_total.get(gid)
+            if total is not None:
+                matched_by_gid += 1
         if total is None and date_only is not None:
             m = str(matchup_series.loc[idx] or '').strip().upper()
             d = date_only.loc[idx] if hasattr(date_only, 'loc') else None
             if m and d is not None:
                 total = matchup_date_to_total.get((m, d))
+                if total is not None:
+                    matched_by_matchup_date += 1
         if total is None:
             skipped += 1
+            if len(examples_unmatched) < 6:
+                try:
+                    d_str = str(date_only.loc[idx]) if (date_only is not None and hasattr(date_only, 'loc')) else ''
+                except Exception:
+                    d_str = ''
+                examples_unmatched.append(f"gid={gid or '—'} matchup={matchup_series.loc[idx] or '—'} date={d_str or '—'}")
             continue
 
         try:
@@ -6958,8 +7044,21 @@ def grade_bets_log(
 
     # Recompute after-mask
     result_norm_after = df_log[result_col].astype(str).str.strip().str.upper()
-    ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log['result'].isna()
+    ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log[result_col].isna()
     summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
+
+    try:
+        print(
+            f"ℹ️  Grade summary: candidates={summary['ungraded_before']} graded={graded} "
+            f"matched_by_game_id={matched_by_gid} matched_by_matchup_date={matched_by_matchup_date} "
+            f"skipped_unmatched={skipped} history_days_back={days_back_required}"
+        )
+        if examples_unmatched:
+            print("ℹ️  Example unmatched rows (up to 6):")
+            for ex in examples_unmatched:
+                print(f"  - {ex}")
+    except Exception:
+        pass
 
     target_path = ensure_local_write_path(resolved_log_path) or resolved_log_path
     wrote = False
