@@ -6748,7 +6748,8 @@ def grade_bets_log(
     log_path: str = 'bets_log.csv',
     historical_days: int = 90,
     historical_cache_path: Optional[str] = None,
-    force_refresh: bool = False
+    force_refresh: bool = False,
+    historical_frame: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
     """Grade/settle ungraded OVER/UNDER picks in a bets log.
 
@@ -6906,8 +6907,13 @@ def grade_bets_log(
     except Exception:
         pass
 
-    # Load historical finals from cache if possible; fall back to API fetch.
+    # Load historical finals from a provided frame first (fast path).
     hist_df: Optional[pd.DataFrame] = None
+    if historical_frame is not None and isinstance(historical_frame, pd.DataFrame) and not historical_frame.empty:
+        if 'total_goals' in historical_frame.columns:
+            hist_df = historical_frame.copy()
+
+    # Otherwise, load from cache if possible; fall back to API fetch.
     if historical_cache_path:
         resolved_hist_path = resolve_local_read_path(historical_cache_path) or os.path.abspath(str(historical_cache_path))
         if resolved_hist_path and (not force_refresh) and os.path.exists(resolved_hist_path):
@@ -8388,6 +8394,21 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             historical_data = model.create_realistic_sample_data()
         
         print(f"✅ Using {len(historical_data)} games for training")
+
+        # Keep the bets log graded so YTD / Yesterday summaries reflect reality.
+        # (Market calibration computes outcomes in-memory but does not persist WIN/LOSS back to the CSV.)
+        log_path_default = getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv'
+        try:
+            if log_path_default:
+                grade_bets_log(
+                    log_path=log_path_default,
+                    historical_days=hist_days,
+                    historical_cache_path=cache_path,
+                    force_refresh=False,
+                    historical_frame=historical_data
+                )
+        except Exception as e:
+            print(f"⚠️  Auto-grade skipped: {e}")
         
         if historical_data['total_goals'].mean() < 4 or historical_data['total_goals'].mean() > 8:
             print("⚠️  Data seems unusual. Using sample data...")
@@ -8448,7 +8469,6 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             origin = model_artifact_path or "preconfigured path"
             print(f"📦 Using saved model from {origin} ({descriptor})")
 
-        log_path_default = getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv'
         calibration_snapshot = model.update_market_calibration(
             log_path=log_path_default,
             historical_frame=historical_data,
