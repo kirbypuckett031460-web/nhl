@@ -1919,15 +1919,23 @@ class RealDataNHLModel:
             .reset_index(level=0, drop=True)
             .fillna(6.2)
         )
+        # Some historical sources can produce a non-string (or all-NA) venue column,
+        # which breaks pandas' `.str` accessor. Normalize it to a safe string series.
+        try:
+            if 'venue' not in features.columns:
+                features['venue'] = ''
+            venue_text = features['venue'].astype('string').fillna('')
+        except Exception:
+            venue_text = features.get('venue', pd.Series('', index=features.index)).astype(str).fillna('')
         features['altitude_bonus'] = np.where(
-            features['venue'].str.contains('Ball Arena|Pepsi Center', case=False, na=False), 0.3, 0
+            venue_text.str.contains('Ball Arena|Pepsi Center', case=False, na=False), 0.3, 0
         )
         # Rink bias adjustments (simplified; positive values inflate shot/xG)
         rink_bias_map = {
             'Rogers Place': 0.08, 'Scotiabank Arena': -0.03, 'Madison Square Garden': -0.02,
             'T-Mobile Arena': 0.02, 'Ball Arena': 0.04, 'Canadian Tire Centre': -0.01
         }
-        features['rink_bias'] = features['venue'].map(rink_bias_map).fillna(0.0)
+        features['rink_bias'] = venue_text.map(rink_bias_map).fillna(0.0)
         
         # Back-to-back detection
         # Rest days computed across full team timelines (merge back to wide form)
