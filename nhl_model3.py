@@ -6335,8 +6335,7 @@ def normalize_bets_log_schema(log_path: Optional[str]) -> Optional[str]:
         return resolved
 
     expected = list(BET_LOG_COLUMNS)
-    if list(df.columns) == expected:
-        return resolved
+    already_ordered = list(df.columns) == expected
 
     cols = list(df.columns)
     required = set(expected)
@@ -6362,6 +6361,59 @@ def normalize_bets_log_schema(log_path: Optional[str]) -> Optional[str]:
         & price_u.isin({'OVER', 'UNDER'})
     )
 
+    # Detect "old-order rows appended under new header" (schema-shift by position):
+    # new header begins with result/action/side, but the row still starts with side/line/price.
+    # Symptoms:
+    # - `result` contains OVER/UNDER
+    # - `action` looks like a numeric total (4.5-9.5)
+    # - `side` looks like an odds number (e.g. -110, +105)
+    result_u = _upper_series('result')
+    action_u = _upper_series('action')
+    try:
+        action_num = pd.to_numeric(df.get('action'), errors='coerce')
+    except Exception:
+        action_num = pd.Series(np.nan, index=df.index)
+    try:
+        side_num = pd.to_numeric(df.get('side'), errors='coerce')
+    except Exception:
+        side_num = pd.Series(np.nan, index=df.index)
+    old_row_under_new_header = (
+        result_u.isin({'OVER', 'UNDER'})
+        & action_num.between(3.0, 10.5, inclusive='both')
+        & side_num.between(-1000.0, 1000.0, inclusive='both')
+        & (~action_u.isin({'BET', 'PICK'}))
+    )
+
+    # Drop accidental repeated header rows (e.g. a second "date,game_id,..." line appended as data).
+    try:
+        date_u = df['date'].astype(str).str.strip().str.lower() if 'date' in df.columns else None
+        game_u = df['game_id'].astype(str).str.strip().str.lower() if 'game_id' in df.columns else None
+        header_like = pd.Series(False, index=df.index)
+        if date_u is not None:
+            header_like = header_like | date_u.eq('date')
+        if game_u is not None:
+            header_like = header_like | game_u.eq('game_id')
+        if bool(header_like.any()):
+            df = df.loc[~header_like].copy()
+            side_u = side_u.loc[df.index]
+            line_u = line_u.loc[df.index]
+            price_u = price_u.loc[df.index]
+            result_u = result_u.loc[df.index]
+            action_u = action_u.loc[df.index]
+            action_num = action_num.loc[df.index]
+            side_num = side_num.loc[df.index]
+            misaligned = misaligned.loc[df.index]
+            old_row_under_new_header = old_row_under_new_header.loc[df.index]
+    except Exception:
+        pass
+
+    # If everything is already in order and there are no row-level misalignments, do nothing.
+    try:
+        if already_ordered and (not bool(misaligned.any())) and (not bool(old_row_under_new_header.any())):
+            return resolved
+    except Exception:
+        pass
+
     df_out = pd.DataFrame(index=df.index)
     for c in expected:
         df_out[c] = np.nan
@@ -6372,7 +6424,7 @@ def normalize_bets_log_schema(log_path: Optional[str]) -> Optional[str]:
             df_out[c] = df[c]
 
     # Non-misaligned rows: map fields by name directly
-    normal_mask = ~misaligned
+    normal_mask = ~(misaligned | old_row_under_new_header)
     if bool(normal_mask.any()):
         for c in expected:
             if c in df.columns:
@@ -6414,6 +6466,53 @@ def normalize_bets_log_schema(log_path: Optional[str]) -> Optional[str]:
         for src, dst in shift_map.items():
             if src in df.columns and dst in df_out.columns:
                 df_out.loc[misaligned, dst] = df.loc[misaligned, src]
+
+    # Old-row-under-new-header rows: re-interpret by positional mapping.
+    if bool(old_row_under_new_header.any()):
+        old_order = [
+            'date',
+            'game_id',
+            'matchup',
+            'side',
+            'line',
+            'price',
+            'pred_total',
+            'edge',
+            'confidence',
+            'kelly_pct',
+            'ev_novig',
+            'consensus_total',
+            'line_diff_vs_consensus',
+            'best_book',
+            'closing_total',
+            'clv_vs_closing',
+            'model_prob',
+            'market_prob',
+            'fair_prob',
+            'bet_month',
+            'calibration_multiplier',
+            'market_velocity',
+            'referee_info',
+            'referee_avg_goals',
+            'referee_home_bias',
+            'closing_price',
+            'closing_source',
+            'result',
+            'action',
+        ]
+        new_order = expected[:]  # BET_LOG_COLUMNS
+        # Create an "old view" of the misaligned rows by reversing the positional mapping:
+        # new_order[i] currently contains old_order[i] values.
+        old_view = {}
+        for i in range(min(len(old_order), len(new_order))):
+            new_col = new_order[i]
+            old_col = old_order[i]
+            if new_col in df.columns:
+                old_view[old_col] = df.loc[old_row_under_new_header, new_col]
+        # Now write the corrected values into df_out using old_view keyed by expected column names.
+        for col in expected:
+            if col in old_view:
+                df_out.loc[old_row_under_new_header, col] = old_view[col]
 
     # Ensure missing columns are present
     for c in expected:
