@@ -6313,6 +6313,133 @@ def _read_bets_log_dataframe(log_path: Optional[str]) -> Optional[pd.DataFrame]:
         return None
 
 
+def normalize_bets_log_schema(log_path: Optional[str]) -> Optional[str]:
+    """Normalize an existing bets log to the current `BET_LOG_COLUMNS` order.
+
+    This fixes a common failure mode where the CSV header is in one column order,
+    but newer rows were appended in a different order (leading to `side/line/price`
+    appearing wrong and `result` grading failing).
+
+    Returns the path that was written (may be a fallback path) or None.
+    """
+
+    resolved = resolve_local_read_path(log_path) or (os.path.abspath(str(log_path)) if log_path else None)
+    if not resolved or not os.path.exists(resolved):
+        return None
+
+    try:
+        df = pd.read_csv(resolved)
+    except Exception:
+        df = _read_bets_log_dataframe(resolved)
+    if df is None or df.empty:
+        return resolved
+
+    expected = list(BET_LOG_COLUMNS)
+    if list(df.columns) == expected:
+        return resolved
+
+    cols = list(df.columns)
+    required = set(expected)
+    if not required.issubset(set(cols)):
+        # If we can't reason about the schema, leave it alone.
+        return resolved
+
+    # Detect "new-order rows appended under old header" (observed starting 2025-12-19 in some logs):
+    # old header has side/line/price early; misaligned rows have blank side, line in {BET,PICK},
+    # and price in {OVER,UNDER}.
+    def _upper_series(name: str) -> pd.Series:
+        try:
+            return df[name].astype(str).str.strip().str.upper()
+        except Exception:
+            return pd.Series('', index=df.index)
+
+    side_u = _upper_series('side')
+    line_u = _upper_series('line')
+    price_u = _upper_series('price')
+    misaligned = (
+        (df['side'].isna() | side_u.eq('') | side_u.eq('NAN'))
+        & line_u.isin({'BET', 'PICK'})
+        & price_u.isin({'OVER', 'UNDER'})
+    )
+
+    df_out = pd.DataFrame(index=df.index)
+    for c in expected:
+        df_out[c] = np.nan
+
+    # Base columns always map by name
+    for c in ('date', 'game_id', 'matchup'):
+        if c in df.columns:
+            df_out[c] = df[c]
+
+    # Non-misaligned rows: map fields by name directly
+    normal_mask = ~misaligned
+    if bool(normal_mask.any()):
+        for c in expected:
+            if c in df.columns:
+                df_out.loc[normal_mask, c] = df.loc[normal_mask, c]
+
+    # Misaligned rows: shift according to the known "old header vs new row order" mismatch
+    if bool(misaligned.any()):
+        shift_map = {
+            # old_header -> expected_schema
+            'side': 'result',
+            'line': 'action',
+            'price': 'side',
+            'pred_total': 'line',
+            'edge': 'price',
+            'confidence': 'pred_total',
+            'kelly_pct': 'edge',
+            'ev_novig': 'confidence',
+            'consensus_total': 'kelly_pct',
+            'line_diff_vs_consensus': 'model_prob',
+            'best_book': 'market_prob',
+            'closing_total': 'fair_prob',
+            'clv_vs_closing': 'ev_novig',
+            'model_prob': 'consensus_total',
+            'market_prob': 'line_diff_vs_consensus',
+            'fair_prob': 'best_book',
+            # these align (same meaning in both layouts)
+            'bet_month': 'bet_month',
+            'calibration_multiplier': 'calibration_multiplier',
+            'market_velocity': 'market_velocity',
+            'referee_info': 'referee_info',
+            'referee_avg_goals': 'referee_avg_goals',
+            'referee_home_bias': 'referee_home_bias',
+            # tail shift
+            'closing_price': 'closing_total',
+            'closing_source': 'closing_price',
+            'result': 'closing_source',
+            'action': 'clv_vs_closing',
+        }
+        for src, dst in shift_map.items():
+            if src in df.columns and dst in df_out.columns:
+                df_out.loc[misaligned, dst] = df.loc[misaligned, src]
+
+    # Ensure missing columns are present
+    for c in expected:
+        if c not in df_out.columns:
+            df_out[c] = np.nan
+    df_out = df_out[expected]
+
+    # Backup original and rewrite normalized
+    try:
+        backup_path = f"{resolved}.bak"
+        if not os.path.exists(backup_path):
+            shutil.copyfile(resolved, backup_path)
+    except Exception:
+        pass
+
+    target_path = ensure_local_write_path(resolved) or resolved
+    try:
+        df_out.to_csv(target_path, index=False)
+        if target_path != resolved:
+            print(f"⚠️  Normalized bets log written to fallback path: {target_path}")
+        return target_path
+    except Exception as e:
+        print(f"⚠️  Failed to normalize bets log schema at {target_path}: {e}")
+        return None
+
+
 def compute_bet_performance_summary(
     training_results: Optional[Dict] = None,
     log_path: Optional[str] = None
@@ -6774,7 +6901,13 @@ def grade_bets_log(
         'ungraded_after': 0
     }
 
-    resolved_log_path = resolve_local_read_path(log_path) or (os.path.abspath(log_path) if log_path else None)
+    # Normalize schema first so grading and YTD stats are consistent.
+    try:
+        normalized_path = normalize_bets_log_schema(log_path)
+    except Exception:
+        normalized_path = None
+
+    resolved_log_path = resolve_local_read_path(normalized_path or log_path) or (os.path.abspath(log_path) if log_path else None)
     if not resolved_log_path or not os.path.exists(resolved_log_path):
         print(f"⚠️  Bets log not found: {log_path}")
         return summary
