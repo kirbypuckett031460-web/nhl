@@ -7230,6 +7230,11 @@ def grade_bets_log(
     matched_by_gid = 0
     matched_by_matchup_date = 0
     examples_unmatched: List[str] = []
+    # Last-chance fallback: fetch final score by game_id directly (handles cases where
+    # historical ETL skipped a Final due to missing advanced stats, and when bet date is NaT).
+    fetcher = None
+    fetched_totals: Dict[str, float] = {}
+    fetched_states: Dict[str, str] = {}
     for idx in df_log.index[candidate_mask]:
         gid = str(game_id_series.loc[idx] or '').strip()
         total = None
@@ -7244,6 +7249,38 @@ def grade_bets_log(
                 total = matchup_date_to_total.get((m, d))
                 if total is not None:
                     matched_by_matchup_date += 1
+        if total is None and gid:
+            # Fetch by game id (fast, single-game request) if we haven't already.
+            if gid in fetched_totals:
+                total = fetched_totals.get(gid)
+            else:
+                try:
+                    if fetcher is None:
+                        fetcher = NHLDataFetcher()
+                    gid_int = int(float(gid))
+                    payload = fetcher.get_game_stats(gid_int)
+                    state_raw = payload.get('gameState') or payload.get('gameScheduleState') or ''
+                    state = str(state_raw or '').strip().upper()
+                    fetched_states[gid] = state
+                    home = payload.get('homeTeam') or {}
+                    away = payload.get('awayTeam') or {}
+                    hs = home.get('score')
+                    as_ = away.get('score')
+                    try:
+                        hs_i = int(hs) if hs is not None else None
+                    except Exception:
+                        hs_i = None
+                    try:
+                        as_i = int(as_) if as_ is not None else None
+                    except Exception:
+                        as_i = None
+                    if hs_i is not None and as_i is not None and state in {'FINAL', 'OFF', 'FINALOT', 'FINALSO'}:
+                        total = float(hs_i + as_i)
+                        fetched_totals[gid] = total
+                    else:
+                        fetched_totals[gid] = None  # cache miss (not final or missing)
+                except Exception:
+                    fetched_totals[gid] = None
         if total is None:
             skipped += 1
             if len(examples_unmatched) < 6:
