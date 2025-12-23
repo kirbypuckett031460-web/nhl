@@ -6997,7 +6997,9 @@ def grade_bets_log(
         'graded': 0,
         'skipped': 0,
         'ungraded_before': 0,
-        'ungraded_after': 0
+        'ungraded_after': 0,
+        'written_path': None,
+        'normalized_path': None
     }
 
     # Normalize schema first so grading and YTD stats are consistent.
@@ -7005,6 +7007,7 @@ def grade_bets_log(
         normalized_path = normalize_bets_log_schema(log_path)
     except Exception:
         normalized_path = None
+    summary['normalized_path'] = normalized_path
 
     resolved_log_path = resolve_local_read_path(normalized_path or log_path) or (os.path.abspath(log_path) if log_path else None)
     if not resolved_log_path or not os.path.exists(resolved_log_path):
@@ -7390,6 +7393,7 @@ def grade_bets_log(
     try:
         df_log.to_csv(target_path, index=False)
         wrote = True
+        summary['written_path'] = target_path
         print(f"✅ Graded {graded} bet(s) (skipped {skipped}). Updated log: {target_path}")
     except Exception as e:
         print(f"⚠️  Failed to write updated bets log to {target_path}: {e}")
@@ -7407,6 +7411,7 @@ def grade_bets_log(
             try:
                 df_log.to_csv(fallback_path, index=False)
                 wrote = True
+                summary['written_path'] = fallback_path
                 print(f"✅ Updated log written to fallback path: {fallback_path}")
             except Exception as e:
                 print(f"⚠️  Failed to write fallback bets log to {fallback_path}: {e}")
@@ -8719,13 +8724,22 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         log_path_default = getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv'
         try:
             if log_path_default:
-                grade_bets_log(
+                grade_summary = grade_bets_log(
                     log_path=log_path_default,
                     historical_days=hist_days,
                     historical_cache_path=cache_path,
                     force_refresh=False,
                     historical_frame=historical_data
                 )
+                written = (grade_summary or {}).get('written_path')
+                if written:
+                    # Propagate the actual log path (handles fallback paths on Windows).
+                    log_path_default = str(written)
+                    if cli_args is not None:
+                        try:
+                            setattr(cli_args, 'log_path', log_path_default)
+                        except Exception:
+                            pass
         except Exception as e:
             print(f"⚠️  Auto-grade skipped: {e}")
         
