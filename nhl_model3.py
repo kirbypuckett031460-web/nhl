@@ -6661,7 +6661,13 @@ def compute_bet_performance_summary(
             # The bets log timestamps are often written as naive local times (no timezone).
             # Interpreting them as UTC will shift dates and break "Yesterday" stats.
             schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
-            parsed = pd.to_datetime(df_log[date_col], errors='coerce')
+            # The bets log can contain mixed date formats (e.g. "12/21/2025 17:15" and
+            # "2025-12-23 19:00:00"). Pandas' vectorized parser can coerce valid values
+            # to NaT when formats are mixed, which breaks Yesterday/YTD stats.
+            try:
+                parsed = pd.to_datetime(df_log[date_col], errors='coerce', format='mixed')
+            except TypeError:
+                parsed = pd.to_datetime(df_log[date_col], errors='coerce')
             if parsed.notna().any() and hasattr(parsed, 'dt'):
                 try:
                     tz_info = getattr(parsed.dt, 'tz', None)
@@ -6904,8 +6910,14 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             except Exception:
                 kelly_pct = 0.0
 
+        # Use schedule timezone for stable "Yesterday" boundaries and consistent logs.
+        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+        try:
+            now_local = pd.Timestamp.now(tz=schedule_tz).to_pydatetime()
+        except Exception:
+            now_local = datetime.now()
         rows.append({
-            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'date': now_local.strftime('%Y-%m-%d %H:%M:%S'),
             'game_id': gid,
             'matchup': matchup,
             'result': '',
