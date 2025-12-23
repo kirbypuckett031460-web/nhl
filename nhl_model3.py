@@ -7022,6 +7022,48 @@ def grade_bets_log(
         print(f"ℹ️  Bets log {resolved_log_path} is empty — nothing to grade.")
         return summary
 
+    # Fix malformed timestamps that parse to NaT (these rows won't count toward YTD/yesterday).
+    # When possible, infer the game date from the NHL gamecenter boxscore for that game_id.
+    try:
+        fixed_dates = 0
+        if 'date' in df_log.columns and 'game_id' in df_log.columns:
+            parsed_dates = pd.to_datetime(df_log['date'], errors='coerce')
+            missing_mask = parsed_dates.isna()
+            if bool(missing_mask.any()):
+                schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+                fetcher_dates = NHLDataFetcher()
+                for idx in df_log.index[missing_mask]:
+                    gid_val = df_log.at[idx, 'game_id']
+                    gid_norm = str(gid_val).strip()
+                    if not gid_norm or gid_norm.lower() in {'nan', 'none', 'null'}:
+                        continue
+                    try:
+                        gid_int = int(float(gid_norm))
+                    except Exception:
+                        continue
+                    try:
+                        payload = fetcher_dates.get_game_stats(gid_int)
+                        ts_raw = payload.get('gameDate') or payload.get('startTimeUTC') or payload.get('startTime')
+                        ts = pd.to_datetime(ts_raw, utc=True, errors='coerce')
+                        if pd.isna(ts):
+                            continue
+                        try:
+                            ts_local = ts.tz_convert(schedule_tz)
+                        except Exception:
+                            ts_local = ts
+                        # Store as a stable local string so downstream summary parsing is consistent.
+                        df_log.at[idx, 'date'] = ts_local.strftime('%Y-%m-%d %H:%M:%S')
+                        fixed_dates += 1
+                    except Exception:
+                        continue
+        if fixed_dates:
+            try:
+                print(f"ℹ️  Repaired {fixed_dates} bets_log row(s) with missing/invalid dates using gamecenter timestamps.")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     def _norm_game_id(value: Any) -> str:
         """Normalize game ids so 2025021234.0 and 2025021234 match."""
         if value is None:
