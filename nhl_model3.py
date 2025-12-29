@@ -7042,7 +7042,14 @@ def grade_bets_log(
     try:
         fixed_dates = 0
         if 'date' in df_log.columns and 'game_id' in df_log.columns:
-            parsed_dates = pd.to_datetime(df_log['date'], errors='coerce')
+            # The bets log can contain mixed date formats (e.g. "10/7/2025 10:24" and
+            # "2025-12-23 15:48:47"). Pandas' default parser may coerce one format to NaT
+            # when mixed formats are present, which would incorrectly trigger the "repair"
+            # path below and overwrite valid bet timestamps.
+            try:
+                parsed_dates = pd.to_datetime(df_log['date'], errors='coerce', format='mixed')
+            except TypeError:
+                parsed_dates = pd.to_datetime(df_log['date'], errors='coerce')
             missing_mask = parsed_dates.isna()
             if bool(missing_mask.any()):
                 schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
@@ -7144,7 +7151,12 @@ def grade_bets_log(
         if series is None:
             return None
         schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
-        parsed = pd.to_datetime(series, errors='coerce')
+        # Mixed date formats are common in long-running logs; use the mixed-format parser
+        # so valid entries aren't coerced to NaT.
+        try:
+            parsed = pd.to_datetime(series, errors='coerce', format='mixed')
+        except TypeError:
+            parsed = pd.to_datetime(series, errors='coerce')
         if not hasattr(parsed, 'dt'):
             return None
         try:
