@@ -2482,6 +2482,181 @@ class RealDataNHLModel:
 
         return df
 
+    def attach_historical_market_odds(
+        self,
+        historical_df: pd.DataFrame,
+        closing_odds_path: Optional[str] = None,
+        odds_history_path: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Attach best-effort 'closing' totals and prices to historical rows.
+
+        Sources (in precedence order):
+        1) closing_odds.json (explicit, curated)
+        2) odds_history.csv (snapshots; derive closing as last snapshot <= game start)
+
+        Output columns (added if missing):
+        - closing_total
+        - closing_over_price
+        - closing_under_price
+        - closing_source
+        """
+        if historical_df is None or not isinstance(historical_df, pd.DataFrame) or historical_df.empty:
+            return historical_df
+
+        df = historical_df.copy()
+        if 'game_id' in df.columns:
+            df['game_id'] = df['game_id'].astype(str)
+        if 'home_team' in df.columns:
+            df['home_team'] = df['home_team'].astype(str).str.upper()
+        if 'away_team' in df.columns:
+            df['away_team'] = df['away_team'].astype(str).str.upper()
+
+        # Ensure output columns exist
+        for col in ('closing_total', 'closing_over_price', 'closing_under_price', 'closing_source'):
+            if col not in df.columns:
+                df[col] = np.nan if col != 'closing_source' else ''
+
+        # Build matchup key for fallback joins
+        if 'matchup' not in df.columns and {'home_team', 'away_team'}.issubset(df.columns):
+            df['matchup'] = df['away_team'].astype(str) + '@' + df['home_team'].astype(str)
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+        # --- 1) Apply explicit closing_odds.json mapping ---
+        resolved_closing_path = resolve_local_read_path(closing_odds_path) if closing_odds_path else None
+        closing_lookup = None
+        if resolved_closing_path and os.path.exists(resolved_closing_path):
+            try:
+                with open(resolved_closing_path, 'r') as f:
+                    closing_lookup = json.load(f)
+            except Exception:
+                closing_lookup = None
+
+        if isinstance(closing_lookup, dict) and closing_lookup:
+            close_total_vals: List[float] = []
+            close_over_vals: List[float] = []
+            close_under_vals: List[float] = []
+            close_source_vals: List[str] = []
+            for _, row in df.iterrows():
+                gid = str(row.get('game_id', ''))
+                mk = str(row.get('matchup', ''))
+                rec = None
+                try:
+                    if gid and gid in closing_lookup:
+                        rec = closing_lookup.get(gid)
+                    elif mk and mk in closing_lookup:
+                        rec = closing_lookup.get(mk)
+                except Exception:
+                    rec = None
+                if isinstance(rec, dict):
+                    close_total_vals.append(rec.get('closing_total'))
+                    close_over_vals.append(rec.get('closing_over'))
+                    close_under_vals.append(rec.get('closing_under'))
+                    close_source_vals.append(str(rec.get('book') or rec.get('source') or 'closing_odds.json'))
+                else:
+                    close_total_vals.append(np.nan)
+                    close_over_vals.append(np.nan)
+                    close_under_vals.append(np.nan)
+                    close_source_vals.append('')
+            df['closing_total'] = pd.to_numeric(df['closing_total'], errors='coerce').fillna(pd.to_numeric(pd.Series(close_total_vals), errors='coerce'))
+            # Only fill prices/sources where missing
+            try:
+                mask_missing_price = pd.to_numeric(df['closing_over_price'], errors='coerce').isna()
+                df.loc[mask_missing_price, 'closing_over_price'] = pd.to_numeric(pd.Series(close_over_vals), errors='coerce').values
+            except Exception:
+                pass
+            try:
+                mask_missing_price = pd.to_numeric(df['closing_under_price'], errors='coerce').isna()
+                df.loc[mask_missing_price, 'closing_under_price'] = pd.to_numeric(pd.Series(close_under_vals), errors='coerce').values
+            except Exception:
+                pass
+            try:
+                mask_missing_src = df['closing_source'].astype(str).str.strip().eq('')
+                df.loc[mask_missing_src, 'closing_source'] = pd.Series(close_source_vals).fillna('').values
+            except Exception:
+                pass
+
+        # --- 2) Derive closing from odds_history.csv snapshots (best effort) ---
+        hist_path = resolve_local_read_path(odds_history_path) if odds_history_path else None
+        if not hist_path:
+            # default fallback
+            hist_path = 'odds_history.csv'
+        if hist_path and os.path.exists(hist_path):
+            try:
+                oh = pd.read_csv(hist_path)
+            except Exception:
+                oh = None
+            if isinstance(oh, pd.DataFrame) and not oh.empty:
+                needed = {'timestamp', 'game_id', 'book_total'}
+                if needed.issubset(set(oh.columns)):
+                    oh = oh.copy()
+                    oh['game_id'] = oh['game_id'].astype(str)
+                    oh['ts'] = pd.to_datetime(oh['timestamp'], errors='coerce')
+                    oh['book_total'] = pd.to_numeric(oh['book_total'], errors='coerce')
+                    oh['book_over'] = pd.to_numeric(oh.get('book_over'), errors='coerce')
+                    oh['book_under'] = pd.to_numeric(oh.get('book_under'), errors='coerce')
+                    # game_date captured by newer runs; older files won't have it.
+                    game_dt_col = None
+                    for candidate in ('game_date', 'game_time', 'commence_time'):
+                        if candidate in oh.columns:
+                            game_dt_col = candidate
+                            break
+                    if game_dt_col:
+                        oh['game_dt'] = pd.to_datetime(oh[game_dt_col], errors='coerce', utc=True).dt.tz_convert(None)
+                    else:
+                        oh['game_dt'] = pd.NaT
+
+                    derived = []
+                    for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
+                        g = grp.sort_values('ts')
+                        # Prefer last snapshot prior to recorded game_dt when available
+                        gdt = None
+                        try:
+                            gdt = g['game_dt'].dropna().iloc[-1] if g['game_dt'].notna().any() else None
+                        except Exception:
+                            gdt = None
+                        if gdt is not None and isinstance(gdt, pd.Timestamp):
+                            pre = g[g['ts'] <= gdt]
+                            pick = pre.iloc[-1] if not pre.empty else g.iloc[-1]
+                        else:
+                            pick = g.iloc[-1]
+                        derived.append({
+                            'game_id': str(gid),
+                            'derived_closing_total': pick.get('book_total'),
+                            'derived_closing_over': pick.get('book_over'),
+                            'derived_closing_under': pick.get('book_under'),
+                            'derived_closing_source': str(pick.get('book') or pick.get('book_key') or 'odds_history.csv')
+                        })
+                    if derived:
+                        ddf = pd.DataFrame(derived).dropna(subset=['game_id'])
+                        ddf['game_id'] = ddf['game_id'].astype(str)
+                        df = df.merge(ddf, on='game_id', how='left')
+                        df['closing_total'] = pd.to_numeric(df['closing_total'], errors='coerce').fillna(pd.to_numeric(df['derived_closing_total'], errors='coerce'))
+                        # Fill prices only if still missing
+                        try:
+                            miss = pd.to_numeric(df['closing_over_price'], errors='coerce').isna()
+                            df.loc[miss, 'closing_over_price'] = pd.to_numeric(df.loc[miss, 'derived_closing_over'], errors='coerce')
+                        except Exception:
+                            pass
+                        try:
+                            miss = pd.to_numeric(df['closing_under_price'], errors='coerce').isna()
+                            df.loc[miss, 'closing_under_price'] = pd.to_numeric(df.loc[miss, 'derived_closing_under'], errors='coerce')
+                        except Exception:
+                            pass
+                        try:
+                            miss = df['closing_source'].astype(str).str.strip().eq('')
+                            df.loc[miss, 'closing_source'] = df.loc[miss, 'derived_closing_source'].fillna('').astype(str)
+                        except Exception:
+                            pass
+                        df.drop(columns=[c for c in ('derived_closing_total','derived_closing_over','derived_closing_under','derived_closing_source') if c in df.columns], inplace=True, errors='ignore')
+
+        # Normalize types
+        df['closing_total'] = pd.to_numeric(df['closing_total'], errors='coerce')
+        df['closing_over_price'] = pd.to_numeric(df['closing_over_price'], errors='coerce')
+        df['closing_under_price'] = pd.to_numeric(df['closing_under_price'], errors='coerce')
+        df['closing_source'] = df['closing_source'].astype(str).fillna('')
+        return df
+
     def train_goal_models(self, enhanced_df: pd.DataFrame) -> None:
         """Train Poisson regression models for home and away goals using current feature set."""
         if not self.feature_names:
@@ -8848,6 +9023,24 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         
         print(f"✅ Using {len(historical_data)} games for training")
 
+        # Attach historical closing totals/prices when available (closing_odds.json and/or odds_history.csv).
+        try:
+            closing_path = getattr(cli_args, 'closing_odds_path', None) if cli_args else os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json')
+            odds_hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else 'odds_history.csv'
+            historical_data = model.attach_historical_market_odds(
+                historical_data,
+                closing_odds_path=closing_path,
+                odds_history_path=odds_hist_path
+            )
+            try:
+                have_close = int(pd.to_numeric(historical_data.get('closing_total'), errors='coerce').notna().sum()) if 'closing_total' in historical_data.columns else 0
+                if have_close:
+                    print(f"📈 Market lines attached: {have_close} game(s) with closing totals available")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"⚠️  Could not attach historical market odds: {e}")
+
         # Keep the bets log graded so YTD / Yesterday summaries reflect reality.
         # (Market calibration computes outcomes in-memory but does not persist WIN/LOSS back to the CSV.)
         log_path_default = getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv'
@@ -9562,8 +9755,15 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     for _, g in todays_games.iterrows():
                         gid = str(g.get('game_id'))
                         rec = betting_odds.get(gid, {})
+                        game_dt = g.get('date')
+                        try:
+                            game_dt_norm = pd.to_datetime(game_dt, utc=True, errors='coerce')
+                            game_dt_iso = game_dt_norm.isoformat() if not pd.isna(game_dt_norm) else ''
+                        except Exception:
+                            game_dt_iso = ''
                         base_row = {
                             'timestamp': ts,
+                            'game_date': game_dt_iso,
                             'game_id': gid,
                             'matchup': f"{g.get('away_team')}@{g.get('home_team')}",
                             'consensus_total': rec.get('consensus_total'),
