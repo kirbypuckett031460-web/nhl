@@ -30,12 +30,16 @@ Command-line options
 - --referee-rates-path: CSV/URL with referee penalties per 60 (optional)
 - --environment-path: Path to `environment.json` (outdoor/start time/weather per game)
 - --lineup-path: Path to `lineup_strength.csv` (team lineup strength)
+- --status-history-path: Optional CSV with historical goalie/injury adjustments (time-aligned) to enrich training features
 - --auto-populate: Auto-fetch MoneyPuck URLs and write normalized CSVs
 - --team-rates-url / --goalie-gsax-url / --penalties-url / --referees-url: Source URLs for auto-populate
 - --realtime-odds: Fetch live totals from The Odds API (US region only; requires `ODDS_API_KEY`)
 - --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
+- --build-closing-lines: Build `data/history/closing_lines.csv` from `--odds-history-path` and exit
+- --closing-lines-path: Output path for canonical closing lines CSV (default `data/history/closing_lines.csv`)
 - --train-speed: Choose `turbo`, `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
 - --fast-train: Shortcut for `--train-speed fast`
+- --train-target: Choose `auto` (default), `edge` (train on total_goals - closing_total), or `total` (train on total goals)
 - --max-train-samples: Cap how many historical games are used for training (useful for fast experimentation)
 - --model-path: Path to persist/load a serialized ensemble artifact (default `data/cache/trained_model.joblib`)
 - --save-trained-model: Persist the ensemble from the current run to `--model-path`
@@ -203,6 +207,17 @@ Closing odds JSON (for CLV):
   "demo_0": {"closing_total": 6.5}
 }
 ```
+
+Canonical closing lines (from odds history)
+------------------------------------------
+
+To make market-line training reproducible, build a canonical open/close totals+prices table from `odds_history.csv`:
+
+```bash
+python nhl_model3.py --build-closing-lines --odds-history-path odds_history.csv --closing-lines-path data/history/closing_lines.csv
+```
+
+When present, the model will prefer `data/history/closing_lines.csv` to populate `closing_total`, `closing_over_price`, and `closing_under_price` for training/backtests.
 
 Social posting
 --------------
