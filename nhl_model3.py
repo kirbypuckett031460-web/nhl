@@ -31,6 +31,7 @@ except Exception:
     HALVING_SEARCH_AVAILABLE = False
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor
+from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -2486,13 +2487,15 @@ class RealDataNHLModel:
         self,
         historical_df: pd.DataFrame,
         closing_odds_path: Optional[str] = None,
-        odds_history_path: Optional[str] = None
+        odds_history_path: Optional[str] = None,
+        closing_lines_path: Optional[str] = None
     ) -> pd.DataFrame:
         """Attach best-effort 'closing' totals and prices to historical rows.
 
         Sources (in precedence order):
-        1) closing_odds.json (explicit, curated)
-        2) odds_history.csv (snapshots; derive closing as last snapshot <= game start)
+        1) closing_lines.csv (canonical open/close derived from odds_history)
+        2) closing_odds.json (explicit, curated)
+        3) odds_history.csv (snapshots; derive closing as last snapshot <= game start)
 
         Output columns (added if missing):
         - closing_total
@@ -2515,12 +2518,65 @@ class RealDataNHLModel:
         for col in ('closing_total', 'closing_over_price', 'closing_under_price', 'closing_source'):
             if col not in df.columns:
                 df[col] = np.nan if col != 'closing_source' else ''
+        # Additional optional columns used for CLV/backtests
+        for col in ('open_total', 'open_over_price', 'open_under_price', 'open_source', 'open_timestamp', 'closing_timestamp'):
+            if col not in df.columns:
+                df[col] = np.nan if 'source' not in col and 'timestamp' not in col else ''
 
         # Build matchup key for fallback joins
         if 'matchup' not in df.columns and {'home_team', 'away_team'}.issubset(df.columns):
             df['matchup'] = df['away_team'].astype(str) + '@' + df['home_team'].astype(str)
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+        # --- 0) Attach canonical closing_lines.csv (if present) ---
+        resolved_lines_path = None
+        if closing_lines_path:
+            resolved_lines_path = resolve_local_read_path(closing_lines_path) or os.path.abspath(str(closing_lines_path))
+        else:
+            # default location
+            resolved_lines_path = resolve_local_read_path('data/history/closing_lines.csv') or 'data/history/closing_lines.csv'
+        try:
+            if resolved_lines_path and os.path.exists(resolved_lines_path):
+                cl = pd.read_csv(resolved_lines_path)
+                if isinstance(cl, pd.DataFrame) and not cl.empty and 'game_id' in cl.columns:
+                    cl = cl.copy()
+                    cl['game_id'] = cl['game_id'].astype(str)
+                    # Normalize numeric columns
+                    for c in ('open_total','open_over_price','open_under_price','closing_total','closing_over_price','closing_under_price'):
+                        if c in cl.columns:
+                            cl[c] = pd.to_numeric(cl[c], errors='coerce')
+                    for c in ('open_source','closing_source','open_timestamp','closing_timestamp'):
+                        if c in cl.columns:
+                            cl[c] = cl[c].astype(str).fillna('')
+                    df = df.merge(cl, on='game_id', how='left', suffixes=('', '_cl'))
+                    # Fill missing open/close fields from canonical columns
+                    for base in ('open_total','open_over_price','open_under_price','open_source','open_timestamp','closing_timestamp'):
+                        ccol = f"{base}_cl"
+                        if ccol in df.columns:
+                            if 'source' in base or 'timestamp' in base:
+                                miss = df[base].astype(str).str.strip().eq('')
+                                df.loc[miss, base] = df.loc[miss, ccol].fillna('').astype(str)
+                            else:
+                                miss = pd.to_numeric(df[base], errors='coerce').isna()
+                                df.loc[miss, base] = pd.to_numeric(df.loc[miss, ccol], errors='coerce')
+                    # Closing fields (our primary columns)
+                    if 'closing_total_cl' in df.columns:
+                        miss = pd.to_numeric(df['closing_total'], errors='coerce').isna()
+                        df.loc[miss, 'closing_total'] = pd.to_numeric(df.loc[miss, 'closing_total_cl'], errors='coerce')
+                    if 'closing_over_price_cl' in df.columns:
+                        miss = pd.to_numeric(df['closing_over_price'], errors='coerce').isna()
+                        df.loc[miss, 'closing_over_price'] = pd.to_numeric(df.loc[miss, 'closing_over_price_cl'], errors='coerce')
+                    if 'closing_under_price_cl' in df.columns:
+                        miss = pd.to_numeric(df['closing_under_price'], errors='coerce').isna()
+                        df.loc[miss, 'closing_under_price'] = pd.to_numeric(df.loc[miss, 'closing_under_price_cl'], errors='coerce')
+                    if 'closing_source_cl' in df.columns:
+                        miss = df['closing_source'].astype(str).str.strip().eq('')
+                        df.loc[miss, 'closing_source'] = df.loc[miss, 'closing_source_cl'].fillna('').astype(str)
+                    # Drop *_cl helper cols
+                    df.drop(columns=[c for c in df.columns if c.endswith('_cl')], inplace=True, errors='ignore')
+        except Exception:
+            pass
 
         # --- 1) Apply explicit closing_odds.json mapping ---
         resolved_closing_path = resolve_local_read_path(closing_odds_path) if closing_odds_path else None
@@ -2656,6 +2712,98 @@ class RealDataNHLModel:
         df['closing_under_price'] = pd.to_numeric(df['closing_under_price'], errors='coerce')
         df['closing_source'] = df['closing_source'].astype(str).fillna('')
         return df
+
+    @staticmethod
+    def build_closing_lines_from_odds_history(
+        odds_history_path: str = 'odds_history.csv',
+        output_path: str = 'data/history/closing_lines.csv'
+    ) -> Optional[str]:
+        """Build a canonical open/close totals table from odds_history snapshots.
+
+        We attempt to use `game_date` (puck drop timestamp) when present to select:
+        - open: earliest snapshot <= game_date (else earliest snapshot)
+        - close: latest snapshot <= game_date (else latest snapshot)
+        """
+        try:
+            src = resolve_local_read_path(odds_history_path) or os.path.abspath(str(odds_history_path))
+        except Exception:
+            src = odds_history_path
+        if not src or not os.path.exists(src):
+            print(f"⚠️  odds history not found at {odds_history_path}")
+            return None
+        try:
+            oh = pd.read_csv(src)
+        except Exception as e:
+            print(f"⚠️  Failed to read odds history {src}: {e}")
+            return None
+        if oh is None or oh.empty:
+            print("⚠️  odds history is empty; nothing to build")
+            return None
+        needed = {'timestamp', 'game_id', 'book_total'}
+        if not needed.issubset(set(oh.columns)):
+            print(f"⚠️  odds history missing required columns: {sorted(list(needed - set(oh.columns)))}")
+            return None
+        oh = oh.copy()
+        oh['game_id'] = oh['game_id'].astype(str)
+        oh['ts'] = pd.to_datetime(oh['timestamp'], errors='coerce')
+        oh['book_total'] = pd.to_numeric(oh['book_total'], errors='coerce')
+        oh['book_over'] = pd.to_numeric(oh.get('book_over'), errors='coerce')
+        oh['book_under'] = pd.to_numeric(oh.get('book_under'), errors='coerce')
+        # game_date captured by newer runs
+        if 'game_date' in oh.columns:
+            try:
+                oh['game_dt'] = pd.to_datetime(oh['game_date'], errors='coerce', utc=True).dt.tz_convert(None)
+            except Exception:
+                oh['game_dt'] = pd.NaT
+        else:
+            oh['game_dt'] = pd.NaT
+        # optional book identifiers
+        if 'book' not in oh.columns:
+            oh['book'] = oh.get('book_key', oh.get('book_title', ''))
+        out_rows: List[Dict[str, Any]] = []
+        for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
+            g = grp.sort_values('ts')
+            gdt = None
+            try:
+                gdt = g['game_dt'].dropna().iloc[-1] if g['game_dt'].notna().any() else None
+            except Exception:
+                gdt = None
+            if gdt is not None and isinstance(gdt, pd.Timestamp):
+                pre = g[g['ts'] <= gdt]
+                use_for_open = pre if not pre.empty else g
+                use_for_close = pre if not pre.empty else g
+            else:
+                use_for_open = g
+                use_for_close = g
+            open_row = use_for_open.iloc[0]
+            close_row = use_for_close.iloc[-1]
+            out_rows.append({
+                'game_id': str(gid),
+                'open_total': open_row.get('book_total'),
+                'open_over_price': open_row.get('book_over'),
+                'open_under_price': open_row.get('book_under'),
+                'open_source': str(open_row.get('book') or open_row.get('book_key') or ''),
+                'open_timestamp': open_row.get('timestamp'),
+                'closing_total': close_row.get('book_total'),
+                'closing_over_price': close_row.get('book_over'),
+                'closing_under_price': close_row.get('book_under'),
+                'closing_source': str(close_row.get('book') or close_row.get('book_key') or ''),
+                'closing_timestamp': close_row.get('timestamp'),
+            })
+        if not out_rows:
+            print("⚠️  No closing lines could be derived from odds history")
+            return None
+        out_df = pd.DataFrame(out_rows)
+        # Write to disk
+        try:
+            target = ensure_local_write_path(output_path) or os.path.abspath(str(output_path))
+            os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+            out_df.to_csv(target, index=False)
+            print(f"💾 Wrote closing lines table: {target} ({len(out_df)} games)")
+            return target
+        except Exception as e:
+            print(f"⚠️  Failed to write closing lines table: {e}")
+            return None
 
     def train_goal_models(self, enhanced_df: pd.DataFrame) -> None:
         """Train Poisson regression models for home and away goals using current feature set."""
@@ -3375,11 +3523,32 @@ class RealDataNHLModel:
 
         # Capture per-game market lines aligned to X/y when available (even in total mode).
         self.market_lines = None
+        self.market_over_prices = None
+        self.market_under_prices = None
         if market_lines_raw is not None:
             try:
                 self.market_lines = market_lines_raw[mask].copy()
             except Exception:
                 self.market_lines = None
+        # Optional prices aligned with the market line (when historical rows include them).
+        try:
+            if 'closing_over_price' in df.columns:
+                self.market_over_prices = pd.to_numeric(df['closing_over_price'], errors='coerce')[mask].copy()
+            elif 'consensus_over' in df.columns:
+                self.market_over_prices = pd.to_numeric(df['consensus_over'], errors='coerce')[mask].copy()
+            else:
+                self.market_over_prices = None
+        except Exception:
+            self.market_over_prices = None
+        try:
+            if 'closing_under_price' in df.columns:
+                self.market_under_prices = pd.to_numeric(df['closing_under_price'], errors='coerce')[mask].copy()
+            elif 'consensus_under' in df.columns:
+                self.market_under_prices = pd.to_numeric(df['consensus_under'], errors='coerce')[mask].copy()
+            else:
+                self.market_under_prices = None
+        except Exception:
+            self.market_under_prices = None
         
         self.feature_names = available_features
         # Capture per-feature baselines for inference-time fallback
@@ -3445,6 +3614,18 @@ class RealDataNHLModel:
                 lines_all = candidate_lines
         except Exception:
             lines_all = None
+        over_prices_all: Optional[pd.Series] = None
+        under_prices_all: Optional[pd.Series] = None
+        try:
+            if getattr(self, 'market_over_prices', None) is not None and len(self.market_over_prices) == len(X):
+                over_prices_all = self.market_over_prices
+        except Exception:
+            over_prices_all = None
+        try:
+            if getattr(self, 'market_under_prices', None) is not None and len(self.market_under_prices) == len(X):
+                under_prices_all = self.market_under_prices
+        except Exception:
+            under_prices_all = None
         # Optional sample cap for faster presets
         original_len = len(X)
         sample_cap = self.max_train_samples
@@ -3471,6 +3652,22 @@ class RealDataNHLModel:
                         lines_all = lines_all.iloc[-len(X):].reset_index(drop=True)
                 except Exception:
                     lines_all = None
+            if over_prices_all is not None:
+                try:
+                    if len(over_prices_all) == original_len:
+                        over_prices_all = over_prices_all.iloc[idx].reset_index(drop=True)
+                    else:
+                        over_prices_all = over_prices_all.iloc[-len(X):].reset_index(drop=True)
+                except Exception:
+                    over_prices_all = None
+            if under_prices_all is not None:
+                try:
+                    if len(under_prices_all) == original_len:
+                        under_prices_all = under_prices_all.iloc[idx].reset_index(drop=True)
+                    else:
+                        under_prices_all = under_prices_all.iloc[-len(X):].reset_index(drop=True)
+                except Exception:
+                    under_prices_all = None
             applied_sample_cap = sample_cap
         
         if len(X) < 20:
@@ -3488,10 +3685,26 @@ class RealDataNHLModel:
                     lines_sorted = None
             else:
                 lines_sorted = None
+            if over_prices_all is not None and len(over_prices_all) == len(X):
+                try:
+                    over_prices_sorted = over_prices_all.loc[ordered_indices].reset_index(drop=True)
+                except Exception:
+                    over_prices_sorted = None
+            else:
+                over_prices_sorted = None
+            if under_prices_all is not None and len(under_prices_all) == len(X):
+                try:
+                    under_prices_sorted = under_prices_all.loc[ordered_indices].reset_index(drop=True)
+                except Exception:
+                    under_prices_sorted = None
+            else:
+                under_prices_sorted = None
         else:
             X_sorted = X.reset_index(drop=True)
             y_sorted = y.reset_index(drop=True)
             lines_sorted = lines_all.reset_index(drop=True) if lines_all is not None and len(lines_all) == len(X) else None
+            over_prices_sorted = over_prices_all.reset_index(drop=True) if over_prices_all is not None and len(over_prices_all) == len(X) else None
+            under_prices_sorted = under_prices_all.reset_index(drop=True) if under_prices_all is not None and len(under_prices_all) == len(X) else None
         split_index = max(1, min(len(X_sorted) - 1, int(len(X_sorted) * 0.75)))
         X_train = X_sorted.iloc[:split_index].reset_index(drop=True)
         y_train = y_sorted.iloc[:split_index].reset_index(drop=True)
@@ -3499,6 +3712,8 @@ class RealDataNHLModel:
         y_test = y_sorted.iloc[split_index:].reset_index(drop=True)
         lines_train = lines_sorted.iloc[:split_index].reset_index(drop=True) if lines_sorted is not None else None
         lines_test = lines_sorted.iloc[split_index:].reset_index(drop=True) if lines_sorted is not None else None
+        over_prices_test = over_prices_sorted.iloc[split_index:].reset_index(drop=True) if over_prices_sorted is not None else None
+        under_prices_test = under_prices_sorted.iloc[split_index:].reset_index(drop=True) if under_prices_sorted is not None else None
         
         # Feature pipeline for scaled modeling during validation
         eval_feature_pipeline = self._build_feature_pipeline()
@@ -3868,6 +4083,77 @@ class RealDataNHLModel:
             predicted_over = (ensemble_pred > test_lines).astype(int)
         ou_accuracy = (actual_over == predicted_over).mean()
 
+        # --- Vs-market backtest metrics (unit ROI, push rate, edge bins) ---
+        def american_to_decimal(a: Optional[float]) -> float:
+            try:
+                if a is None or not np.isfinite(float(a)):
+                    return 1.9091  # -110
+                aa = int(round(float(a)))
+                if aa >= 100:
+                    return 1.0 + (aa / 100.0)
+                return 1.0 + (100.0 / max(1, abs(aa)))
+            except Exception:
+                return 1.9091
+
+        backtest: Dict[str, Any] = {}
+        try:
+            # Determine predicted/actual totals in total space
+            if is_edge_mode:
+                pred_total_eval = np.asarray(pred_total_test, dtype=float)
+                actual_total_eval = np.asarray(actual_total_test, dtype=float)
+            else:
+                pred_total_eval = np.asarray(ensemble_pred, dtype=float)
+                actual_total_eval = y_test.values.astype(float)
+            line_eval = np.asarray(test_lines, dtype=float)
+            pick_over = (pred_total_eval > line_eval)
+            # Outcome vs line
+            is_push = np.isclose(actual_total_eval, line_eval, atol=1e-9)
+            is_over = actual_total_eval > line_eval
+            win = (pick_over & is_over) | ((~pick_over) & (~is_over) & (~is_push))
+            loss = (~win) & (~is_push)
+            # Price used: prefer closing side prices if present
+            oprice = pd.to_numeric(over_prices_test, errors='coerce').to_numpy(dtype=float) if over_prices_test is not None else np.full(len(line_eval), np.nan)
+            uprice = pd.to_numeric(under_prices_test, errors='coerce').to_numpy(dtype=float) if under_prices_test is not None else np.full(len(line_eval), np.nan)
+            dec = np.where(pick_over, np.vectorize(american_to_decimal)(oprice), np.vectorize(american_to_decimal)(uprice))
+            unit_profit = np.where(win, dec - 1.0, np.where(loss, -1.0, 0.0))
+            # Signed edge vs close (how far our pred_total is from closing line in chosen direction)
+            signed_edge = np.where(pick_over, pred_total_eval - line_eval, line_eval - pred_total_eval)
+            realized_signed = np.where(pick_over, actual_total_eval - line_eval, line_eval - actual_total_eval)
+            backtest = {
+                'n': int(len(line_eval)),
+                'bets_over': int(pick_over.sum()),
+                'bets_under': int((~pick_over).sum()),
+                'push_rate': float(np.mean(is_push)) if len(is_push) else None,
+                'hit_rate_ex_push': float(np.mean(win[~is_push])) if (~is_push).any() else None,
+                'avg_unit_profit': float(np.mean(unit_profit)) if len(unit_profit) else None,
+                'median_unit_profit': float(np.median(unit_profit)) if len(unit_profit) else None,
+                'avg_signed_edge': float(np.mean(signed_edge)) if len(signed_edge) else None,
+                'avg_realized_edge': float(np.mean(realized_signed)) if len(realized_signed) else None
+            }
+            # Edge calibration bins
+            try:
+                bins = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.80, 1.10, 9.0], dtype=float)
+                abs_edge = np.abs(pred_total_eval - line_eval)
+                idx = np.digitize(abs_edge, bins, right=False) - 1
+                rows = []
+                for bi in range(len(bins) - 1):
+                    m = idx == bi
+                    if not m.any():
+                        continue
+                    rows.append({
+                        'bin': f"{bins[bi]:.2f}-{bins[bi+1]:.2f}",
+                        'n': int(m.sum()),
+                        'hit_ex_push': float(np.mean(win[m & (~is_push)])) if (m & (~is_push)).any() else None,
+                        'avg_unit_profit': float(np.mean(unit_profit[m])),
+                        'avg_abs_edge': float(np.mean(abs_edge[m])),
+                        'avg_realized_signed': float(np.mean(realized_signed[m]))
+                    })
+                backtest['edge_bins'] = rows
+            except Exception:
+                pass
+        except Exception:
+            backtest = {}
+
         # Probability calibration check (Gaussian proxy with residual_std) using per-game lines
         try:
             std_dev = residual_std if residual_std > 0 else 0.85
@@ -4063,6 +4349,8 @@ class RealDataNHLModel:
             'consensus_guard_accuracy': self.consensus_guard_accuracy,
             'consensus_guard_support': self.consensus_guard_support
         }
+        if backtest:
+            training_summary['market_backtest'] = backtest
         model_state['training_results'] = training_summary
         model_state['trained_at'] = datetime.utcnow().isoformat()
         self.total_model = model_state
@@ -9044,6 +9332,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         )
         model.hydrate_training_context(**context_kwargs)
 
+        # Optional: build canonical closing lines table from odds_history snapshots and exit.
+        if cli_args and getattr(cli_args, 'build_closing_lines', False):
+            out_path = getattr(cli_args, 'closing_lines_path', None) or os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv')
+            src_path = getattr(cli_args, 'odds_history_path', None) or os.getenv('ODDS_HISTORY_PATH', 'odds_history.csv')
+            RealDataNHLModel.build_closing_lines_from_odds_history(
+                odds_history_path=str(src_path),
+                output_path=str(out_path)
+            )
+            return model, [], None
+
         if cli_args and getattr(cli_args, 'refresh_moneypuck', False):
             print("\n🧰 Refreshing MoneyPuck data before loading rate tables...")
             try:
@@ -9150,10 +9448,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         try:
             closing_path = getattr(cli_args, 'closing_odds_path', None) if cli_args else os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json')
             odds_hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else 'odds_history.csv'
+            closing_lines_path = getattr(cli_args, 'closing_lines_path', None) if cli_args else os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv')
             historical_data = model.attach_historical_market_odds(
                 historical_data,
                 closing_odds_path=closing_path,
-                odds_history_path=odds_hist_path
+                odds_history_path=odds_hist_path,
+                closing_lines_path=closing_lines_path
             )
             try:
                 have_close = int(pd.to_numeric(historical_data.get('closing_total'), errors='coerce').notna().sum()) if 'closing_total' in historical_data.columns else 0
@@ -10616,6 +10916,8 @@ if __name__ == "__main__":
     parser.add_argument('--log-odds-history', action='store_true', help='Append odds snapshots to odds_history.csv')
     parser.add_argument('--log-odds', dest='log_odds_history', action='store_true', help='Alias for --log-odds-history')
     parser.add_argument('--odds-history-path', type=str, default='odds_history.csv', help='Path to odds history CSV')
+    parser.add_argument('--build-closing-lines', action='store_true', help='Build data/history/closing_lines.csv from --odds-history-path and exit')
+    parser.add_argument('--closing-lines-path', type=str, default=os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv'), help='Output path for canonical closing lines CSV')
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
     parser.add_argument('--xg-baseline-total', type=float, default=float(os.getenv('XG_BASELINE_TOTAL', 6.2)), help='xG baseline total used to compute adjustments')
     parser.add_argument('--xg-clamp-abs', type=float, default=float(os.getenv('XG_CLAMP_ABS', 2.0)), help='Absolute clamp for xG total adjustment')
