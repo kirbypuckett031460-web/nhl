@@ -31,6 +31,7 @@ except Exception:
     HALVING_SEARCH_AVAILABLE = False
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor
+from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -2486,13 +2487,15 @@ class RealDataNHLModel:
         self,
         historical_df: pd.DataFrame,
         closing_odds_path: Optional[str] = None,
-        odds_history_path: Optional[str] = None
+        odds_history_path: Optional[str] = None,
+        closing_lines_path: Optional[str] = None
     ) -> pd.DataFrame:
         """Attach best-effort 'closing' totals and prices to historical rows.
 
         Sources (in precedence order):
-        1) closing_odds.json (explicit, curated)
-        2) odds_history.csv (snapshots; derive closing as last snapshot <= game start)
+        1) closing_lines.csv (canonical open/close derived from odds_history)
+        2) closing_odds.json (explicit, curated)
+        3) odds_history.csv (snapshots; derive closing as last snapshot <= game start)
 
         Output columns (added if missing):
         - closing_total
@@ -2515,12 +2518,65 @@ class RealDataNHLModel:
         for col in ('closing_total', 'closing_over_price', 'closing_under_price', 'closing_source'):
             if col not in df.columns:
                 df[col] = np.nan if col != 'closing_source' else ''
+        # Additional optional columns used for CLV/backtests
+        for col in ('open_total', 'open_over_price', 'open_under_price', 'open_source', 'open_timestamp', 'closing_timestamp'):
+            if col not in df.columns:
+                df[col] = np.nan if 'source' not in col and 'timestamp' not in col else ''
 
         # Build matchup key for fallback joins
         if 'matchup' not in df.columns and {'home_team', 'away_team'}.issubset(df.columns):
             df['matchup'] = df['away_team'].astype(str) + '@' + df['home_team'].astype(str)
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+        # --- 0) Attach canonical closing_lines.csv (if present) ---
+        resolved_lines_path = None
+        if closing_lines_path:
+            resolved_lines_path = resolve_local_read_path(closing_lines_path) or os.path.abspath(str(closing_lines_path))
+        else:
+            # default location
+            resolved_lines_path = resolve_local_read_path('data/history/closing_lines.csv') or 'data/history/closing_lines.csv'
+        try:
+            if resolved_lines_path and os.path.exists(resolved_lines_path):
+                cl = pd.read_csv(resolved_lines_path)
+                if isinstance(cl, pd.DataFrame) and not cl.empty and 'game_id' in cl.columns:
+                    cl = cl.copy()
+                    cl['game_id'] = cl['game_id'].astype(str)
+                    # Normalize numeric columns
+                    for c in ('open_total','open_over_price','open_under_price','closing_total','closing_over_price','closing_under_price'):
+                        if c in cl.columns:
+                            cl[c] = pd.to_numeric(cl[c], errors='coerce')
+                    for c in ('open_source','closing_source','open_timestamp','closing_timestamp'):
+                        if c in cl.columns:
+                            cl[c] = cl[c].astype(str).fillna('')
+                    df = df.merge(cl, on='game_id', how='left', suffixes=('', '_cl'))
+                    # Fill missing open/close fields from canonical columns
+                    for base in ('open_total','open_over_price','open_under_price','open_source','open_timestamp','closing_timestamp'):
+                        ccol = f"{base}_cl"
+                        if ccol in df.columns:
+                            if 'source' in base or 'timestamp' in base:
+                                miss = df[base].astype(str).str.strip().eq('')
+                                df.loc[miss, base] = df.loc[miss, ccol].fillna('').astype(str)
+                            else:
+                                miss = pd.to_numeric(df[base], errors='coerce').isna()
+                                df.loc[miss, base] = pd.to_numeric(df.loc[miss, ccol], errors='coerce')
+                    # Closing fields (our primary columns)
+                    if 'closing_total_cl' in df.columns:
+                        miss = pd.to_numeric(df['closing_total'], errors='coerce').isna()
+                        df.loc[miss, 'closing_total'] = pd.to_numeric(df.loc[miss, 'closing_total_cl'], errors='coerce')
+                    if 'closing_over_price_cl' in df.columns:
+                        miss = pd.to_numeric(df['closing_over_price'], errors='coerce').isna()
+                        df.loc[miss, 'closing_over_price'] = pd.to_numeric(df.loc[miss, 'closing_over_price_cl'], errors='coerce')
+                    if 'closing_under_price_cl' in df.columns:
+                        miss = pd.to_numeric(df['closing_under_price'], errors='coerce').isna()
+                        df.loc[miss, 'closing_under_price'] = pd.to_numeric(df.loc[miss, 'closing_under_price_cl'], errors='coerce')
+                    if 'closing_source_cl' in df.columns:
+                        miss = df['closing_source'].astype(str).str.strip().eq('')
+                        df.loc[miss, 'closing_source'] = df.loc[miss, 'closing_source_cl'].fillna('').astype(str)
+                    # Drop *_cl helper cols
+                    df.drop(columns=[c for c in df.columns if c.endswith('_cl')], inplace=True, errors='ignore')
+        except Exception:
+            pass
 
         # --- 1) Apply explicit closing_odds.json mapping ---
         resolved_closing_path = resolve_local_read_path(closing_odds_path) if closing_odds_path else None
@@ -2656,6 +2712,98 @@ class RealDataNHLModel:
         df['closing_under_price'] = pd.to_numeric(df['closing_under_price'], errors='coerce')
         df['closing_source'] = df['closing_source'].astype(str).fillna('')
         return df
+
+    @staticmethod
+    def build_closing_lines_from_odds_history(
+        odds_history_path: str = 'odds_history.csv',
+        output_path: str = 'data/history/closing_lines.csv'
+    ) -> Optional[str]:
+        """Build a canonical open/close totals table from odds_history snapshots.
+
+        We attempt to use `game_date` (puck drop timestamp) when present to select:
+        - open: earliest snapshot <= game_date (else earliest snapshot)
+        - close: latest snapshot <= game_date (else latest snapshot)
+        """
+        try:
+            src = resolve_local_read_path(odds_history_path) or os.path.abspath(str(odds_history_path))
+        except Exception:
+            src = odds_history_path
+        if not src or not os.path.exists(src):
+            print(f"⚠️  odds history not found at {odds_history_path}")
+            return None
+        try:
+            oh = pd.read_csv(src)
+        except Exception as e:
+            print(f"⚠️  Failed to read odds history {src}: {e}")
+            return None
+        if oh is None or oh.empty:
+            print("⚠️  odds history is empty; nothing to build")
+            return None
+        needed = {'timestamp', 'game_id', 'book_total'}
+        if not needed.issubset(set(oh.columns)):
+            print(f"⚠️  odds history missing required columns: {sorted(list(needed - set(oh.columns)))}")
+            return None
+        oh = oh.copy()
+        oh['game_id'] = oh['game_id'].astype(str)
+        oh['ts'] = pd.to_datetime(oh['timestamp'], errors='coerce')
+        oh['book_total'] = pd.to_numeric(oh['book_total'], errors='coerce')
+        oh['book_over'] = pd.to_numeric(oh.get('book_over'), errors='coerce')
+        oh['book_under'] = pd.to_numeric(oh.get('book_under'), errors='coerce')
+        # game_date captured by newer runs
+        if 'game_date' in oh.columns:
+            try:
+                oh['game_dt'] = pd.to_datetime(oh['game_date'], errors='coerce', utc=True).dt.tz_convert(None)
+            except Exception:
+                oh['game_dt'] = pd.NaT
+        else:
+            oh['game_dt'] = pd.NaT
+        # optional book identifiers
+        if 'book' not in oh.columns:
+            oh['book'] = oh.get('book_key', oh.get('book_title', ''))
+        out_rows: List[Dict[str, Any]] = []
+        for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
+            g = grp.sort_values('ts')
+            gdt = None
+            try:
+                gdt = g['game_dt'].dropna().iloc[-1] if g['game_dt'].notna().any() else None
+            except Exception:
+                gdt = None
+            if gdt is not None and isinstance(gdt, pd.Timestamp):
+                pre = g[g['ts'] <= gdt]
+                use_for_open = pre if not pre.empty else g
+                use_for_close = pre if not pre.empty else g
+            else:
+                use_for_open = g
+                use_for_close = g
+            open_row = use_for_open.iloc[0]
+            close_row = use_for_close.iloc[-1]
+            out_rows.append({
+                'game_id': str(gid),
+                'open_total': open_row.get('book_total'),
+                'open_over_price': open_row.get('book_over'),
+                'open_under_price': open_row.get('book_under'),
+                'open_source': str(open_row.get('book') or open_row.get('book_key') or ''),
+                'open_timestamp': open_row.get('timestamp'),
+                'closing_total': close_row.get('book_total'),
+                'closing_over_price': close_row.get('book_over'),
+                'closing_under_price': close_row.get('book_under'),
+                'closing_source': str(close_row.get('book') or close_row.get('book_key') or ''),
+                'closing_timestamp': close_row.get('timestamp'),
+            })
+        if not out_rows:
+            print("⚠️  No closing lines could be derived from odds history")
+            return None
+        out_df = pd.DataFrame(out_rows)
+        # Write to disk
+        try:
+            target = ensure_local_write_path(output_path) or os.path.abspath(str(output_path))
+            os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+            out_df.to_csv(target, index=False)
+            print(f"💾 Wrote closing lines table: {target} ({len(out_df)} games)")
+            return target
+        except Exception as e:
+            print(f"⚠️  Failed to write closing lines table: {e}")
+            return None
 
     def train_goal_models(self, enhanced_df: pd.DataFrame) -> None:
         """Train Poisson regression models for home and away goals using current feature set."""
@@ -3315,30 +3463,92 @@ class RealDataNHLModel:
         
         # Create feature matrix
         X = df[available_features].copy()
-        y = df['total_goals'].copy()
         dates = df['date'].copy()
-        
-        # Remove rows with missing target
-        mask = ~y.isna()
-        X = X[mask]
-        y = y[mask]
-        dates = dates[mask]
 
-        # Optional: capture a per-game "market line" series when present in the input frame.
-        # This is used for more realistic O/U evaluation and probability calibration.
+        # Determine target mode.
+        # - total: y = total_goals
+        # - edge:  y = total_goals - market_line (closing_total preferred)
+        # - auto:  choose edge if sufficient market_line coverage
+        target_mode_req = str(getattr(self, 'train_target_mode', '') or os.getenv('TRAIN_TARGET', 'auto')).strip().lower()
+        if target_mode_req not in ('auto', 'total', 'edge'):
+            target_mode_req = 'auto'
+
+        # Prefer closing_total if available, else consensus_total, else line.
         self.market_line_col = None
-        self.market_lines = None
         for candidate in ('closing_total', 'consensus_total', 'line'):
             if candidate in df.columns:
                 self.market_line_col = candidate
                 break
+        market_lines_raw = None
         if self.market_line_col:
             try:
-                lines = pd.to_numeric(df[self.market_line_col], errors='coerce')
-                lines = lines[mask]
-                self.market_lines = lines.copy()
+                market_lines_raw = pd.to_numeric(df[self.market_line_col], errors='coerce')
+            except Exception:
+                market_lines_raw = None
+
+        totals_raw = pd.to_numeric(df.get('total_goals'), errors='coerce') if 'total_goals' in df.columns else pd.Series(np.nan, index=df.index)
+
+        # Auto-select edge mode when enough lines exist.
+        target_mode = target_mode_req
+        if target_mode_req == 'auto':
+            have_lines = 0
+            if market_lines_raw is not None:
+                try:
+                    have_lines = int(market_lines_raw.notna().sum())
+                except Exception:
+                    have_lines = 0
+            # Require a decent sample; otherwise stay in total mode.
+            if have_lines >= max(120, int(0.35 * max(1, len(df)))):
+                target_mode = 'edge'
+            else:
+                target_mode = 'total'
+        self.target_mode = target_mode
+
+        if target_mode == 'edge':
+            if market_lines_raw is None or self.market_line_col is None:
+                print("⚠️  Edge training requested but no market line column found; falling back to total-goals training.")
+                target_mode = 'total'
+                self.target_mode = 'total'
+
+        if target_mode == 'edge' and market_lines_raw is not None:
+            y = (totals_raw - market_lines_raw).copy()
+            mask = (~y.isna()) & (~market_lines_raw.isna())
+        else:
+            y = totals_raw.copy()
+            mask = ~y.isna()
+
+        X = X[mask]
+        y = y[mask]
+        dates = dates[mask]
+
+        # Capture per-game market lines aligned to X/y when available (even in total mode).
+        self.market_lines = None
+        self.market_over_prices = None
+        self.market_under_prices = None
+        if market_lines_raw is not None:
+            try:
+                self.market_lines = market_lines_raw[mask].copy()
             except Exception:
                 self.market_lines = None
+        # Optional prices aligned with the market line (when historical rows include them).
+        try:
+            if 'closing_over_price' in df.columns:
+                self.market_over_prices = pd.to_numeric(df['closing_over_price'], errors='coerce')[mask].copy()
+            elif 'consensus_over' in df.columns:
+                self.market_over_prices = pd.to_numeric(df['consensus_over'], errors='coerce')[mask].copy()
+            else:
+                self.market_over_prices = None
+        except Exception:
+            self.market_over_prices = None
+        try:
+            if 'closing_under_price' in df.columns:
+                self.market_under_prices = pd.to_numeric(df['closing_under_price'], errors='coerce')[mask].copy()
+            elif 'consensus_under' in df.columns:
+                self.market_under_prices = pd.to_numeric(df['consensus_under'], errors='coerce')[mask].copy()
+            else:
+                self.market_under_prices = None
+        except Exception:
+            self.market_under_prices = None
         
         self.feature_names = available_features
         # Capture per-feature baselines for inference-time fallback
@@ -3375,7 +3585,14 @@ class RealDataNHLModel:
             except Exception:
                 self.ref_goal_baseline = 6.2
         
-        print(f"Prepared {len(X)} samples with {len(available_features)} features")
+        try:
+            if self.target_mode == 'edge' and self.market_lines is not None:
+                coverage = float(pd.to_numeric(df[self.market_line_col], errors='coerce').notna().mean()) if self.market_line_col in df.columns else 0.0
+                print(f"Prepared {len(X)} samples with {len(available_features)} features (target=edge vs {self.market_line_col}, line_coverage={coverage:.0%})")
+            else:
+                print(f"Prepared {len(X)} samples with {len(available_features)} features (target=total)")
+        except Exception:
+            print(f"Prepared {len(X)} samples with {len(available_features)} features")
         
         return X, y, dates
     
@@ -3389,7 +3606,7 @@ class RealDataNHLModel:
         speed_cfg = TRAIN_SPEED_PRESETS[speed_profile]
         self.skip_goal_model_training = bool(speed_cfg.get('skip_goal_models', False))
         print(f"⏱️ Training preset: {speed_cfg.get('label', speed_profile.title())}")
-        # Optional market lines (must align with X/y order)
+        # Optional market lines (must align with X/y order). Used for realistic O/U scoring and edge-mode modeling.
         lines_all: Optional[pd.Series] = None
         try:
             candidate_lines = getattr(self, 'market_lines', None)
@@ -3397,6 +3614,18 @@ class RealDataNHLModel:
                 lines_all = candidate_lines
         except Exception:
             lines_all = None
+        over_prices_all: Optional[pd.Series] = None
+        under_prices_all: Optional[pd.Series] = None
+        try:
+            if getattr(self, 'market_over_prices', None) is not None and len(self.market_over_prices) == len(X):
+                over_prices_all = self.market_over_prices
+        except Exception:
+            over_prices_all = None
+        try:
+            if getattr(self, 'market_under_prices', None) is not None and len(self.market_under_prices) == len(X):
+                under_prices_all = self.market_under_prices
+        except Exception:
+            under_prices_all = None
         # Optional sample cap for faster presets
         original_len = len(X)
         sample_cap = self.max_train_samples
@@ -3423,6 +3652,22 @@ class RealDataNHLModel:
                         lines_all = lines_all.iloc[-len(X):].reset_index(drop=True)
                 except Exception:
                     lines_all = None
+            if over_prices_all is not None:
+                try:
+                    if len(over_prices_all) == original_len:
+                        over_prices_all = over_prices_all.iloc[idx].reset_index(drop=True)
+                    else:
+                        over_prices_all = over_prices_all.iloc[-len(X):].reset_index(drop=True)
+                except Exception:
+                    over_prices_all = None
+            if under_prices_all is not None:
+                try:
+                    if len(under_prices_all) == original_len:
+                        under_prices_all = under_prices_all.iloc[idx].reset_index(drop=True)
+                    else:
+                        under_prices_all = under_prices_all.iloc[-len(X):].reset_index(drop=True)
+                except Exception:
+                    under_prices_all = None
             applied_sample_cap = sample_cap
         
         if len(X) < 20:
@@ -3440,10 +3685,26 @@ class RealDataNHLModel:
                     lines_sorted = None
             else:
                 lines_sorted = None
+            if over_prices_all is not None and len(over_prices_all) == len(X):
+                try:
+                    over_prices_sorted = over_prices_all.loc[ordered_indices].reset_index(drop=True)
+                except Exception:
+                    over_prices_sorted = None
+            else:
+                over_prices_sorted = None
+            if under_prices_all is not None and len(under_prices_all) == len(X):
+                try:
+                    under_prices_sorted = under_prices_all.loc[ordered_indices].reset_index(drop=True)
+                except Exception:
+                    under_prices_sorted = None
+            else:
+                under_prices_sorted = None
         else:
             X_sorted = X.reset_index(drop=True)
             y_sorted = y.reset_index(drop=True)
             lines_sorted = lines_all.reset_index(drop=True) if lines_all is not None and len(lines_all) == len(X) else None
+            over_prices_sorted = over_prices_all.reset_index(drop=True) if over_prices_all is not None and len(over_prices_all) == len(X) else None
+            under_prices_sorted = under_prices_all.reset_index(drop=True) if under_prices_all is not None and len(under_prices_all) == len(X) else None
         split_index = max(1, min(len(X_sorted) - 1, int(len(X_sorted) * 0.75)))
         X_train = X_sorted.iloc[:split_index].reset_index(drop=True)
         y_train = y_sorted.iloc[:split_index].reset_index(drop=True)
@@ -3451,6 +3712,8 @@ class RealDataNHLModel:
         y_test = y_sorted.iloc[split_index:].reset_index(drop=True)
         lines_train = lines_sorted.iloc[:split_index].reset_index(drop=True) if lines_sorted is not None else None
         lines_test = lines_sorted.iloc[split_index:].reset_index(drop=True) if lines_sorted is not None else None
+        over_prices_test = over_prices_sorted.iloc[split_index:].reset_index(drop=True) if over_prices_sorted is not None else None
+        under_prices_test = under_prices_sorted.iloc[split_index:].reset_index(drop=True) if under_prices_sorted is not None else None
         
         # Feature pipeline for scaled modeling during validation
         eval_feature_pipeline = self._build_feature_pipeline()
@@ -3715,8 +3978,17 @@ class RealDataNHLModel:
                 poisson_local = None
             return poisson_local, nb_local, gp_local
 
-        # Poisson model for total goals (non-negative)
-        poisson_model, nb_params, gp_model = _fit_poisson_components(X_train_scaled, y_train)
+        # Poisson model for TOTAL goals (non-negative).
+        # If we're training the ensemble on edge, we still want the Poisson head to model totals.
+        y_train_for_poisson = y_train
+        if is_edge_mode:
+            try:
+                if lines_train is not None:
+                    tr_lines_for_poisson = pd.to_numeric(lines_train, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+                    y_train_for_poisson = pd.Series(y_train.values + tr_lines_for_poisson, index=y_train.index)
+            except Exception:
+                y_train_for_poisson = y_train
+        poisson_model, nb_params, gp_model = _fit_poisson_components(X_train_scaled, y_train_for_poisson)
 
         # Poisson expected totals on the test set
         if poisson_model is not None:
@@ -3730,9 +4002,16 @@ class RealDataNHLModel:
             walk_horizon = max(4, int(round(walk_horizon * float(speed_cfg.get('cv_scale', 1.0)))))
             walk_step = max(2, walk_horizon // 2)
             walk_min_train = max(walk_horizon * 2, len(X_sorted) // 3)
+            y_sorted_for_walk = y_sorted
+            if is_edge_mode and lines_sorted is not None:
+                try:
+                    ls = pd.to_numeric(lines_sorted, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+                    y_sorted_for_walk = pd.Series(y_sorted.values + ls, index=y_sorted.index)
+                except Exception:
+                    y_sorted_for_walk = y_sorted
             walk_metrics = self._walk_forward_backtest(
                 X_sorted,
-                y_sorted,
+                y_sorted_for_walk,
                 trained_models,
                 weights_array,
                 walk_min_train,
@@ -3743,12 +4022,48 @@ class RealDataNHLModel:
                 print(f"Walk-forward RMSE {walk_metrics['rmse']:.3f} (splits={walk_metrics.get('splits_evaluated', 0)})")
         
         # Calculate metrics and residual-based uncertainty (plus conformal radius)
-        rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred))
-        mae = mean_absolute_error(y_test, ensemble_pred)
-        residual_std = float(np.std(y_test.values - ensemble_pred)) if len(y_test) > 1 else 0.85
+        is_edge_mode = str(getattr(self, 'target_mode', 'total') or 'total').strip().lower() == 'edge'
+        # Determine evaluation lines (prefer market; fallback to inferred default)
+        default_line = 6.5
+        try:
+            default_line = float(os.getenv('DEFAULT_TOTAL_LINE', '6.5'))
+        except Exception:
+            default_line = 6.5
+        if lines_test is not None:
+            test_lines = pd.to_numeric(lines_test, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+        else:
+            # Fall back to a line derived from training mean totals if we have it (total mode only).
+            if not is_edge_mode:
+                try:
+                    train_mean = float(y_train.mean())
+                    if np.isfinite(train_mean) and train_mean > 0:
+                        default_line = float(round(train_mean * 2.0) / 2.0)
+                except Exception:
+                    pass
+            test_lines = np.full(len(y_test), default_line, dtype=float)
+
+        # Convert model outputs into total predictions when training on edge.
+        if is_edge_mode:
+            pred_edge_test = np.asarray(ensemble_pred, dtype=float)
+            pred_total_test = test_lines + pred_edge_test
+            actual_total_test = y_test.values.astype(float) + test_lines  # y_test is edge -> recover total
+            rmse_edge = float(np.sqrt(mean_squared_error(y_test, pred_edge_test)))
+            mae_edge = float(mean_absolute_error(y_test, pred_edge_test))
+            rmse = float(np.sqrt(mean_squared_error(actual_total_test, pred_total_test)))
+            mae = float(mean_absolute_error(actual_total_test, pred_total_test))
+            residual_std = float(np.std(actual_total_test - pred_total_test)) if len(actual_total_test) > 1 else 0.85
+        else:
+            rmse_edge = None
+            mae_edge = None
+            rmse = float(np.sqrt(mean_squared_error(y_test, ensemble_pred)))
+            mae = float(mean_absolute_error(y_test, ensemble_pred))
+            residual_std = float(np.std(y_test.values - ensemble_pred)) if len(y_test) > 1 else 0.85
 
         # Symmetric conformal interval via absolute residual quantiles (configurable quantile)
-        abs_res = np.abs(y_test.values - ensemble_pred)
+        if is_edge_mode:
+            abs_res = np.abs(actual_total_test - pred_total_test)
+        else:
+            abs_res = np.abs(y_test.values - ensemble_pred)
         if len(abs_res) >= 5:
             self.conformal_q80 = float(np.quantile(abs_res, 0.80))
             self.conformal_q90 = float(np.quantile(abs_res, 0.90))
@@ -3759,31 +4074,94 @@ class RealDataNHLModel:
             self.conformal_q90 = 1.0
             self.conformal_radius = self.conformal_q90
         
-        # Over/under accuracy (prefer per-game market line when available)
-        default_line = 6.5
-        try:
-            default_line = float(os.getenv('DEFAULT_TOTAL_LINE', '6.5'))
-        except Exception:
-            default_line = 6.5
-        try:
-            train_mean = float(y_train.mean())
-            if np.isfinite(train_mean) and train_mean > 0:
-                # Round to nearest half-goal to mimic market totals
-                default_line = float(round(train_mean * 2.0) / 2.0)
-        except Exception:
-            pass
-        if lines_test is not None:
-            test_lines = pd.to_numeric(lines_test, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+        # Over/under accuracy vs per-game line.
+        if is_edge_mode:
+            actual_over = (actual_total_test > test_lines).astype(int)
+            predicted_over = (pred_total_test > test_lines).astype(int)
         else:
-            test_lines = np.full(len(y_test), default_line, dtype=float)
-        actual_over = (y_test.values > test_lines).astype(int)
-        predicted_over = (ensemble_pred > test_lines).astype(int)
+            actual_over = (y_test.values > test_lines).astype(int)
+            predicted_over = (ensemble_pred > test_lines).astype(int)
         ou_accuracy = (actual_over == predicted_over).mean()
+
+        # --- Vs-market backtest metrics (unit ROI, push rate, edge bins) ---
+        def american_to_decimal(a: Optional[float]) -> float:
+            try:
+                if a is None or not np.isfinite(float(a)):
+                    return 1.9091  # -110
+                aa = int(round(float(a)))
+                if aa >= 100:
+                    return 1.0 + (aa / 100.0)
+                return 1.0 + (100.0 / max(1, abs(aa)))
+            except Exception:
+                return 1.9091
+
+        backtest: Dict[str, Any] = {}
+        try:
+            # Determine predicted/actual totals in total space
+            if is_edge_mode:
+                pred_total_eval = np.asarray(pred_total_test, dtype=float)
+                actual_total_eval = np.asarray(actual_total_test, dtype=float)
+            else:
+                pred_total_eval = np.asarray(ensemble_pred, dtype=float)
+                actual_total_eval = y_test.values.astype(float)
+            line_eval = np.asarray(test_lines, dtype=float)
+            pick_over = (pred_total_eval > line_eval)
+            # Outcome vs line
+            is_push = np.isclose(actual_total_eval, line_eval, atol=1e-9)
+            is_over = actual_total_eval > line_eval
+            win = (pick_over & is_over) | ((~pick_over) & (~is_over) & (~is_push))
+            loss = (~win) & (~is_push)
+            # Price used: prefer closing side prices if present
+            oprice = pd.to_numeric(over_prices_test, errors='coerce').to_numpy(dtype=float) if over_prices_test is not None else np.full(len(line_eval), np.nan)
+            uprice = pd.to_numeric(under_prices_test, errors='coerce').to_numpy(dtype=float) if under_prices_test is not None else np.full(len(line_eval), np.nan)
+            dec = np.where(pick_over, np.vectorize(american_to_decimal)(oprice), np.vectorize(american_to_decimal)(uprice))
+            unit_profit = np.where(win, dec - 1.0, np.where(loss, -1.0, 0.0))
+            # Signed edge vs close (how far our pred_total is from closing line in chosen direction)
+            signed_edge = np.where(pick_over, pred_total_eval - line_eval, line_eval - pred_total_eval)
+            realized_signed = np.where(pick_over, actual_total_eval - line_eval, line_eval - actual_total_eval)
+            backtest = {
+                'n': int(len(line_eval)),
+                'bets_over': int(pick_over.sum()),
+                'bets_under': int((~pick_over).sum()),
+                'push_rate': float(np.mean(is_push)) if len(is_push) else None,
+                'hit_rate_ex_push': float(np.mean(win[~is_push])) if (~is_push).any() else None,
+                'avg_unit_profit': float(np.mean(unit_profit)) if len(unit_profit) else None,
+                'median_unit_profit': float(np.median(unit_profit)) if len(unit_profit) else None,
+                'avg_signed_edge': float(np.mean(signed_edge)) if len(signed_edge) else None,
+                'avg_realized_edge': float(np.mean(realized_signed)) if len(realized_signed) else None
+            }
+            # Edge calibration bins
+            try:
+                bins = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.80, 1.10, 9.0], dtype=float)
+                abs_edge = np.abs(pred_total_eval - line_eval)
+                idx = np.digitize(abs_edge, bins, right=False) - 1
+                rows = []
+                for bi in range(len(bins) - 1):
+                    m = idx == bi
+                    if not m.any():
+                        continue
+                    rows.append({
+                        'bin': f"{bins[bi]:.2f}-{bins[bi+1]:.2f}",
+                        'n': int(m.sum()),
+                        'hit_ex_push': float(np.mean(win[m & (~is_push)])) if (m & (~is_push)).any() else None,
+                        'avg_unit_profit': float(np.mean(unit_profit[m])),
+                        'avg_abs_edge': float(np.mean(abs_edge[m])),
+                        'avg_realized_signed': float(np.mean(realized_signed[m]))
+                    })
+                backtest['edge_bins'] = rows
+            except Exception:
+                pass
+        except Exception:
+            backtest = {}
 
         # Probability calibration check (Gaussian proxy with residual_std) using per-game lines
         try:
             std_dev = residual_std if residual_std > 0 else 0.85
-            raw_over_prob = norm.sf(test_lines, loc=ensemble_pred, scale=std_dev)
+            if is_edge_mode:
+                # P(total > line) == P(edge > 0)
+                raw_over_prob = norm.sf(0.0, loc=pred_edge_test, scale=std_dev)
+            else:
+                raw_over_prob = norm.sf(test_lines, loc=ensemble_pred, scale=std_dev)
             eps = 1e-6
         except Exception:
             raw_over_prob = None
@@ -3828,8 +4206,13 @@ class RealDataNHLModel:
                     oof_resid = y_train.values[valid] - oof_pred[valid]
                     oof_std = float(np.std(oof_resid)) if len(oof_resid) > 1 else residual_std
                     oof_std = oof_std if (np.isfinite(oof_std) and oof_std > 1e-6) else (residual_std if residual_std > 1e-6 else 0.85)
-                    raw_oof_prob = norm.sf(tr_lines[valid], loc=oof_pred[valid], scale=oof_std)
-                    oof_over = (y_train.values[valid] > tr_lines[valid]).astype(int)
+                    if is_edge_mode:
+                        raw_oof_prob = norm.sf(0.0, loc=oof_pred[valid], scale=oof_std)
+                        # y_train is edge in edge mode
+                        oof_over = (y_train.values[valid] > 0.0).astype(int)
+                    else:
+                        raw_oof_prob = norm.sf(tr_lines[valid], loc=oof_pred[valid], scale=oof_std)
+                        oof_over = (y_train.values[valid] > tr_lines[valid]).astype(int)
                     iso = IsotonicRegression(out_of_bounds='clip')
                     iso.fit(raw_oof_prob, oof_over)
                     iso_over_model = iso
@@ -3854,9 +4237,16 @@ class RealDataNHLModel:
             brier = None
             logloss = None
 
+        # Guardrails should operate in total space (compare to line).
+        if is_edge_mode:
+            ens_for_guards = np.asarray(pred_total_test, dtype=float)
+            actual_for_guards = np.asarray(actual_total_test, dtype=float)
+        else:
+            ens_for_guards = np.asarray(ensemble_pred, dtype=float)
+            actual_for_guards = y_test.values.astype(float)
         precision_guard = self._calibrate_precision_guard(
-            ensemble_pred=np.asarray(ensemble_pred, dtype=float),
-            actual_totals=y_test.values.astype(float),
+            ensemble_pred=ens_for_guards,
+            actual_totals=actual_for_guards,
             reference_lines=test_lines.astype(float)
         )
         if precision_guard:
@@ -3869,9 +4259,9 @@ class RealDataNHLModel:
                 f"(baseline {precision_guard['baseline_accuracy']:.1%})"
             )
         consensus_guard = self._calibrate_consensus_guard(
-            model_predictions=test_preds,
-            ensemble_pred=np.asarray(ensemble_pred, dtype=float),
-            actual_totals=y_test.values.astype(float),
+            model_predictions=test_preds if not is_edge_mode else (test_preds + test_lines.reshape(1, -1)),
+            ensemble_pred=ens_for_guards,
+            actual_totals=actual_for_guards,
             reference_lines=test_lines.astype(float)
         )
         if consensus_guard:
@@ -3897,7 +4287,14 @@ class RealDataNHLModel:
             est_full.fit(X_sorted, y_sorted)
             final_models[name] = est_full
 
-        final_poisson, final_nb_params, final_gp = _fit_poisson_components(X_full_scaled, y_sorted)
+        y_sorted_for_poisson = y_sorted
+        if is_edge_mode and lines_sorted is not None:
+            try:
+                ls = pd.to_numeric(lines_sorted, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+                y_sorted_for_poisson = pd.Series(y_sorted.values + ls, index=y_sorted.index)
+            except Exception:
+                y_sorted_for_poisson = y_sorted
+        final_poisson, final_nb_params, final_gp = _fit_poisson_components(X_full_scaled, y_sorted_for_poisson)
 
         self.locked_feature_pipeline = final_pipeline
 
@@ -3910,6 +4307,8 @@ class RealDataNHLModel:
             'poisson_model': final_poisson,
             'nb_params': final_nb_params,
             'gp_model': final_gp,
+            'target_mode': 'edge' if is_edge_mode else 'total',
+            'market_line_col': getattr(self, 'market_line_col', None),
             'cv_strategy_used': cv_label,
             'train_speed_profile': speed_profile,
             'train_sample_cap': applied_sample_cap,
@@ -3935,6 +4334,10 @@ class RealDataNHLModel:
             'test_size': len(X_test),
             'features_used': len(self.feature_names),
             'residual_std': residual_std,
+            'target_mode': 'edge' if is_edge_mode else 'total',
+            'market_line_col': getattr(self, 'market_line_col', None),
+            'rmse_edge': rmse_edge,
+            'mae_edge': mae_edge,
             'brier': brier,
             'logloss': logloss,
             'cv_strategy': cv_label,
@@ -3946,6 +4349,8 @@ class RealDataNHLModel:
             'consensus_guard_accuracy': self.consensus_guard_accuracy,
             'consensus_guard_support': self.consensus_guard_support
         }
+        if backtest:
+            training_summary['market_backtest'] = backtest
         model_state['training_results'] = training_summary
         model_state['trained_at'] = datetime.utcnow().isoformat()
         self.total_model = model_state
@@ -4065,6 +4470,14 @@ class RealDataNHLModel:
         consensus_std_val = float(np.std(preds_arr)) if len(preds_arr) > 1 else 0.0
         consensus_range_val = float(np.max(preds_arr) - np.min(preds_arr)) if len(preds_arr) else 0.0
 
+        target_mode = str(self.total_model.get('target_mode') or 'total').strip().lower()
+        is_edge_mode = target_mode == 'edge'
+        # If training target is edge, convert to a total by adding the market line.
+        if is_edge_mode:
+            predicted_total = float(betting_line) + float(ensemble_pred)
+        else:
+            predicted_total = float(ensemble_pred)
+
         # Poisson expected total
         poisson_model = self.total_model.get('poisson_model')
         poisson_mu = None
@@ -4074,14 +4487,12 @@ class RealDataNHLModel:
             except Exception:
                 poisson_mu = None
 
-        # Blend predictions conservatively if Poisson available
+        # Blend predictions conservatively if Poisson available (blend in TOTAL space).
         if poisson_mu is not None:
-            predicted_total = 0.6 * ensemble_pred + 0.4 * poisson_mu
-        else:
-            predicted_total = ensemble_pred
+            predicted_total = float(0.6 * predicted_total + 0.4 * poisson_mu)
         if hm_flow is not None and am_flow is not None:
             flow_total = hm_flow + am_flow
-            ref_total = poisson_mu if poisson_mu is not None else ensemble_pred
+            ref_total = poisson_mu if poisson_mu is not None else predicted_total
             predicted_total = float(0.5 * predicted_total + 0.3 * flow_total + 0.2 * ref_total)
         
         if ref_goal_value is not None:
@@ -8921,6 +9332,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         )
         model.hydrate_training_context(**context_kwargs)
 
+        # Optional: build canonical closing lines table from odds_history snapshots and exit.
+        if cli_args and getattr(cli_args, 'build_closing_lines', False):
+            out_path = getattr(cli_args, 'closing_lines_path', None) or os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv')
+            src_path = getattr(cli_args, 'odds_history_path', None) or os.getenv('ODDS_HISTORY_PATH', 'odds_history.csv')
+            RealDataNHLModel.build_closing_lines_from_odds_history(
+                odds_history_path=str(src_path),
+                output_path=str(out_path)
+            )
+            return model, [], None
+
         if cli_args and getattr(cli_args, 'refresh_moneypuck', False):
             print("\n🧰 Refreshing MoneyPuck data before loading rate tables...")
             try:
@@ -9027,10 +9448,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         try:
             closing_path = getattr(cli_args, 'closing_odds_path', None) if cli_args else os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json')
             odds_hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else 'odds_history.csv'
+            closing_lines_path = getattr(cli_args, 'closing_lines_path', None) if cli_args else os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv')
             historical_data = model.attach_historical_market_odds(
                 historical_data,
                 closing_odds_path=closing_path,
-                odds_history_path=odds_hist_path
+                odds_history_path=odds_hist_path,
+                closing_lines_path=closing_lines_path
             )
             try:
                 have_close = int(pd.to_numeric(historical_data.get('closing_total'), errors='coerce').notna().sum()) if 'closing_total' in historical_data.columns else 0
@@ -9072,6 +9495,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         
         print("\n🔧 Step 2: Engineering features...")
         enhanced_data = model.create_enhanced_features(historical_data)
+        # Configure training target mode (auto|total|edge). Auto uses edge when enough market lines exist.
+        try:
+            model.train_target_mode = getattr(cli_args, 'train_target', None) if cli_args else None
+        except Exception:
+            pass
         X, y, dates = model.prepare_model_data(enhanced_data)
         
         print(f"✅ Created {len(model.feature_names)} features from {len(X)} games")
@@ -10470,6 +10898,7 @@ if __name__ == "__main__":
         default_train_speed = 'balanced'
     parser.add_argument('--train-speed', choices=['fast','balanced','full'], default=default_train_speed, help='Training speed preset: fast trims CV + samples, balanced is default, full matches legacy exhaustive search')
     parser.add_argument('--fast-train', action='store_true', help='Shortcut for --train-speed fast')
+    parser.add_argument('--train-target', choices=['auto','total','edge'], default=str(os.getenv('TRAIN_TARGET', 'auto')).strip().lower(), help='Training target: auto (prefer edge vs closing lines when available), total (predict total goals), edge (predict total_goals - closing_total)')
     parser.add_argument('--max-train-samples', type=int, default=int(os.getenv('MAX_TRAIN_SAMPLES', '0')), help='Cap how many historical games are used for training (0 = no cap)')
     parser.add_argument('--model-path', type=str, default=os.getenv('TRAINED_MODEL_PATH', 'data/cache/trained_model.joblib'), help='Path to persist/load the trained ensemble artifact')
     parser.add_argument('--save-trained-model', action='store_true', help='Persist the trained ensemble to --model-path after fitting')
@@ -10487,6 +10916,8 @@ if __name__ == "__main__":
     parser.add_argument('--log-odds-history', action='store_true', help='Append odds snapshots to odds_history.csv')
     parser.add_argument('--log-odds', dest='log_odds_history', action='store_true', help='Alias for --log-odds-history')
     parser.add_argument('--odds-history-path', type=str, default='odds_history.csv', help='Path to odds history CSV')
+    parser.add_argument('--build-closing-lines', action='store_true', help='Build data/history/closing_lines.csv from --odds-history-path and exit')
+    parser.add_argument('--closing-lines-path', type=str, default=os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv'), help='Output path for canonical closing lines CSV')
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
     parser.add_argument('--xg-baseline-total', type=float, default=float(os.getenv('XG_BASELINE_TOTAL', 6.2)), help='xG baseline total used to compute adjustments')
     parser.add_argument('--xg-clamp-abs', type=float, default=float(os.getenv('XG_CLAMP_ABS', 2.0)), help='Absolute clamp for xG total adjustment')
