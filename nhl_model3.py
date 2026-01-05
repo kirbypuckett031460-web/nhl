@@ -631,6 +631,13 @@ class RealDataNHLModel:
         self.referee_rates_snapshot: Optional[pd.DataFrame] = None
         self.lineup_strength_snapshot: Optional[Dict[str, float]] = None
         self.environment_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
+        # Snapshot enrichment policy:
+        # - Default: only enrich rows without final totals (i.e., today's games / future rows).
+        # - Set ENRICH_HIST_WITH_SNAPSHOTS=1 to enrich all rows (not recommended for backtests).
+        self.enrich_hist_with_snapshots: bool = str(os.getenv('ENRICH_HIST_WITH_SNAPSHOTS', '')).strip().lower() in TRUTHY_FLAGS
+        # Optional training-time market line support (when historical rows include a line/closing total)
+        self.market_line_col: Optional[str] = None
+        self.market_lines: Optional[pd.Series] = None
         self.historical_cache_metadata: Dict[str, Any] = {}
         profile = str(os.getenv('TRAIN_SPEED', 'balanced')).strip().lower()
         if profile not in TRAIN_SPEED_PRESETS:
@@ -1903,14 +1910,8 @@ class RealDataNHLModel:
         pace_std = lagged_pace.expanding(min_periods=5).std().replace(0.0, np.nan)
         features['pace_zscore'] = ((lagged_pace - pace_mean) / pace_std).fillna(0.0)
 
-        # Opponent-adjusted strength-of-schedule approximation using Elo and opponent rates
-        try:
-            opp_strength = []
-            for _, row in features[['home_team','away_team','home_elo','away_elo']].iterrows():
-                opp_strength.append(0.5 * float(row['home_elo']) + 0.5 * float(row['away_elo']))
-            features['sos_elo'] = pd.Series(opp_strength, index=features.index).fillna(1500.0)
-        except Exception:
-            features['sos_elo'] = 1500.0
+        # Opponent-adjusted strength-of-schedule approximation (initialized here; computed after Elo below).
+        features['sos_elo'] = 1500.0
         
         # Venue effects (leak-free: shift then expanding mean)
         features['venue_total_avg'] = (
@@ -2311,57 +2312,34 @@ class RealDataNHLModel:
             features['home_elo'] = pd.Series(home_elos, index=features.index)
             features['away_elo'] = pd.Series(away_elos, index=features.index)
             features['elo_diff'] = features['home_elo'] - features['away_elo']
+            # Now that Elo exists for each row, compute a simple SOS proxy.
+            features['sos_elo'] = (0.5 * features['home_elo'] + 0.5 * features['away_elo']).fillna(1500.0)
         except Exception:
             features['home_elo'] = 0.0
             features['away_elo'] = 0.0
             features['elo_diff'] = 0.0
+            features['sos_elo'] = 1500.0
 
-        # True strength-of-schedule (opponent-adjusted) via simple least-squares team O/D ratings
-        try:
-            # Build equations: for each game, model goals_for ~ off(team) - def(opp) + H
-            # We'll estimate combined rating r_team = off(team) - def(team) for tractability
-            teams = pd.Index(sorted(set(features['home_team'].astype(str)) | set(features['away_team'].astype(str))))
-            team_to_idx = {t: i for i, t in enumerate(teams)}
-            rows_A = []
-            rows_b = []
-            for _, row in features[['home_team','away_team','home_goals','away_goals']].iterrows():
-                ht = str(row['home_team']); at = str(row['away_team'])
-                if pd.notna(row['home_goals']):
-                    a = np.zeros(len(teams)); a[team_to_idx[ht]] = 1.0; a[team_to_idx[at]] = -1.0
-                    rows_A.append(a); rows_b.append(float(row['home_goals']))
-                if pd.notna(row['away_goals']):
-                    a = np.zeros(len(teams)); a[team_to_idx[at]] = 1.0; a[team_to_idx[ht]] = -1.0
-                    rows_A.append(a); rows_b.append(float(row['away_goals']))
-            if len(rows_A) >= len(teams):
-                A = np.vstack(rows_A)
-                b = np.array(rows_b)
-                # ridge regularization for stability
-                lam = 0.1
-                ATA = A.T @ A + lam * np.eye(A.shape[1])
-                ATb = A.T @ b
-                r = np.linalg.solve(ATA, ATb)
-                ratings = {t: float(r[team_to_idx[t]]) for t in teams}
-                features['home_sos_true'] = features['home_team'].map(ratings).astype(float).fillna(0.0)
-                features['away_sos_true'] = features['away_team'].map(ratings).astype(float).fillna(0.0)
-                features['sos_true_diff'] = features['home_sos_true'] - features['away_sos_true']
-            else:
-                features['home_sos_true'] = 0.0
-                features['away_sos_true'] = 0.0
-                features['sos_true_diff'] = 0.0
-        except Exception:
-            features['home_sos_true'] = 0.0
-            features['away_sos_true'] = 0.0
-            features['sos_true_diff'] = 0.0
+        # NOTE: We intentionally DO NOT compute "true SOS" via a global least-squares fit here.
+        # That approach leaks future results into earlier rows (because it uses the full dataset).
+        # Keep placeholders at 0.0 so the model doesn't learn a leaky signal.
+        features['home_sos_true'] = 0.0
+        features['away_sos_true'] = 0.0
+        features['sos_true_diff'] = 0.0
         
         # Fill NaNs
         numeric_cols = features.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             if features[col].isna().any():
+                # Never impute actual outcomes. Keeping NaN prevents non-final games from entering training.
+                if col in ('home_goals', 'away_goals', 'total_goals'):
+                    continue
                 if 'goals' in col.lower() or 'total' in col.lower():
                     features[col] = features[col].fillna(6.2)
                 else:
                     features[col] = features[col].fillna(0.0)
         
+        # Enrich only rows without final totals by default (i.e., today's games / future rows).
         features = self._merge_context_snapshots(features)
         return features
 
@@ -2370,6 +2348,16 @@ class RealDataNHLModel:
         if not isinstance(features, pd.DataFrame) or features.empty:
             return features
         df = features
+
+        # Default: only apply snapshot-derived enrichment to rows without a known final total.
+        # This prevents "painting" historical rows with today's MoneyPuck/goalie/ref snapshots.
+        if self.enrich_hist_with_snapshots:
+            apply_mask = pd.Series(True, index=df.index)
+        else:
+            if 'total_goals' in df.columns:
+                apply_mask = pd.to_numeric(df['total_goals'], errors='coerce').isna()
+            else:
+                apply_mask = pd.Series(True, index=df.index)
 
         # Team-level advanced rates (MoneyPuck) to backfill proxies
         if isinstance(self.team_rates_snapshot, pd.DataFrame) and 'team' in self.team_rates_snapshot.columns:
@@ -2388,7 +2376,8 @@ class RealDataNHLModel:
                     team_col = 'home_team' if col.startswith('home_') else 'away_team'
                     if col not in df.columns:
                         df[col] = np.nan
-                    df[col] = df[col].fillna(df[team_col].map(tr[metric]))
+                    if apply_mask.any():
+                        df.loc[apply_mask, col] = df.loc[apply_mask, col].fillna(df.loc[apply_mask, team_col].map(tr[metric]))
 
         # Penalty rates snapshot -> aggregate per matchup
         if isinstance(self.penalty_rates_snapshot, pd.DataFrame) and 'team' in self.penalty_rates_snapshot.columns:
@@ -2411,7 +2400,8 @@ class RealDataNHLModel:
                     if metric not in df.columns:
                         df[metric] = series
                     else:
-                        df[metric] = df[metric].fillna(series)
+                        if apply_mask.any():
+                            df.loc[apply_mask, metric] = df.loc[apply_mask, metric].fillna(series.loc[apply_mask])
 
         # Goalie snapshots: fill team-level GSAx/probability placeholders
         if isinstance(self.goalie_rates_snapshot, pd.DataFrame) and {'team', 'gsax_rolling'}.issubset(self.goalie_rates_snapshot.columns):
@@ -2425,13 +2415,15 @@ class RealDataNHLModel:
                 if gsax_col not in df.columns:
                     df[gsax_col] = fallback_gsax
                 else:
-                    df[gsax_col] = df[gsax_col].replace(0.0, np.nan).fillna(fallback_gsax)
+                    if apply_mask.any():
+                        df.loc[apply_mask, gsax_col] = df.loc[apply_mask, gsax_col].replace(0.0, np.nan).fillna(fallback_gsax.loc[apply_mask])
                 if team_prob is not None:
                     fallback_prob = df[team_col].map(team_prob).fillna(0.6)
                     if prob_col not in df.columns:
                         df[prob_col] = fallback_prob
                     else:
-                        df[prob_col] = df[prob_col].replace(0.0, np.nan).fillna(fallback_prob)
+                        if apply_mask.any():
+                            df.loc[apply_mask, prob_col] = df.loc[apply_mask, prob_col].replace(0.0, np.nan).fillna(fallback_prob.loc[apply_mask])
 
         # Referee snapshot -> baseline scoring tendency
         if isinstance(self.referee_rates_snapshot, pd.DataFrame):
@@ -2441,7 +2433,8 @@ class RealDataNHLModel:
                 if 'ref_goals_gm' not in df.columns:
                     df['ref_goals_gm'] = baseline
                 else:
-                    df['ref_goals_gm'] = df['ref_goals_gm'].fillna(baseline)
+                    if apply_mask.any():
+                        df.loc[apply_mask, 'ref_goals_gm'] = df.loc[apply_mask, 'ref_goals_gm'].fillna(baseline)
 
         # Lineup strength snapshot
         if isinstance(self.lineup_strength_snapshot, dict) and self.lineup_strength_snapshot:
@@ -2451,7 +2444,8 @@ class RealDataNHLModel:
                 if col not in df.columns:
                     df[col] = series
                 else:
-                    df[col] = df[col].fillna(series)
+                    if apply_mask.any():
+                        df.loc[apply_mask, col] = df.loc[apply_mask, col].fillna(series.loc[apply_mask])
 
         # Environment snapshot (outdoor/weather)
         if isinstance(self.environment_snapshot, dict) and self.environment_snapshot:
@@ -2483,7 +2477,8 @@ class RealDataNHLModel:
                     if dest not in df.columns:
                         df[dest] = series
                     else:
-                        df[dest] = df[dest].fillna(series)
+                        if apply_mask.any():
+                            df.loc[apply_mask, dest] = df.loc[apply_mask, dest].fillna(series.loc[apply_mask])
 
         return df
 
@@ -3109,7 +3104,7 @@ class RealDataNHLModel:
             'home_b2b', 'away_b2b', 'season_progress', 'late_season', 'rest_diff', 'schedule_density_diff',
             'base_total_prediction', 'total_adjustments', 'final_prediction_base', 'travel_fatigue_index',
             'timezone_diff', 'travel_penalty', 'home_elo', 'away_elo', 'elo_diff',
-            'sos_elo', 'home_sos_true', 'away_sos_true', 'sos_true_diff',
+            'sos_elo',
             'home_3in4','away_3in4','home_4in6','away_4in6',
             'home_home_streak','away_home_streak','home_road_trip_len','away_road_trip_len',
             'hour_local','is_weekend','is_early','is_late','travel_direction_ew',
@@ -3153,6 +3148,22 @@ class RealDataNHLModel:
         X = X[mask]
         y = y[mask]
         dates = dates[mask]
+
+        # Optional: capture a per-game "market line" series when present in the input frame.
+        # This is used for more realistic O/U evaluation and probability calibration.
+        self.market_line_col = None
+        self.market_lines = None
+        for candidate in ('closing_total', 'consensus_total', 'line'):
+            if candidate in df.columns:
+                self.market_line_col = candidate
+                break
+        if self.market_line_col:
+            try:
+                lines = pd.to_numeric(df[self.market_line_col], errors='coerce')
+                lines = lines[mask]
+                self.market_lines = lines.copy()
+            except Exception:
+                self.market_lines = None
         
         self.feature_names = available_features
         # Capture per-feature baselines for inference-time fallback
@@ -3203,6 +3214,14 @@ class RealDataNHLModel:
         speed_cfg = TRAIN_SPEED_PRESETS[speed_profile]
         self.skip_goal_model_training = bool(speed_cfg.get('skip_goal_models', False))
         print(f"⏱️ Training preset: {speed_cfg.get('label', speed_profile.title())}")
+        # Optional market lines (must align with X/y order)
+        lines_all: Optional[pd.Series] = None
+        try:
+            candidate_lines = getattr(self, 'market_lines', None)
+            if candidate_lines is not None and len(candidate_lines) == len(X):
+                lines_all = candidate_lines
+        except Exception:
+            lines_all = None
         # Optional sample cap for faster presets
         original_len = len(X)
         sample_cap = self.max_train_samples
@@ -3221,6 +3240,14 @@ class RealDataNHLModel:
                     dates = dates.iloc[idx].reset_index(drop=True)
                 else:
                     dates = dates.iloc[-len(X):].reset_index(drop=True)
+            if lines_all is not None:
+                try:
+                    if len(lines_all) == original_len:
+                        lines_all = lines_all.iloc[idx].reset_index(drop=True)
+                    else:
+                        lines_all = lines_all.iloc[-len(X):].reset_index(drop=True)
+                except Exception:
+                    lines_all = None
             applied_sample_cap = sample_cap
         
         if len(X) < 20:
@@ -3231,14 +3258,24 @@ class RealDataNHLModel:
             ordered_indices = dates.sort_values().index
             X_sorted = X.loc[ordered_indices].reset_index(drop=True)
             y_sorted = y.loc[ordered_indices].reset_index(drop=True)
+            if lines_all is not None and len(lines_all) == len(X):
+                try:
+                    lines_sorted = lines_all.loc[ordered_indices].reset_index(drop=True)
+                except Exception:
+                    lines_sorted = None
+            else:
+                lines_sorted = None
         else:
             X_sorted = X.reset_index(drop=True)
             y_sorted = y.reset_index(drop=True)
+            lines_sorted = lines_all.reset_index(drop=True) if lines_all is not None and len(lines_all) == len(X) else None
         split_index = max(1, min(len(X_sorted) - 1, int(len(X_sorted) * 0.75)))
         X_train = X_sorted.iloc[:split_index].reset_index(drop=True)
         y_train = y_sorted.iloc[:split_index].reset_index(drop=True)
         X_test = X_sorted.iloc[split_index:].reset_index(drop=True)
         y_test = y_sorted.iloc[split_index:].reset_index(drop=True)
+        lines_train = lines_sorted.iloc[:split_index].reset_index(drop=True) if lines_sorted is not None else None
+        lines_test = lines_sorted.iloc[split_index:].reset_index(drop=True) if lines_sorted is not None else None
         
         # Feature pipeline for scaled modeling during validation
         eval_feature_pipeline = self._build_feature_pipeline()
@@ -3547,36 +3584,100 @@ class RealDataNHLModel:
             self.conformal_q90 = 1.0
             self.conformal_radius = self.conformal_q90
         
-        # Over/under accuracy (using average line of 6.5)
-        test_lines = np.full(len(y_test), 6.5)
+        # Over/under accuracy (prefer per-game market line when available)
+        default_line = 6.5
+        try:
+            default_line = float(os.getenv('DEFAULT_TOTAL_LINE', '6.5'))
+        except Exception:
+            default_line = 6.5
+        try:
+            train_mean = float(y_train.mean())
+            if np.isfinite(train_mean) and train_mean > 0:
+                # Round to nearest half-goal to mimic market totals
+                default_line = float(round(train_mean * 2.0) / 2.0)
+        except Exception:
+            pass
+        if lines_test is not None:
+            test_lines = pd.to_numeric(lines_test, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+        else:
+            test_lines = np.full(len(y_test), default_line, dtype=float)
         actual_over = (y_test.values > test_lines).astype(int)
         predicted_over = (ensemble_pred > test_lines).astype(int)
         ou_accuracy = (actual_over == predicted_over).mean()
 
-        # Quick probability calibration check (Gaussian proxy with residual_std)
+        # Probability calibration check (Gaussian proxy with residual_std) using per-game lines
         try:
             std_dev = residual_std if residual_std > 0 else 0.85
             raw_over_prob = norm.sf(test_lines, loc=ensemble_pred, scale=std_dev)
-            # Brier score (lower is better)
-            brier = float(brier_score_loss(actual_over, raw_over_prob))
-            # Log loss (guard against 0/1 probs)
             eps = 1e-6
-            logloss = float(log_loss(actual_over, np.clip(raw_over_prob, eps, 1-eps)))
+        except Exception:
+            raw_over_prob = None
+            eps = 1e-6
+
+        # Fit isotonic calibration mapping from raw over-prob proxies (Gaussian) to outcomes.
+        # IMPORTANT: Fit on walk-forward OOF predictions from the TRAIN split (not the test split),
+        # to avoid leaking test outcomes into the calibration mapping.
+        iso_over_model: Optional[IsotonicRegression] = None
+        try:
+            if len(X_train) >= 30:
+                # Determine training lines (market line if available, else default)
+                if lines_train is not None:
+                    tr_lines = pd.to_numeric(lines_train, errors='coerce').fillna(default_line).to_numpy(dtype=float)
+                else:
+                    tr_lines = np.full(len(y_train), default_line, dtype=float)
+                n_splits_iso = min(5, max(3, len(X_train) // 50))
+                n_splits_iso = max(2, min(n_splits_iso, len(X_train) - 1))
+                tscv_iso = TimeSeriesSplit(n_splits=n_splits_iso)
+                oof_pred = np.full(len(X_train), np.nan, dtype=float)
+                for tr_idx, val_idx in tscv_iso.split(X_train):
+                    X_tr = X_train.iloc[tr_idx]
+                    y_tr = y_train.iloc[tr_idx]
+                    X_val = X_train.iloc[val_idx]
+                    fold_preds = []
+                    for name in model_order:
+                        est = models.get(name)
+                        if est is None:
+                            fold_preds.append(np.zeros(len(X_val), dtype=float))
+                            continue
+                        est_fold = clone(est)
+                        try:
+                            est_fold.fit(X_tr, y_tr)
+                            fold_preds.append(np.asarray(est_fold.predict(X_val), dtype=float))
+                        except Exception:
+                            fold_preds.append(np.zeros(len(X_val), dtype=float))
+                    fold_stack = np.vstack(fold_preds)
+                    fold_ens = (weights_array.reshape(-1, 1) * fold_stack).sum(axis=0)
+                    oof_pred[val_idx] = fold_ens
+                valid = np.isfinite(oof_pred)
+                if valid.any():
+                    oof_resid = y_train.values[valid] - oof_pred[valid]
+                    oof_std = float(np.std(oof_resid)) if len(oof_resid) > 1 else residual_std
+                    oof_std = oof_std if (np.isfinite(oof_std) and oof_std > 1e-6) else (residual_std if residual_std > 1e-6 else 0.85)
+                    raw_oof_prob = norm.sf(tr_lines[valid], loc=oof_pred[valid], scale=oof_std)
+                    oof_over = (y_train.values[valid] > tr_lines[valid]).astype(int)
+                    iso = IsotonicRegression(out_of_bounds='clip')
+                    iso.fit(raw_oof_prob, oof_over)
+                    iso_over_model = iso
+        except Exception:
+            iso_over_model = None
+
+        # Score calibration metrics using calibrated probabilities when available.
+        brier = None
+        logloss = None
+        try:
+            if raw_over_prob is not None:
+                probs_eval = raw_over_prob
+                if iso_over_model is not None:
+                    try:
+                        probs_eval = iso_over_model.transform(probs_eval)
+                    except Exception:
+                        probs_eval = raw_over_prob
+                probs_eval = np.clip(np.asarray(probs_eval, dtype=float), eps, 1.0 - eps)
+                brier = float(brier_score_loss(actual_over, probs_eval))
+                logloss = float(log_loss(actual_over, probs_eval))
         except Exception:
             brier = None
             logloss = None
-
-        # Fit isotonic calibration mapping from raw over-prob proxies (Gaussian) to outcomes
-        iso_over_model: Optional[IsotonicRegression] = None
-        try:
-            # Proxy over-prob using Gaussian on test set for calibration only
-            std_dev = residual_std if residual_std > 0 else 0.85
-            raw_over_prob = norm.sf(test_lines, loc=ensemble_pred, scale=std_dev)
-            iso = IsotonicRegression(out_of_bounds='clip')
-            iso.fit(raw_over_prob, actual_over)
-            iso_over_model = iso
-        except Exception:
-            iso_over_model = None
 
         precision_guard = self._calibrate_precision_guard(
             ensemble_pred=np.asarray(ensemble_pred, dtype=float),
@@ -6117,7 +6218,8 @@ class RealDataNHLModel:
                         'home_team': g.get('home_team', 'HOME'),
                         'away_team': g.get('away_team', 'AWAY'),
                         'venue': g.get('venue', f"{g.get('home_team','HOME')} Arena"),
-                        'home_goals': 0, 'away_goals': 0, 'total_goals': 0
+                        # Unknown pre-game outcomes should remain NaN (prevents training leakage).
+                        'home_goals': np.nan, 'away_goals': np.nan, 'total_goals': np.nan
                     })
                 print(f"✅ Loaded {len(rows)} offline games from {offline_path}")
                 return pd.DataFrame(rows)
@@ -6170,9 +6272,10 @@ class RealDataNHLModel:
                             'home_team': home_team['abbreviation'],
                             'away_team': away_team['abbreviation'],
                             'venue': game.get('venue', {}).get('name', f"{home_team['abbreviation']} Arena"),
-                            'home_goals': 0,
-                            'away_goals': 0,
-                            'total_goals': 0
+                            # Unknown pre-game outcomes should remain NaN (prevents training leakage).
+                            'home_goals': np.nan,
+                            'away_goals': np.nan,
+                            'total_goals': np.nan
                         }
                         todays_games.append(game_data)
                         kept += 1
@@ -6195,7 +6298,8 @@ class RealDataNHLModel:
                         'home_team': g.get('home_team', 'HOME'),
                         'away_team': g.get('away_team', 'AWAY'),
                         'venue': g.get('venue', f"{g.get('home_team','HOME')} Arena"),
-                        'home_goals': 0, 'away_goals': 0, 'total_goals': 0
+                        # Unknown pre-game outcomes should remain NaN (prevents training leakage).
+                        'home_goals': np.nan, 'away_goals': np.nan, 'total_goals': np.nan
                     })
                 if todays_games:
                     print(f"✅ Loaded {len(todays_games)} offline games from {offline_path}")
@@ -6216,9 +6320,10 @@ class RealDataNHLModel:
                     'home_team': home,
                     'away_team': away,
                     'venue': f'{home} Arena',
-                    'home_goals': 0,
-                    'away_goals': 0,
-                    'total_goals': 0
+                    # Unknown pre-game outcomes should remain NaN (prevents training leakage).
+                    'home_goals': np.nan,
+                    'away_goals': np.nan,
+                    'total_goals': np.nan
                 })
         
         print(f"✅ Prepared {len(todays_games)} games for prediction")
@@ -10156,7 +10261,8 @@ if __name__ == "__main__":
     parser.add_argument('--post-social', action='store_true', help='Enable social media posting')
     parser.add_argument('--date', type=str, default=None, help='ISO date YYYY-MM-DD for which to fetch/predict games (default: today)')
     parser.add_argument('--today-games-path', type=str, default=None, help='Path to offline today games JSON to bypass API')
-    parser.add_argument('--historical-days', type=int, default=int(os.getenv('HISTORICAL_DAYS', '90')), help='How many days of history to pull for training data')
+    # 90 days is usually too little for stable totals modeling; default to one season-ish.
+    parser.add_argument('--historical-days', type=int, default=int(os.getenv('HISTORICAL_DAYS', '365')), help='How many days of history to pull for training data')
     parser.add_argument('--historical-cache-path', type=str, default=os.getenv('HISTORICAL_CACHE_PATH', 'data/history/historical_games.csv'), help='CSV cache for historical games')
     parser.add_argument('--historical-cache-refresh', action='store_true', help='Force refresh of historical cache even if it exists')
     default_train_speed = str(os.getenv('TRAIN_SPEED', 'balanced')).strip().lower()
