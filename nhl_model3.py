@@ -2713,6 +2713,120 @@ class RealDataNHLModel:
         df['closing_source'] = df['closing_source'].astype(str).fillna('')
         return df
 
+    def attach_status_history(self, features_df: pd.DataFrame, status_history_path: Optional[str]) -> pd.DataFrame:
+        """Attach time-aligned goalie/injury adjustments for training from a status history CSV.
+
+        Expected CSV columns (flexible; best-effort mapping):
+        - game_id (optional)
+        - date (YYYY-MM-DD or timestamp) (optional; used with matchup)
+        - matchup (AWAY@HOME) (optional; used with date)
+        - home_goalie_adj, away_goalie_adj, injury_penalty_adj (optional)
+        - home_goalie_gsax, away_goalie_gsax (optional)
+        - home_goalie_prob, away_goalie_prob (optional)
+
+        Values are assumed to be known pre-game (no leakage protection enforced here).
+        """
+        if features_df is None or not isinstance(features_df, pd.DataFrame) or features_df.empty:
+            return features_df
+        if not status_history_path:
+            return features_df
+        resolved = resolve_local_read_path(status_history_path) or os.path.abspath(str(status_history_path))
+        if not resolved or not os.path.exists(resolved):
+            return features_df
+        try:
+            hist = pd.read_csv(resolved)
+        except Exception as e:
+            print(f"⚠️  Failed to read status history {resolved}: {e}")
+            return features_df
+        if hist is None or hist.empty:
+            return features_df
+
+        df = features_df.copy()
+        hist = hist.copy()
+
+        # Normalize IDs + matchup keys
+        if 'game_id' in df.columns:
+            df['game_id'] = df['game_id'].astype(str)
+        if 'game_id' in hist.columns:
+            hist['game_id'] = hist['game_id'].astype(str)
+
+        if 'matchup' not in df.columns and {'home_team', 'away_team'}.issubset(df.columns):
+            df['matchup'] = df['away_team'].astype(str).str.upper() + '@' + df['home_team'].astype(str).str.upper()
+        if 'matchup' in hist.columns:
+            hist['matchup'] = hist['matchup'].astype(str).str.upper().str.strip()
+
+        # Normalize dates to date_only for join
+        if 'date' in df.columns:
+            df['date_only'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+        else:
+            df['date_only'] = pd.NaT
+        if 'date' in hist.columns:
+            hist['date_only'] = pd.to_datetime(hist['date'], errors='coerce').dt.date
+        else:
+            hist['date_only'] = pd.NaT
+
+        # Column mapping
+        col_map = {
+            'home_goalie_adj': ['home_goalie_adj', 'hg_adj', 'home_adj'],
+            'away_goalie_adj': ['away_goalie_adj', 'ag_adj', 'away_adj'],
+            'injury_penalty_adj': ['injury_penalty_adj', 'inj_adj', 'injury_adj'],
+            'home_goalie_gsax': ['home_goalie_gsax', 'hg_gsax', 'home_gsax'],
+            'away_goalie_gsax': ['away_goalie_gsax', 'ag_gsax', 'away_gsax'],
+            'home_goalie_prob': ['home_goalie_prob', 'hg_prob', 'home_prob'],
+            'away_goalie_prob': ['away_goalie_prob', 'ag_prob', 'away_prob'],
+        }
+        for target, aliases in col_map.items():
+            if target in hist.columns:
+                continue
+            for alt in aliases:
+                if alt in hist.columns:
+                    hist = hist.rename(columns={alt: target})
+                    break
+
+        attach_cols = [c for c in col_map.keys() if c in hist.columns]
+        if not attach_cols:
+            return df
+
+        # Coerce numeric
+        for c in attach_cols:
+            hist[c] = pd.to_numeric(hist[c], errors='coerce')
+
+        # Join priority: game_id, else (matchup,date_only)
+        merged = None
+        try:
+            if 'game_id' in hist.columns and 'game_id' in df.columns and hist['game_id'].notna().any():
+                subset = hist[['game_id'] + attach_cols].dropna(subset=['game_id'])
+                merged = df.merge(subset, on='game_id', how='left', suffixes=('', '_hist'))
+            elif 'matchup' in hist.columns and hist['matchup'].notna().any():
+                subset = hist[['matchup', 'date_only'] + attach_cols].dropna(subset=['matchup'])
+                merged = df.merge(subset, on=['matchup', 'date_only'], how='left', suffixes=('', '_hist'))
+        except Exception:
+            merged = None
+        if merged is None:
+            return df
+
+        # Fill features (prefer existing non-zero/non-null)
+        for c in attach_cols:
+            src = c if c in df.columns else None
+            hist_c = c if c in merged.columns else None
+            if hist_c is None:
+                continue
+            if src is None:
+                merged[c] = merged[hist_c]
+                continue
+            try:
+                base = pd.to_numeric(merged[src], errors='coerce')
+                incoming = pd.to_numeric(merged[hist_c], errors='coerce')
+                # if base is 0.0 (placeholder) or NaN, fill from incoming
+                mask = base.isna() | np.isclose(base.fillna(0.0), 0.0, atol=1e-12)
+                merged.loc[mask, src] = incoming.loc[mask]
+            except Exception:
+                pass
+
+        # Cleanup
+        merged.drop(columns=[c for c in ('date_only',) if c in merged.columns], inplace=True, errors='ignore')
+        return merged
+
     @staticmethod
     def build_closing_lines_from_odds_history(
         odds_history_path: str = 'odds_history.csv',
@@ -4154,23 +4268,57 @@ class RealDataNHLModel:
         except Exception:
             backtest = {}
 
-        # Probability calibration check (Gaussian proxy with residual_std) using per-game lines
+        # Probability engine for O/U: prefer NB/Poisson (not Gaussian residual proxy).
+        def _total_over_prob(mu: float, line_value: float, nb_k: Optional[float]) -> float:
+            try:
+                mu_f = float(mu)
+                if not np.isfinite(mu_f) or mu_f <= 0:
+                    return 0.0
+                lv = float(line_value)
+                is_integer = abs(lv - round(lv)) < 1e-9
+                if nb_k is not None and np.isfinite(nb_k) and float(nb_k) > 0:
+                    k = float(nb_k)
+                    # Negative binomial parameterization: mean=mu, size=k, p=k/(k+mu)
+                    p = k / (k + mu_f)
+                    if is_integer:
+                        L = int(round(lv))
+                        # P(total > L) = 1 - CDF(L)
+                        return float(1.0 - nbinom.cdf(L, k, p))
+                    # For half-lines, "over" means >= ceil(line) == floor(line)+1 -> P(total > floor(line))
+                    L = int(np.floor(lv))
+                    return float(1.0 - nbinom.cdf(L, k, p))
+                # Poisson fallback
+                if is_integer:
+                    L = int(round(lv))
+                    return float(1.0 - poisson.cdf(L, mu_f))
+                L = int(np.floor(lv))
+                return float(1.0 - poisson.cdf(L, mu_f))
+            except Exception:
+                return 0.5
+
         try:
-            std_dev = residual_std if residual_std > 0 else 0.85
+            nb_k_eval = None
+            try:
+                nb = nb_params if isinstance(nb_params, dict) else None
+                if nb and isinstance(nb.get('k'), (int, float)) and float(nb.get('k')) > 0:
+                    nb_k_eval = float(nb.get('k'))
+            except Exception:
+                nb_k_eval = None
             if is_edge_mode:
-                # P(total > line) == P(edge > 0)
-                raw_over_prob = norm.sf(0.0, loc=pred_edge_test, scale=std_dev)
+                mu_eval = np.asarray(pred_total_test, dtype=float)
             else:
-                raw_over_prob = norm.sf(test_lines, loc=ensemble_pred, scale=std_dev)
+                mu_eval = np.asarray(ensemble_pred, dtype=float)
+            raw_over_prob = np.array([_total_over_prob(m, l, nb_k_eval) for m, l in zip(mu_eval, test_lines)], dtype=float)
             eps = 1e-6
         except Exception:
             raw_over_prob = None
             eps = 1e-6
 
-        # Fit isotonic calibration mapping from raw over-prob proxies (Gaussian) to outcomes.
+        # Fit isotonic calibration mapping from NB/Poisson over-probs to outcomes.
         # IMPORTANT: Fit on walk-forward OOF predictions from the TRAIN split (not the test split),
         # to avoid leaking test outcomes into the calibration mapping.
         iso_over_model: Optional[IsotonicRegression] = None
+        prob_calibrator = None
         try:
             if len(X_train) >= 30:
                 # Determine training lines (market line if available, else default)
@@ -4182,6 +4330,7 @@ class RealDataNHLModel:
                 n_splits_iso = max(2, min(n_splits_iso, len(X_train) - 1))
                 tscv_iso = TimeSeriesSplit(n_splits=n_splits_iso)
                 oof_pred = np.full(len(X_train), np.nan, dtype=float)
+                oof_std = np.full(len(X_train), np.nan, dtype=float)
                 for tr_idx, val_idx in tscv_iso.split(X_train):
                     X_tr = X_train.iloc[tr_idx]
                     y_tr = y_train.iloc[tr_idx]
@@ -4201,23 +4350,55 @@ class RealDataNHLModel:
                     fold_stack = np.vstack(fold_preds)
                     fold_ens = (weights_array.reshape(-1, 1) * fold_stack).sum(axis=0)
                     oof_pred[val_idx] = fold_ens
+                    # model disagreement feature (std across base learners)
+                    try:
+                        oof_std[val_idx] = np.std(fold_stack, axis=0)
+                    except Exception:
+                        oof_std[val_idx] = np.nan
                 valid = np.isfinite(oof_pred)
                 if valid.any():
-                    oof_resid = y_train.values[valid] - oof_pred[valid]
-                    oof_std = float(np.std(oof_resid)) if len(oof_resid) > 1 else residual_std
-                    oof_std = oof_std if (np.isfinite(oof_std) and oof_std > 1e-6) else (residual_std if residual_std > 1e-6 else 0.85)
+                    # Convert OOF predictions into TOTAL space and compute NB/Poisson over probabilities.
                     if is_edge_mode:
-                        raw_oof_prob = norm.sf(0.0, loc=oof_pred[valid], scale=oof_std)
-                        # y_train is edge in edge mode
-                        oof_over = (y_train.values[valid] > 0.0).astype(int)
+                        oof_total = oof_pred[valid] + tr_lines[valid]
+                        actual_total = y_train.values[valid] + tr_lines[valid]
+                        pred_edge_feat = oof_pred[valid]
                     else:
-                        raw_oof_prob = norm.sf(tr_lines[valid], loc=oof_pred[valid], scale=oof_std)
-                        oof_over = (y_train.values[valid] > tr_lines[valid]).astype(int)
+                        oof_total = oof_pred[valid]
+                        actual_total = y_train.values[valid]
+                        pred_edge_feat = oof_pred[valid] - tr_lines[valid]
+                    raw_oof_prob = np.array(
+                        [_total_over_prob(m, l, nb_k_eval) for m, l in zip(oof_total, tr_lines[valid])],
+                        dtype=float
+                    )
+                    # Exclude pushes for integer lines to keep the classifier well-defined
+                    is_push_train = np.isclose(actual_total, tr_lines[valid], atol=1e-9) & (np.abs(tr_lines[valid] - np.round(tr_lines[valid])) < 1e-9)
+                    keep = ~is_push_train
+                    oof_over = (actual_total > tr_lines[valid]).astype(int)
                     iso = IsotonicRegression(out_of_bounds='clip')
-                    iso.fit(raw_oof_prob, oof_over)
+                    iso.fit(raw_oof_prob[keep], oof_over[keep])
                     iso_over_model = iso
+
+                    # Secondary probability calibrator: LogisticRegression on (pred_edge, model_std, line).
+                    try:
+                        feats = np.column_stack([
+                            np.asarray(pred_edge_feat, dtype=float),
+                            np.asarray(oof_std[valid], dtype=float),
+                            np.asarray(tr_lines[valid], dtype=float),
+                        ])
+                        y_bin = np.asarray(oof_over, dtype=int)
+                        keep_lr = keep & np.isfinite(feats).all(axis=1)
+                        if int(keep_lr.sum()) >= 80:
+                            prob_calibrator = Pipeline([
+                                ('imputer', SimpleImputer(strategy='median')),
+                                ('scaler', StandardScaler()),
+                                ('lr', LogisticRegression(max_iter=1000))
+                            ])
+                            prob_calibrator.fit(feats[keep_lr], y_bin[keep_lr])
+                    except Exception:
+                        prob_calibrator = None
         except Exception:
             iso_over_model = None
+            prob_calibrator = None
 
         # Score calibration metrics using calibrated probabilities when available.
         brier = None
@@ -4225,7 +4406,21 @@ class RealDataNHLModel:
         try:
             if raw_over_prob is not None:
                 probs_eval = raw_over_prob
-                if iso_over_model is not None:
+                # Prefer logistic calibrator; else isotonic; else raw NB/Poisson prob.
+                if prob_calibrator is not None:
+                    try:
+                        # Features in TOTAL space: pred_edge, model_std, line
+                        if is_edge_mode:
+                            pred_edge_eval = np.asarray(pred_edge_test, dtype=float)
+                            model_std_eval = np.std(np.asarray(test_preds, dtype=float), axis=0) if isinstance(test_preds, np.ndarray) else np.full(len(test_lines), np.nan)
+                        else:
+                            pred_edge_eval = np.asarray(ensemble_pred, dtype=float) - np.asarray(test_lines, dtype=float)
+                            model_std_eval = np.std(np.asarray(test_preds, dtype=float), axis=0) if isinstance(test_preds, np.ndarray) else np.full(len(test_lines), np.nan)
+                        feats_eval = np.column_stack([pred_edge_eval, model_std_eval, np.asarray(test_lines, dtype=float)])
+                        probs_eval = prob_calibrator.predict_proba(feats_eval)[:, 1]
+                    except Exception:
+                        probs_eval = raw_over_prob
+                elif iso_over_model is not None:
                     try:
                         probs_eval = iso_over_model.transform(probs_eval)
                     except Exception:
@@ -4317,6 +4512,7 @@ class RealDataNHLModel:
             'conformal_q90': self.conformal_q90,
             'conformal_radius': self.conformal_radius,
             'iso_over': iso_over_model,
+            'prob_calibrator': prob_calibrator,
             'precision_edge_floor': self.precision_edge_floor,
             'precision_guard_accuracy': self.precision_guard_accuracy,
             'precision_guard_support': self.precision_guard_support,
@@ -4821,6 +5017,23 @@ class RealDataNHLModel:
             if isinstance(iso_over, IsotonicRegression):
                 over_prob = float(np.clip(iso_over.predict([over_prob])[0], 0.0, 1.0))
                 under_prob = float(max(0.0, min(1.0, 1.0 - over_prob - push_prob)))
+        except Exception:
+            pass
+
+        # Secondary calibration: LogisticRegression on (pred_edge, model_std, line)
+        try:
+            prob_cal = (self.total_model or {}).get('prob_calibrator')
+            if prob_cal is not None:
+                pred_edge = float(predicted_total - float(betting_line))
+                feats = np.array([[pred_edge, float(consensus_std_val), float(betting_line)]], dtype=float)
+                p_lr = float(prob_cal.predict_proba(feats)[0][1])
+                # Blend (LR is powerful but can overfit; keep some distribution info)
+                p_lr = float(np.clip(p_lr, 1e-6, 1.0 - 1e-6))
+                blended = float(0.65 * p_lr + 0.35 * float(over_prob))
+                # Respect push mass on integer lines
+                max_over = float(max(0.0, 1.0 - float(push_prob) - 1e-6))
+                over_prob = float(np.clip(blended, 1e-6, max_over))
+                under_prob = float(max(0.0, min(1.0, 1.0 - over_prob - float(push_prob))))
         except Exception:
             pass
 
@@ -9495,6 +9708,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         
         print("\n🔧 Step 2: Engineering features...")
         enhanced_data = model.create_enhanced_features(historical_data)
+        # Optional: attach time-aligned goalie/injury history for training (status_history.csv).
+        try:
+            status_hist_path = getattr(cli_args, 'status_history_path', None) if cli_args else os.getenv('STATUS_HISTORY_PATH')
+            enhanced_data = model.attach_status_history(enhanced_data, status_hist_path)
+        except Exception as e:
+            print(f"⚠️  Status history attach failed: {e}")
         # Configure training target mode (auto|total|edge). Auto uses edge when enough market lines exist.
         try:
             model.train_target_mode = getattr(cli_args, 'train_target', None) if cli_args else None
@@ -10933,6 +11152,7 @@ if __name__ == "__main__":
     parser.add_argument('--environment-path', type=str, default=os.getenv('ENVIRONMENT_JSON', None), help='Path to environment JSON (outdoor/start time/weather)')
     parser.add_argument('--env-refresh', action='store_true', help='Refresh/overwrite today entries in environment.json')
     parser.add_argument('--lineup-path', type=str, default=os.getenv('LINEUP_STRENGTH_CSV', None), help='Path to lineup strength CSV (team,lineup_strength)')
+    parser.add_argument('--status-history-path', type=str, default=os.getenv('STATUS_HISTORY_PATH', None), help='Optional CSV with historical goalie/injury adjustments for training (time-aligned)')
     parser.add_argument('--auto-populate', action='store_true', help='Auto-fetch team rates/goalie GSAx/penalties/referees from URLs and write CSVs')
     parser.add_argument('--team-rates-url', type=str, default=os.getenv('TEAM_RATES_URL', None), help='URL to fetch team rates CSV')
     parser.add_argument('--goalie-gsax-url', type=str, default=os.getenv('GOALIE_GSAX_URL', None), help='URL to fetch goalie GSAx CSV')
