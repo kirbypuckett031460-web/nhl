@@ -3828,6 +3828,14 @@ class RealDataNHLModel:
         lines_test = lines_sorted.iloc[split_index:].reset_index(drop=True) if lines_sorted is not None else None
         over_prices_test = over_prices_sorted.iloc[split_index:].reset_index(drop=True) if over_prices_sorted is not None else None
         under_prices_test = under_prices_sorted.iloc[split_index:].reset_index(drop=True) if under_prices_sorted is not None else None
+        # Determine if we're training in edge mode (must be defined before any later references).
+        is_edge_mode = str(getattr(self, 'target_mode', 'total') or 'total').strip().lower() == 'edge'
+        # Default total line used only as fallback for missing market lines.
+        default_line = 6.5
+        try:
+            default_line = float(os.getenv('DEFAULT_TOTAL_LINE', '6.5'))
+        except Exception:
+            default_line = 6.5
         
         # Feature pipeline for scaled modeling during validation
         eval_feature_pipeline = self._build_feature_pipeline()
@@ -4136,13 +4144,7 @@ class RealDataNHLModel:
                 print(f"Walk-forward RMSE {walk_metrics['rmse']:.3f} (splits={walk_metrics.get('splits_evaluated', 0)})")
         
         # Calculate metrics and residual-based uncertainty (plus conformal radius)
-        is_edge_mode = str(getattr(self, 'target_mode', 'total') or 'total').strip().lower() == 'edge'
         # Determine evaluation lines (prefer market; fallback to inferred default)
-        default_line = 6.5
-        try:
-            default_line = float(os.getenv('DEFAULT_TOTAL_LINE', '6.5'))
-        except Exception:
-            default_line = 6.5
         if lines_test is not None:
             test_lines = pd.to_numeric(lines_test, errors='coerce').fillna(default_line).to_numpy(dtype=float)
         else:
