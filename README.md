@@ -44,7 +44,7 @@ Command-line options
 - --model-path: Path to persist/load a serialized ensemble artifact (default `data/cache/trained_model.joblib`)
 - --save-trained-model: Persist the ensemble from the current run to `--model-path`
 - --use-saved-model: Skip retraining and hydrate the ensemble from `--model-path`
-- --historical-days: Limit how many days of completed games are downloaded before training (default `HISTORICAL_DAYS` env or 90)
+- --historical-days: Limit how many days of completed games are downloaded before training (default `HISTORICAL_DAYS` env or 365)
 - --historical-cache-path: CSV cache for historical games (default `data/history/historical_games.csv`; set to empty to disable)
 - --historical-cache-refresh: Force-refresh the historical cache even if the file already exists
 
