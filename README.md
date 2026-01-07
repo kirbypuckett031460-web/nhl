@@ -37,6 +37,7 @@ Command-line options
 - --log-odds-history / --log-odds: Append realtime odds snapshots to `odds_history.csv`
 - --build-closing-lines: Build `data/history/closing_lines.csv` from `--odds-history-path` and exit
 - --closing-lines-path: Output path for canonical closing lines CSV (default `data/history/closing_lines.csv`)
+- --closing-lines-version: Optional version prefix to use from `CLOSING_LINES_VERSION_DIR` (e.g., `20260107` or `20260107T120000Z`) for reproducible backtests
 - --train-speed: Choose `turbo`, `fast`, `balanced` (default), or `full` to control CV depth, walk-forward checks, and tuning iterations
 - --fast-train: Shortcut for `--train-speed fast`
 - --train-target: Choose `auto` (default), `edge` (train on total_goals - closing_total), or `total` (train on total goals)

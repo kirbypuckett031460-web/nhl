@@ -7,12 +7,26 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import glob
+
+
+def resolve_closing_lines_version(version_dir: str, version_prefix: str) -> Optional[str]:
+    """Resolve a specific versioned closing-lines file by prefix (YYYYMMDD or YYYYMMDDTHHMMSSZ)."""
+    if not version_dir or not version_prefix:
+        return None
+    try:
+        pattern = os.path.join(version_dir, f"{version_prefix}*_closing_lines.csv")
+        matches = sorted(glob.glob(pattern))
+        return matches[-1] if matches else None
+    except Exception:
+        return None
 
 
 def build_closing_lines_from_odds_history(
     odds_history_path: str,
     output_path: str,
     version_dir: Optional[str] = "data/history/closing_lines",
+    require_game_date: bool = False,
 ) -> Optional[str]:
     """Build a canonical open/close totals+prices table from odds_history snapshots.
 
@@ -65,6 +79,8 @@ def build_closing_lines_from_odds_history(
             gdt = g["game_dt"].dropna().iloc[-1] if g["game_dt"].notna().any() else None
         except Exception:
             gdt = None
+        if require_game_date and (gdt is None or not isinstance(gdt, pd.Timestamp)):
+            continue
         if gdt is not None and isinstance(gdt, pd.Timestamp):
             pre = g[g["ts"] <= gdt]
             use_open = pre if not pre.empty else g

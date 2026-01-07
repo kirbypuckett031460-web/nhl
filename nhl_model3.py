@@ -74,7 +74,9 @@ from nhl_model.common import (
 from nhl_model.odds_utils import american_to_decimal as odds_american_to_decimal
 from nhl_model.odds_utils import decimal_to_implied_prob as odds_decimal_to_implied_prob
 from nhl_model.market_history import build_closing_lines_from_odds_history as build_closing_lines_table
+from nhl_model.market_history import resolve_closing_lines_version
 from nhl_model.status_history import attach_status_history as attach_status_history_util
+from nhl_model.probability_engine import totals_probs_nb_poisson, totals_side_evs
 from nhl_model.data_fetcher import NHLDataFetcher
 from nhl_model.social import SocialMediaPoster
 try:
@@ -2754,8 +2756,9 @@ class RealDataNHLModel:
         except Exception:
             out = output_path
         version_dir = os.getenv('CLOSING_LINES_VERSION_DIR', 'data/history/closing_lines')
+        require_game_date = str(os.getenv('CLOSING_LINES_REQUIRE_GAME_DATE', '')).strip().lower() in TRUTHY_FLAGS
         try:
-            built = build_closing_lines_table(src, out, version_dir=version_dir)
+            built = build_closing_lines_table(src, out, version_dir=version_dir, require_game_date=require_game_date)
         except Exception:
             built = None
         return built
@@ -4103,34 +4106,6 @@ class RealDataNHLModel:
         except Exception:
             backtest = {}
 
-        # Probability engine for O/U: prefer NB/Poisson (not Gaussian residual proxy).
-        def _total_over_prob(mu: float, line_value: float, nb_k: Optional[float]) -> float:
-            try:
-                mu_f = float(mu)
-                if not np.isfinite(mu_f) or mu_f <= 0:
-                    return 0.0
-                lv = float(line_value)
-                is_integer = abs(lv - round(lv)) < 1e-9
-                if nb_k is not None and np.isfinite(nb_k) and float(nb_k) > 0:
-                    k = float(nb_k)
-                    # Negative binomial parameterization: mean=mu, size=k, p=k/(k+mu)
-                    p = k / (k + mu_f)
-                    if is_integer:
-                        L = int(round(lv))
-                        # P(total > L) = 1 - CDF(L)
-                        return float(1.0 - nbinom.cdf(L, k, p))
-                    # For half-lines, "over" means >= ceil(line) == floor(line)+1 -> P(total > floor(line))
-                    L = int(np.floor(lv))
-                    return float(1.0 - nbinom.cdf(L, k, p))
-                # Poisson fallback
-                if is_integer:
-                    L = int(round(lv))
-                    return float(1.0 - poisson.cdf(L, mu_f))
-                L = int(np.floor(lv))
-                return float(1.0 - poisson.cdf(L, mu_f))
-            except Exception:
-                return 0.5
-
         try:
             nb_k_eval = None
             try:
@@ -4139,11 +4114,14 @@ class RealDataNHLModel:
                     nb_k_eval = float(nb.get('k'))
             except Exception:
                 nb_k_eval = None
-            if is_edge_mode:
-                mu_eval = np.asarray(pred_total_test, dtype=float)
+            # Use the same totals prob driver as inference: NB/Poisson around poisson_mu when available,
+            # else around the model's total point estimate.
+            if poisson_pred is not None and len(poisson_pred) == len(test_lines):
+                mu_eval = np.asarray(poisson_pred, dtype=float)
             else:
-                mu_eval = np.asarray(ensemble_pred, dtype=float)
-            raw_over_prob = np.array([_total_over_prob(m, l, nb_k_eval) for m, l in zip(mu_eval, test_lines)], dtype=float)
+                mu_eval = np.asarray(pred_total_test if is_edge_mode else ensemble_pred, dtype=float)
+            raw_probs = [totals_probs_nb_poisson(m, l, nb_k_eval) for m, l in zip(mu_eval, test_lines)]
+            raw_over_prob = np.asarray([p.over for p in raw_probs], dtype=float)
             eps = 1e-6
         except Exception:
             raw_over_prob = None
@@ -4154,6 +4132,7 @@ class RealDataNHLModel:
         # to avoid leaking test outcomes into the calibration mapping.
         iso_over_model: Optional[IsotonicRegression] = None
         prob_calibrator = None
+        p_over_model = None
         try:
             if len(X_train) >= 30:
                 # Determine training lines (market line if available, else default)
@@ -4201,8 +4180,8 @@ class RealDataNHLModel:
                         oof_total = oof_pred[valid]
                         actual_total = y_train.values[valid]
                         pred_edge_feat = oof_pred[valid] - tr_lines[valid]
-                    raw_oof_prob = np.array(
-                        [_total_over_prob(m, l, nb_k_eval) for m, l in zip(oof_total, tr_lines[valid])],
+                    raw_oof_prob = np.asarray(
+                        [totals_probs_nb_poisson(m, l, nb_k_eval).over for m, l in zip(oof_total, tr_lines[valid])],
                         dtype=float
                     )
                     # Exclude pushes for integer lines to keep the classifier well-defined
@@ -4231,9 +4210,41 @@ class RealDataNHLModel:
                             prob_calibrator.fit(feats[keep_lr], y_bin[keep_lr])
                     except Exception:
                         prob_calibrator = None
+
+                    # Direct probability model: LogisticRegression on (pred_edge, model_std, line, poisson_mu, nb_k).
+                    try:
+                        mu_feat = None
+                        try:
+                            if poisson_model is not None:
+                                mu_all = np.asarray(poisson_model.predict(X_train_scaled), dtype=float)
+                                mu_feat = mu_all[valid]
+                        except Exception:
+                            mu_feat = None
+                        if mu_feat is None or len(mu_feat) != int(np.sum(valid)):
+                            mu_feat = np.full(int(np.sum(valid)), np.nan)
+                        k_feat = np.full(int(np.sum(valid)), float(nb_k_eval) if nb_k_eval is not None else np.nan)
+                        feats2 = np.column_stack([
+                            np.asarray(pred_edge_feat, dtype=float),
+                            np.asarray(oof_std[valid], dtype=float),
+                            np.asarray(tr_lines[valid], dtype=float),
+                            np.asarray(mu_feat, dtype=float),
+                            np.asarray(k_feat, dtype=float),
+                        ])
+                        y_bin = np.asarray(oof_over, dtype=int)
+                        keep2 = keep & np.isfinite(feats2).all(axis=1)
+                        if int(keep2.sum()) >= 120:
+                            p_over_model = Pipeline([
+                                ('imputer', SimpleImputer(strategy='median')),
+                                ('scaler', StandardScaler()),
+                                ('lr', LogisticRegression(max_iter=1000))
+                            ])
+                            p_over_model.fit(feats2[keep2], y_bin[keep2])
+                    except Exception:
+                        p_over_model = None
         except Exception:
             iso_over_model = None
             prob_calibrator = None
+            p_over_model = None
 
         # Score calibration metrics using calibrated probabilities when available.
         brier = None
@@ -4241,8 +4252,21 @@ class RealDataNHLModel:
         try:
             if raw_over_prob is not None:
                 probs_eval = raw_over_prob
-                # Prefer logistic calibrator; else isotonic; else raw NB/Poisson prob.
-                if prob_calibrator is not None:
+                # Prefer direct probability model; else logistic calibrator; else isotonic; else raw NB/Poisson prob.
+                if p_over_model is not None:
+                    try:
+                        if is_edge_mode:
+                            pred_edge_eval = np.asarray(pred_edge_test, dtype=float)
+                        else:
+                            pred_edge_eval = np.asarray(ensemble_pred, dtype=float) - np.asarray(test_lines, dtype=float)
+                        model_std_eval = np.std(np.asarray(test_preds, dtype=float), axis=0) if isinstance(test_preds, np.ndarray) else np.full(len(test_lines), np.nan)
+                        mu_eval2 = np.asarray(poisson_pred, dtype=float) if poisson_pred is not None and len(poisson_pred) == len(test_lines) else np.full(len(test_lines), np.nan)
+                        k_eval2 = np.full(len(test_lines), float(nb_k_eval) if nb_k_eval is not None else np.nan)
+                        feats_eval = np.column_stack([pred_edge_eval, model_std_eval, np.asarray(test_lines, dtype=float), mu_eval2, k_eval2])
+                        probs_eval = p_over_model.predict_proba(feats_eval)[:, 1]
+                    except Exception:
+                        probs_eval = raw_over_prob
+                elif prob_calibrator is not None:
                     try:
                         # Features in TOTAL space: pred_edge, model_std, line
                         if is_edge_mode:
@@ -4450,6 +4474,7 @@ class RealDataNHLModel:
             'conformal_radius': self.conformal_radius,
             'iso_over': iso_over_model,
             'prob_calibrator': prob_calibrator,
+            'p_over_model': p_over_model,
             'precision_edge_floor': self.precision_edge_floor,
             'precision_guard_accuracy': self.precision_guard_accuracy,
             'precision_guard_support': self.precision_guard_support,
@@ -4966,6 +4991,28 @@ class RealDataNHLModel:
             if isinstance(iso_over, IsotonicRegression):
                 over_prob = float(np.clip(iso_over.predict([over_prob])[0], 0.0, 1.0))
                 under_prob = float(max(0.0, min(1.0, 1.0 - over_prob - push_prob)))
+        except Exception:
+            pass
+
+        # Direct probability model (preferred): LogisticRegression on (pred_edge, model_std, line, poisson_mu, nb_k)
+        try:
+            p_over_model = (self.total_model or {}).get('p_over_model')
+            if p_over_model is not None and poisson_mu is not None:
+                pred_edge = float(predicted_total - float(betting_line))
+                k_val = None
+                try:
+                    nb = (self.total_model or {}).get('nb_params')
+                    if isinstance(nb, dict) and isinstance(nb.get('k'), (int, float)):
+                        k_val = float(nb.get('k'))
+                except Exception:
+                    k_val = None
+                feats = np.array([[pred_edge, float(consensus_std_val), float(betting_line), float(poisson_mu), float(k_val) if k_val is not None else np.nan]], dtype=float)
+                p_lr = float(p_over_model.predict_proba(feats)[0][1])
+                p_lr = float(np.clip(p_lr, 1e-6, 1.0 - 1e-6))
+                blended = float(0.70 * p_lr + 0.30 * float(over_prob))
+                max_over = float(max(0.0, 1.0 - float(push_prob) - 1e-6))
+                over_prob = float(np.clip(blended, 1e-6, max_over))
+                under_prob = float(max(0.0, min(1.0, 1.0 - over_prob - float(push_prob))))
         except Exception:
             pass
 
@@ -9618,6 +9665,18 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             closing_path = getattr(cli_args, 'closing_odds_path', None) if cli_args else os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json')
             odds_hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else 'odds_history.csv'
             closing_lines_path = getattr(cli_args, 'closing_lines_path', None) if cli_args else os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv')
+            # If a specific version is requested, prefer the versioned file for reproducible backtests.
+            try:
+                version_prefix = str(getattr(cli_args, 'closing_lines_version', '') or '').strip()
+            except Exception:
+                version_prefix = ''
+            if not version_prefix:
+                version_prefix = str(os.getenv('CLOSING_LINES_VERSION', '')).strip()
+            if version_prefix:
+                version_dir = str(os.getenv('CLOSING_LINES_VERSION_DIR', 'data/history/closing_lines') or 'data/history/closing_lines')
+                resolved_version = resolve_closing_lines_version(version_dir, version_prefix)
+                if resolved_version:
+                    closing_lines_path = resolved_version
             historical_data = model.attach_historical_market_odds(
                 historical_data,
                 closing_odds_path=closing_path,
@@ -11093,6 +11152,7 @@ if __name__ == "__main__":
     parser.add_argument('--odds-history-path', type=str, default='odds_history.csv', help='Path to odds history CSV')
     parser.add_argument('--build-closing-lines', action='store_true', help='Build data/history/closing_lines.csv from --odds-history-path and exit')
     parser.add_argument('--closing-lines-path', type=str, default=os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv'), help='Output path for canonical closing lines CSV')
+    parser.add_argument('--closing-lines-version', type=str, default=os.getenv('CLOSING_LINES_VERSION', ''), help='Optional version prefix to use from CLOSING_LINES_VERSION_DIR (e.g., 20260107 or 20260107T120000Z)')
     parser.add_argument('--mc-sims', type=int, default=int(os.getenv('MC_SIMS_TOTALS', '20000')), help='Monte Carlo sims for copula totals/moneyline (default 20000; env MC_SIMS_TOTALS)')
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
     parser.add_argument('--xg-baseline-total', type=float, default=float(os.getenv('XG_BASELINE_TOTAL', 6.2)), help='xG baseline total used to compute adjustments')
