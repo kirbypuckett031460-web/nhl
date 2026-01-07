@@ -71,6 +71,10 @@ from nhl_model.common import (
     get_team_nickname,
     get_team_primary_color,
 )
+from nhl_model.odds_utils import american_to_decimal as odds_american_to_decimal
+from nhl_model.odds_utils import decimal_to_implied_prob as odds_decimal_to_implied_prob
+from nhl_model.market_history import build_closing_lines_from_odds_history as build_closing_lines_table
+from nhl_model.status_history import attach_status_history as attach_status_history_util
 from nhl_model.data_fetcher import NHLDataFetcher
 from nhl_model.social import SocialMediaPoster
 try:
@@ -2714,17 +2718,10 @@ class RealDataNHLModel:
         return df
 
     def attach_status_history(self, features_df: pd.DataFrame, status_history_path: Optional[str]) -> pd.DataFrame:
-        """Attach time-aligned goalie/injury adjustments for training from a status history CSV.
+        """Attach time-aligned goalie/injury adjustments from `--status-history-path`.
 
-        Expected CSV columns (flexible; best-effort mapping):
-        - game_id (optional)
-        - date (YYYY-MM-DD or timestamp) (optional; used with matchup)
-        - matchup (AWAY@HOME) (optional; used with date)
-        - home_goalie_adj, away_goalie_adj, injury_penalty_adj (optional)
-        - home_goalie_gsax, away_goalie_gsax (optional)
-        - home_goalie_prob, away_goalie_prob (optional)
-
-        Values are assumed to be known pre-game (no leakage protection enforced here).
+        Delegates to `nhl_model.status_history.attach_status_history`, which supports an optional
+        `status_timestamp` leakage guard (ignores updates after game start time).
         """
         if features_df is None or not isinstance(features_df, pd.DataFrame) or features_df.empty:
             return features_df
@@ -2734,190 +2731,34 @@ class RealDataNHLModel:
         if not resolved or not os.path.exists(resolved):
             return features_df
         try:
-            hist = pd.read_csv(resolved)
-        except Exception as e:
-            print(f"⚠️  Failed to read status history {resolved}: {e}")
-            return features_df
-        if hist is None or hist.empty:
-            return features_df
-
-        df = features_df.copy()
-        hist = hist.copy()
-
-        # Normalize IDs + matchup keys
-        if 'game_id' in df.columns:
-            df['game_id'] = df['game_id'].astype(str)
-        if 'game_id' in hist.columns:
-            hist['game_id'] = hist['game_id'].astype(str)
-
-        if 'matchup' not in df.columns and {'home_team', 'away_team'}.issubset(df.columns):
-            df['matchup'] = df['away_team'].astype(str).str.upper() + '@' + df['home_team'].astype(str).str.upper()
-        if 'matchup' in hist.columns:
-            hist['matchup'] = hist['matchup'].astype(str).str.upper().str.strip()
-
-        # Normalize dates to date_only for join
-        if 'date' in df.columns:
-            df['date_only'] = pd.to_datetime(df['date'], errors='coerce').dt.date
-        else:
-            df['date_only'] = pd.NaT
-        if 'date' in hist.columns:
-            hist['date_only'] = pd.to_datetime(hist['date'], errors='coerce').dt.date
-        else:
-            hist['date_only'] = pd.NaT
-
-        # Column mapping
-        col_map = {
-            'home_goalie_adj': ['home_goalie_adj', 'hg_adj', 'home_adj'],
-            'away_goalie_adj': ['away_goalie_adj', 'ag_adj', 'away_adj'],
-            'injury_penalty_adj': ['injury_penalty_adj', 'inj_adj', 'injury_adj'],
-            'home_goalie_gsax': ['home_goalie_gsax', 'hg_gsax', 'home_gsax'],
-            'away_goalie_gsax': ['away_goalie_gsax', 'ag_gsax', 'away_gsax'],
-            'home_goalie_prob': ['home_goalie_prob', 'hg_prob', 'home_prob'],
-            'away_goalie_prob': ['away_goalie_prob', 'ag_prob', 'away_prob'],
-        }
-        for target, aliases in col_map.items():
-            if target in hist.columns:
-                continue
-            for alt in aliases:
-                if alt in hist.columns:
-                    hist = hist.rename(columns={alt: target})
-                    break
-
-        attach_cols = [c for c in col_map.keys() if c in hist.columns]
-        if not attach_cols:
-            return df
-
-        # Coerce numeric
-        for c in attach_cols:
-            hist[c] = pd.to_numeric(hist[c], errors='coerce')
-
-        # Join priority: game_id, else (matchup,date_only)
-        merged = None
-        try:
-            if 'game_id' in hist.columns and 'game_id' in df.columns and hist['game_id'].notna().any():
-                subset = hist[['game_id'] + attach_cols].dropna(subset=['game_id'])
-                merged = df.merge(subset, on='game_id', how='left', suffixes=('', '_hist'))
-            elif 'matchup' in hist.columns and hist['matchup'].notna().any():
-                subset = hist[['matchup', 'date_only'] + attach_cols].dropna(subset=['matchup'])
-                merged = df.merge(subset, on=['matchup', 'date_only'], how='left', suffixes=('', '_hist'))
+            return attach_status_history_util(features_df, resolved, game_time_col='date')
         except Exception:
-            merged = None
-        if merged is None:
-            return df
-
-        # Fill features (prefer existing non-zero/non-null)
-        for c in attach_cols:
-            src = c if c in df.columns else None
-            hist_c = c if c in merged.columns else None
-            if hist_c is None:
-                continue
-            if src is None:
-                merged[c] = merged[hist_c]
-                continue
-            try:
-                base = pd.to_numeric(merged[src], errors='coerce')
-                incoming = pd.to_numeric(merged[hist_c], errors='coerce')
-                # if base is 0.0 (placeholder) or NaN, fill from incoming
-                mask = base.isna() | np.isclose(base.fillna(0.0), 0.0, atol=1e-12)
-                merged.loc[mask, src] = incoming.loc[mask]
-            except Exception:
-                pass
-
-        # Cleanup
-        merged.drop(columns=[c for c in ('date_only',) if c in merged.columns], inplace=True, errors='ignore')
-        return merged
+            return features_df
 
     @staticmethod
     def build_closing_lines_from_odds_history(
         odds_history_path: str = 'odds_history.csv',
         output_path: str = 'data/history/closing_lines.csv'
     ) -> Optional[str]:
-        """Build a canonical open/close totals table from odds_history snapshots.
+        """Build a canonical open/close totals+prices table from odds_history snapshots.
 
-        We attempt to use `game_date` (puck drop timestamp) when present to select:
-        - open: earliest snapshot <= game_date (else earliest snapshot)
-        - close: latest snapshot <= game_date (else latest snapshot)
+        Delegates to `nhl_model.market_history.build_closing_lines_from_odds_history` and also
+        writes a versioned copy under `data/history/closing_lines/`.
         """
         try:
             src = resolve_local_read_path(odds_history_path) or os.path.abspath(str(odds_history_path))
         except Exception:
             src = odds_history_path
-        if not src or not os.path.exists(src):
-            print(f"⚠️  odds history not found at {odds_history_path}")
-            return None
         try:
-            oh = pd.read_csv(src)
-        except Exception as e:
-            print(f"⚠️  Failed to read odds history {src}: {e}")
-            return None
-        if oh is None or oh.empty:
-            print("⚠️  odds history is empty; nothing to build")
-            return None
-        needed = {'timestamp', 'game_id', 'book_total'}
-        if not needed.issubset(set(oh.columns)):
-            print(f"⚠️  odds history missing required columns: {sorted(list(needed - set(oh.columns)))}")
-            return None
-        oh = oh.copy()
-        oh['game_id'] = oh['game_id'].astype(str)
-        oh['ts'] = pd.to_datetime(oh['timestamp'], errors='coerce')
-        oh['book_total'] = pd.to_numeric(oh['book_total'], errors='coerce')
-        oh['book_over'] = pd.to_numeric(oh.get('book_over'), errors='coerce')
-        oh['book_under'] = pd.to_numeric(oh.get('book_under'), errors='coerce')
-        # game_date captured by newer runs
-        if 'game_date' in oh.columns:
-            try:
-                oh['game_dt'] = pd.to_datetime(oh['game_date'], errors='coerce', utc=True).dt.tz_convert(None)
-            except Exception:
-                oh['game_dt'] = pd.NaT
-        else:
-            oh['game_dt'] = pd.NaT
-        # optional book identifiers
-        if 'book' not in oh.columns:
-            oh['book'] = oh.get('book_key', oh.get('book_title', ''))
-        out_rows: List[Dict[str, Any]] = []
-        for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
-            g = grp.sort_values('ts')
-            gdt = None
-            try:
-                gdt = g['game_dt'].dropna().iloc[-1] if g['game_dt'].notna().any() else None
-            except Exception:
-                gdt = None
-            if gdt is not None and isinstance(gdt, pd.Timestamp):
-                pre = g[g['ts'] <= gdt]
-                use_for_open = pre if not pre.empty else g
-                use_for_close = pre if not pre.empty else g
-            else:
-                use_for_open = g
-                use_for_close = g
-            open_row = use_for_open.iloc[0]
-            close_row = use_for_close.iloc[-1]
-            out_rows.append({
-                'game_id': str(gid),
-                'open_total': open_row.get('book_total'),
-                'open_over_price': open_row.get('book_over'),
-                'open_under_price': open_row.get('book_under'),
-                'open_source': str(open_row.get('book') or open_row.get('book_key') or ''),
-                'open_timestamp': open_row.get('timestamp'),
-                'closing_total': close_row.get('book_total'),
-                'closing_over_price': close_row.get('book_over'),
-                'closing_under_price': close_row.get('book_under'),
-                'closing_source': str(close_row.get('book') or close_row.get('book_key') or ''),
-                'closing_timestamp': close_row.get('timestamp'),
-            })
-        if not out_rows:
-            print("⚠️  No closing lines could be derived from odds history")
-            return None
-        out_df = pd.DataFrame(out_rows)
-        # Write to disk
+            out = ensure_local_write_path(output_path) or os.path.abspath(str(output_path))
+        except Exception:
+            out = output_path
+        version_dir = os.getenv('CLOSING_LINES_VERSION_DIR', 'data/history/closing_lines')
         try:
-            target = ensure_local_write_path(output_path) or os.path.abspath(str(output_path))
-            os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
-            out_df.to_csv(target, index=False)
-            print(f"💾 Wrote closing lines table: {target} ({len(out_df)} games)")
-            return target
-        except Exception as e:
-            print(f"⚠️  Failed to write closing lines table: {e}")
-            return None
+            built = build_closing_lines_table(src, out, version_dir=version_dir)
+        except Exception:
+            built = None
+        return built
 
     def train_goal_models(self, enhanced_df: pd.DataFrame) -> None:
         """Train Poisson regression models for home and away goals using current feature set."""
@@ -4201,15 +4042,7 @@ class RealDataNHLModel:
 
         # --- Vs-market backtest metrics (unit ROI, push rate, edge bins) ---
         def american_to_decimal(a: Optional[float]) -> float:
-            try:
-                if a is None or not np.isfinite(float(a)):
-                    return 1.9091  # -110
-                aa = int(round(float(a)))
-                if aa >= 100:
-                    return 1.0 + (aa / 100.0)
-                return 1.0 + (100.0 / max(1, abs(aa)))
-            except Exception:
-                return 1.9091
+            return float(odds_american_to_decimal(a))
 
         backtest: Dict[str, Any] = {}
         try:
@@ -4434,6 +4267,108 @@ class RealDataNHLModel:
             brier = None
             logloss = None
 
+        # Thresholded "bet-like" backtest: only count rows that pass EV/edge/std filters.
+        backtest_filtered: Dict[str, Any] = {}
+        try:
+            if backtest and raw_over_prob is not None:
+                # Pull totals/lines in total space
+                if is_edge_mode:
+                    pred_total_eval = np.asarray(pred_total_test, dtype=float)
+                    actual_total_eval = np.asarray(actual_total_test, dtype=float)
+                else:
+                    pred_total_eval = np.asarray(ensemble_pred, dtype=float)
+                    actual_total_eval = y_test.values.astype(float)
+                line_eval = np.asarray(test_lines, dtype=float)
+                abs_edge = np.abs(pred_total_eval - line_eval)
+                pick_over = pred_total_eval > line_eval
+                is_integer_line = np.abs(line_eval - np.round(line_eval)) < 1e-9
+                # Push probability (NB/Poisson, consistent with prob engine)
+                def _push_prob(mu: float, line_value: float, nb_k: Optional[float]) -> float:
+                    try:
+                        mu_f = float(mu)
+                        if not np.isfinite(mu_f) or mu_f <= 0:
+                            return 0.0
+                        lv = float(line_value)
+                        if abs(lv - round(lv)) >= 1e-9:
+                            return 0.0
+                        L = int(round(lv))
+                        if nb_k is not None and np.isfinite(nb_k) and float(nb_k) > 0:
+                            k = float(nb_k)
+                            p = k / (k + mu_f)
+                            return float(nbinom.pmf(L, k, p))
+                        return float(poisson.pmf(L, mu_f))
+                    except Exception:
+                        return 0.0
+                push_p = np.array([_push_prob(m, l, nb_k_eval) for m, l in zip(pred_total_eval, line_eval)], dtype=float)
+                push_p = np.where(is_integer_line, push_p, 0.0)
+                p_over = np.asarray(probs_eval, dtype=float) if 'probs_eval' in locals() and probs_eval is not None else np.asarray(raw_over_prob, dtype=float)
+                p_over = np.clip(p_over, 1e-6, 1.0 - 1e-6)
+                p_under = np.clip(1.0 - p_over - push_p, 1e-9, 1.0)
+
+                oprice = pd.to_numeric(over_prices_test, errors='coerce').to_numpy(dtype=float) if over_prices_test is not None else np.full(len(line_eval), np.nan)
+                uprice = pd.to_numeric(under_prices_test, errors='coerce').to_numpy(dtype=float) if under_prices_test is not None else np.full(len(line_eval), np.nan)
+                dec_over = np.vectorize(odds_american_to_decimal)(oprice)
+                dec_under = np.vectorize(odds_american_to_decimal)(uprice)
+
+                # EV per side (including push probability when integer line)
+                ev_over = p_over * (dec_over - 1.0) - (1.0 - p_over - push_p)
+                ev_under = p_under * (dec_under - 1.0) - (1.0 - p_under - push_p)
+                ev_side = np.where(pick_over, ev_over, ev_under)
+
+                std_eval = np.std(np.asarray(test_preds, dtype=float), axis=0) if isinstance(test_preds, np.ndarray) else np.full(len(line_eval), np.nan)
+
+                try:
+                    ev_min = float(os.getenv('BACKTEST_EV_MIN', '0.0'))
+                except Exception:
+                    ev_min = 0.0
+                try:
+                    edge_min = float(os.getenv('BACKTEST_EDGE_MIN', '0.25'))
+                except Exception:
+                    edge_min = 0.25
+                # Default std cap uses learned consensus cap when available; else no cap.
+                std_cap = None
+                try:
+                    std_cap = float(self.consensus_std_cap) if self.consensus_std_cap is not None else None
+                except Exception:
+                    std_cap = None
+                try:
+                    env_std = os.getenv('BACKTEST_STD_MAX')
+                    if env_std:
+                        std_cap = float(env_std)
+                except Exception:
+                    pass
+
+                keep = (ev_side >= ev_min) & (abs_edge >= edge_min)
+                if std_cap is not None and np.isfinite(std_cap):
+                    keep = keep & (std_eval <= float(std_cap))
+
+                if int(np.sum(keep)) > 0:
+                    # Outcome + unit profit using same bookkeeping as full backtest
+                    is_push = np.isclose(actual_total_eval, line_eval, atol=1e-9)
+                    is_over = actual_total_eval > line_eval
+                    win = (pick_over & is_over) | ((~pick_over) & (~is_over) & (~is_push))
+                    loss = (~win) & (~is_push)
+                    dec = np.where(pick_over, dec_over, dec_under)
+                    unit_profit = np.where(win, dec - 1.0, np.where(loss, -1.0, 0.0))
+                    unit_profit = unit_profit[keep]
+                    win_k = win[keep]
+                    push_k = is_push[keep]
+                    backtest_filtered = {
+                        'filter': {
+                            'ev_min': ev_min,
+                            'edge_min': edge_min,
+                            'std_cap': std_cap,
+                        },
+                        'n': int(np.sum(keep)),
+                        'hit_rate_ex_push': float(np.mean(win_k[~push_k])) if (~push_k).any() else None,
+                        'push_rate': float(np.mean(push_k)) if len(push_k) else None,
+                        'avg_unit_profit': float(np.mean(unit_profit)) if len(unit_profit) else None,
+                        'median_unit_profit': float(np.median(unit_profit)) if len(unit_profit) else None,
+                        'avg_ev': float(np.mean(ev_side[keep])) if len(ev_side) else None,
+                    }
+        except Exception:
+            backtest_filtered = {}
+
         # Guardrails should operate in total space (compare to line).
         if is_edge_mode:
             ens_for_guards = np.asarray(pred_total_test, dtype=float)
@@ -4549,6 +4484,8 @@ class RealDataNHLModel:
         }
         if backtest:
             training_summary['market_backtest'] = backtest
+        if backtest_filtered:
+            training_summary['market_backtest_filtered'] = backtest_filtered
         model_state['training_results'] = training_summary
         model_state['trained_at'] = datetime.utcnow().isoformat()
         self.total_model = model_state
@@ -4724,10 +4661,8 @@ class RealDataNHLModel:
         away_win_prob: Optional[float] = None
 
         def american_to_decimal(american: int) -> float:
-            if american >= 100:
-                return 1.0 + (american / 100.0)
-            else:
-                return 1.0 + (100.0 / abs(american))
+            # Back-compat wrapper (prefer shared helper)
+            return float(odds_american_to_decimal(american))
 
         def poisson_over_under_probs(mu: float, line_value: float) -> Tuple[float, float, float]:
             # Use exact Poisson tail probabilities
@@ -4747,7 +4682,8 @@ class RealDataNHLModel:
                 under_p = float(poisson.cdf(under_floor, mu))
                 return over_p, under_p, 0.0
 
-        # Prefer neural/ensemble copula mixture; else NB/Poisson totals; else Gaussian
+        # Prefer NB/Poisson totals when available (fast + consistent with training);
+        # use copula mixture primarily for moneyline/joint goal features.
         home_mu_model = (self.total_model or {}).get('home_goal_mu_model')
         away_mu_model = (self.total_model or {}).get('away_goal_mu_model')
         hm_lr: Optional[float] = None
@@ -4789,7 +4725,38 @@ class RealDataNHLModel:
             component_weights.append(flow_weight)
 
         over_prob = under_prob = push_prob = None
-        if component_mus:
+        # Fast totals: NB/Poisson from poisson_mu if available.
+        if poisson_mu is not None and poisson_mu > 0:
+            try:
+                nb = (self.total_model or {}).get('nb_params')
+                gp_model = (self.total_model or {}).get('gp_model')
+                if nb and isinstance(nb.get('k'), (int, float)) and nb['k'] > 0:
+                    k = float(nb['k'])
+                    L = int(np.floor(betting_line))
+                    p = k / (k + poisson_mu)
+                    under_p = float(nbinom.cdf(L, k, p))
+                    if abs(betting_line - round(betting_line)) < 1e-9:
+                        push_prob = float(nbinom.pmf(int(round(betting_line)), k, p))
+                        over_prob = float(1.0 - under_p - push_prob)
+                    else:
+                        push_prob = 0.0
+                        over_prob = float(1.0 - under_p)
+                    under_prob = under_p
+                elif gp_model is not None:
+                    try:
+                        import statsmodels.api as sm
+                        Xg = sm.add_constant(poisson_features)
+                        mu_gp = float(gp_model.predict(Xg)[0])
+                        over_prob, under_prob, push_prob = poisson_over_under_probs(max(1e-6, mu_gp), betting_line)
+                    except Exception:
+                        over_prob, under_prob, push_prob = poisson_over_under_probs(poisson_mu, betting_line)
+                else:
+                    over_prob, under_prob, push_prob = poisson_over_under_probs(poisson_mu, betting_line)
+            except Exception:
+                over_prob = under_prob = push_prob = None
+
+        # If totals probabilities are still missing, fall back to copula mixture simulation.
+        if (over_prob is None or under_prob is None or push_prob is None) and component_mus:
             total_w = float(sum(component_weights))
             if not np.isfinite(total_w) or total_w <= 0:
                 component_weights = [1.0 / len(component_mus)] * len(component_mus)
@@ -4801,7 +4768,12 @@ class RealDataNHLModel:
                 seed_material = feature_seed.tobytes() + odds_seed.tobytes()
                 seed_int = int.from_bytes(hashlib.blake2b(seed_material, digest_size=8).digest(), 'big', signed=False)
                 rng = np.random.default_rng(seed_int)
-                sims = 60000
+                # Monte Carlo budget (override with MC_SIMS_TOTALS, default lowered for speed).
+                try:
+                    sims = int(os.getenv('MC_SIMS_TOTALS', '20000'))
+                except Exception:
+                    sims = 20000
+                sims = max(2000, min(200000, sims))
                 choices = rng.choice(len(component_mus), size=sims, p=component_weights)
                 totals = np.zeros(sims)
                 home_scores = np.zeros(sims)
@@ -4853,44 +4825,19 @@ class RealDataNHLModel:
                 away_win_prob = None
 
         if over_prob is None or under_prob is None or push_prob is None:
-            if poisson_mu is not None and poisson_mu > 0:
-                nb = (self.total_model or {}).get('nb_params')
-                gp_model = (self.total_model or {}).get('gp_model')
-                if nb and isinstance(nb.get('k'), (int, float)) and nb['k'] > 0:
-                    k = float(nb['k'])
-                    L = int(np.floor(betting_line))
-                    p = k / (k + poisson_mu)
-                    under_p = float(nbinom.cdf(L, k, p))
-                    if abs(betting_line - round(betting_line)) < 1e-9:
-                        push_prob = float(nbinom.pmf(int(round(betting_line)), k, p))
-                        over_prob = float(1.0 - under_p - push_prob)
-                    else:
-                        push_prob = 0.0
-                        over_prob = float(1.0 - under_p)
-                    under_prob = under_p if push_prob == 0.0 else under_p
-                elif gp_model is not None:
-                    try:
-                        import statsmodels.api as sm
-                        Xg = sm.add_constant(poisson_features)
-                        mu_gp = float(gp_model.predict(Xg)[0])
-                        over_prob, under_prob, push_prob = poisson_over_under_probs(max(1e-6, mu_gp), betting_line)
-                    except Exception:
-                        over_prob, under_prob, push_prob = poisson_over_under_probs(poisson_mu, betting_line)
-                else:
-                    over_prob, under_prob, push_prob = poisson_over_under_probs(poisson_mu, betting_line)
+            # Last resort Gaussian fallback (should be rare)
+            std_dev = float(self.total_model.get('residual_std', 0.85))
+            is_integer_line = abs(betting_line - round(betting_line)) < 1e-9
+            if is_integer_line:
+                lower = betting_line - 0.25
+                upper = betting_line + 0.25
+                push_prob = float(max(0.0, norm.cdf(upper, predicted_total, std_dev) - norm.cdf(lower, predicted_total, std_dev)))
+                under_prob = float(norm.cdf(lower, predicted_total, std_dev))
+                over_prob = float(1.0 - norm.cdf(upper, predicted_total, std_dev))
             else:
-                std_dev = float(self.total_model.get('residual_std', 0.85))
-                is_integer_line = abs(betting_line - round(betting_line)) < 1e-9
-                if is_integer_line:
-                    lower = betting_line - 0.25
-                    upper = betting_line + 0.25
-                    push_prob = float(max(0.0, norm.cdf(upper, predicted_total, std_dev) - norm.cdf(lower, predicted_total, std_dev)))
-                    under_prob = float(norm.cdf(lower, predicted_total, std_dev))
-                    over_prob = float(1.0 - norm.cdf(upper, predicted_total, std_dev))
-                else:
-                    push_prob = 0.0
-                    under_prob = float(norm.cdf(betting_line, predicted_total, std_dev))
-                    over_prob = float(1.0 - under_prob)
+                push_prob = 0.0
+                under_prob = float(norm.cdf(betting_line, predicted_total, std_dev))
+                over_prob = float(1.0 - under_prob)
 
         # Normalize to guard against numerical drift
         total_prob = over_prob + under_prob + push_prob
@@ -4914,7 +4861,7 @@ class RealDataNHLModel:
                 return 1.0 + (100.0 / abs(american))
 
         def decimal_to_implied_prob(decimal_odds: float) -> float:
-            return 1.0 / max(decimal_odds, 1e-9)
+            return float(odds_decimal_to_implied_prob(decimal_odds))
 
         over_dec = american_to_decimal(over_american_odds)
         under_dec = american_to_decimal(under_american_odds)
@@ -9485,6 +9432,13 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     train_jobs_val = -1
                 model.train_n_jobs = train_jobs_val if train_jobs_val not in (0,) else -1
+            # Surface MC sim budget via env var for downstream probability engine.
+            try:
+                mc_sims = int(getattr(cli_args, 'mc_sims', 0) or 0)
+                if mc_sims > 0:
+                    os.environ['MC_SIMS_TOTALS'] = str(mc_sims)
+            except Exception:
+                pass
         print(f"🚦 Training speed preset: {model.train_speed_profile}")
 
         # Historical fetch configuration (days + caching)
@@ -11139,6 +11093,7 @@ if __name__ == "__main__":
     parser.add_argument('--odds-history-path', type=str, default='odds_history.csv', help='Path to odds history CSV')
     parser.add_argument('--build-closing-lines', action='store_true', help='Build data/history/closing_lines.csv from --odds-history-path and exit')
     parser.add_argument('--closing-lines-path', type=str, default=os.getenv('CLOSING_LINES_PATH', 'data/history/closing_lines.csv'), help='Output path for canonical closing lines CSV')
+    parser.add_argument('--mc-sims', type=int, default=int(os.getenv('MC_SIMS_TOTALS', '20000')), help='Monte Carlo sims for copula totals/moneyline (default 20000; env MC_SIMS_TOTALS)')
     parser.add_argument('--xg-path', type=str, default=None, help='Path to expected goals JSON for today\'s games')
     parser.add_argument('--xg-baseline-total', type=float, default=float(os.getenv('XG_BASELINE_TOTAL', 6.2)), help='xG baseline total used to compute adjustments')
     parser.add_argument('--xg-clamp-abs', type=float, default=float(os.getenv('XG_CLAMP_ABS', 2.0)), help='Absolute clamp for xG total adjustment')
