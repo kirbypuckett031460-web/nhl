@@ -88,6 +88,18 @@ try:
     STATSMODELS_AVAILABLE = True
 except Exception:
     STATSMODELS_AVAILABLE = False
+try:
+    from lightgbm import LGBMRegressor  # type: ignore
+    LIGHTGBM_AVAILABLE = True
+except Exception:
+    LGBMRegressor = None
+    LIGHTGBM_AVAILABLE = False
+try:
+    from catboost import CatBoostRegressor  # type: ignore
+    CATBOOST_AVAILABLE = True
+except Exception:
+    CatBoostRegressor = None
+    CATBOOST_AVAILABLE = False
 
 # Optional plotting library to build tweet-style image
 try:
@@ -458,11 +470,13 @@ TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
         'hgb_iter': 8,
         'ridge_alphas': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
         'ridge_iter': 6,
+        'poisson_alphas': [0.2, 0.5, 1.0],
+        'poisson_iter': 4,
         'use_rolling_origin': True,
         'cv_scale': 1.0,
         'learn_weights': True,
         'walk_forward': True,
-        'default_weights': [0.32, 0.28, 0.20, 0.20]
+        'default_weights': [0.28, 0.24, 0.18, 0.18, 0.12]
     },
     'balanced': {
         'label': 'Balanced (default)',
@@ -482,11 +496,13 @@ TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
         'hgb_iter': 5,
         'ridge_alphas': [0.2, 0.5, 1.0, 2.0, 4.0],
         'ridge_iter': 5,
+        'poisson_alphas': [0.2, 0.5, 1.0],
+        'poisson_iter': 3,
         'use_rolling_origin': True,
         'cv_scale': 0.85,
         'learn_weights': True,
         'walk_forward': True,
-        'default_weights': [0.34, 0.28, 0.20, 0.18]
+        'default_weights': [0.30, 0.25, 0.18, 0.17, 0.10]
     },
     'fast': {
         'label': 'Fast',
@@ -506,12 +522,14 @@ TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
         'hgb_iter': 2,
         'ridge_alphas': [0.5, 1.0, 2.0],
         'ridge_iter': 3,
+        'poisson_alphas': [0.3, 0.6],
+        'poisson_iter': 1,
         'use_rolling_origin': False,
         'tss_splits': 3,
         'cv_scale': 0.6,
         'learn_weights': False,
         'walk_forward': False,
-        'default_weights': [0.4, 0.35, 0.15, 0.10],
+        'default_weights': [0.36, 0.30, 0.15, 0.11, 0.08],
         'auto_sample_cap': 600
     },
     'turbo': {
@@ -552,12 +570,17 @@ TRAIN_SPEED_PRESETS: Dict[str, Dict[str, Any]] = {
         'ridge_defaults': {
             'model__alpha': 1.0
         },
+        'poisson_alphas': [0.5],
+        'poisson_iter': 0,
+        'poisson_defaults': {
+            'model__alpha': 0.5
+        },
         'use_rolling_origin': False,
         'tss_splits': 2,
         'cv_scale': 0.45,
         'learn_weights': False,
         'walk_forward': False,
-        'default_weights': [0.45, 0.35, 0.20, 0.0],
+        'default_weights': [0.40, 0.30, 0.18, 0.07, 0.05],
         'auto_sample_cap': 400,
         'skip_goal_models': True
     }
@@ -574,6 +597,19 @@ class RealDataNHLModel:
         self.feature_names = []
         self.feature_baselines: Dict[str, float] = {}
         self.target_baseline: float = 6.2
+        self.train_target_mode: str = str(os.getenv('TRAIN_TARGET', 'edge')).strip().lower() or 'edge'
+        try:
+            self.recency_halflife_days: float = float(os.getenv('RECENCY_HALFLIFE_DAYS', '120'))
+        except Exception:
+            self.recency_halflife_days = 120.0
+        try:
+            self.recency_halflife_games: float = float(os.getenv('RECENCY_HALFLIFE_GAMES', '260'))
+        except Exception:
+            self.recency_halflife_games = 260.0
+        try:
+            self.calibration_window_days: float = float(os.getenv('CALIBRATION_WINDOW_DAYS', '365'))
+        except Exception:
+            self.calibration_window_days = 365.0
         # Store conformal quantiles for uncertainty intervals
         self.conformal_q80: Optional[float] = None
         self.conformal_q90: Optional[float] = None
@@ -1916,6 +1952,12 @@ class RealDataNHLModel:
         pace_mean = lagged_pace.expanding(min_periods=5).mean()
         pace_std = lagged_pace.expanding(min_periods=5).std().replace(0.0, np.nan)
         features['pace_zscore'] = ((lagged_pace - pace_mean) / pace_std).fillna(0.0)
+        # League scoring environment (shifted to avoid leakage)
+        try:
+            league_total = pd.to_numeric(features.get('total_goals'), errors='coerce').shift()
+        except Exception:
+            league_total = pd.Series(np.nan, index=features.index)
+        features['league_total_ewm'] = league_total.ewm(alpha=0.08, min_periods=5).mean().fillna(6.2)
 
         # Opponent-adjusted strength-of-schedule approximation (initialized here; computed after Elo below).
         features['sos_elo'] = 1500.0
@@ -2779,6 +2821,18 @@ class RealDataNHLModel:
                 print("⚠️  Goal feature matrix is empty; skipping goal model training.")
                 return
             Xg = Xg.apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            sample_weight = None
+            try:
+                if 'date' in df.columns:
+                    dates = pd.to_datetime(df['date'], errors='coerce')
+                    max_dt = dates.max()
+                    if pd.notna(max_dt):
+                        delta_days = (max_dt - dates).dt.days.astype(float)
+                        half_life = max(1.0, float(getattr(self, 'recency_halflife_days', 120.0)))
+                        decay = np.log(2.0) / half_life
+                        sample_weight = np.exp(-decay * delta_days)
+            except Exception:
+                sample_weight = None
             goal_pipeline = Pipeline([
                 ('imputer', SimpleImputer(strategy='median')),
                 ('scaler', StandardScaler())
@@ -2792,8 +2846,12 @@ class RealDataNHLModel:
             y_away = df['away_goals'].astype(float)
             self.home_goal_mu_model = PoissonRegressor(alpha=0.5, max_iter=1000)
             self.away_goal_mu_model = PoissonRegressor(alpha=0.5, max_iter=1000)
-            self.home_goal_mu_model.fit(Xg_scaled, y_home)
-            self.away_goal_mu_model.fit(Xg_scaled, y_away)
+            if sample_weight is not None and len(sample_weight) == len(Xg_scaled):
+                self.home_goal_mu_model.fit(Xg_scaled, y_home, sample_weight=sample_weight)
+                self.away_goal_mu_model.fit(Xg_scaled, y_away, sample_weight=sample_weight)
+            else:
+                self.home_goal_mu_model.fit(Xg_scaled, y_home)
+                self.away_goal_mu_model.fit(Xg_scaled, y_away)
             if self.total_model is None:
                 self.total_model = {}
             self.total_model['home_goal_mu_model'] = self.home_goal_mu_model
@@ -3376,11 +3434,65 @@ class RealDataNHLModel:
     
     def prepare_model_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
         """Prepare features, target, and dates for modeling (chronological splits)"""
-        
+        df = df.copy()
+        # Market context features (open/close, price movement, consensus dispersion)
+        try:
+            if 'open_total' in df.columns and 'closing_total' in df.columns:
+                df['line_movement'] = pd.to_numeric(df['closing_total'], errors='coerce') - pd.to_numeric(df['open_total'], errors='coerce')
+        except Exception:
+            pass
+        try:
+            if 'line' in df.columns and 'consensus_total' in df.columns:
+                df['line_diff_vs_consensus'] = pd.to_numeric(df['line'], errors='coerce') - pd.to_numeric(df['consensus_total'], errors='coerce')
+        except Exception:
+            pass
+        def _american_to_implied(series: pd.Series) -> pd.Series:
+            vals = pd.to_numeric(series, errors='coerce')
+            def _conv(v):
+                try:
+                    if v is None or not np.isfinite(v):
+                        return np.nan
+                    return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(v))))
+                except Exception:
+                    return np.nan
+            return vals.apply(_conv)
+        try:
+            if 'open_over_price' in df.columns and 'closing_over_price' in df.columns:
+                df['over_price_move'] = _american_to_implied(df['closing_over_price']) - _american_to_implied(df['open_over_price'])
+            if 'open_under_price' in df.columns and 'closing_under_price' in df.columns:
+                df['under_price_move'] = _american_to_implied(df['closing_under_price']) - _american_to_implied(df['open_under_price'])
+        except Exception:
+            pass
+        try:
+            if 'open_total' in df.columns and 'closing_total' in df.columns:
+                df['market_total_mid'] = (
+                    pd.to_numeric(df['open_total'], errors='coerce') + pd.to_numeric(df['closing_total'], errors='coerce')
+                ) / 2.0
+            else:
+                df['market_total_mid'] = np.nan
+        except Exception:
+            df['market_total_mid'] = np.nan
+        try:
+            if 'market_total' not in df.columns:
+                if 'closing_total' in df.columns:
+                    df['market_total'] = pd.to_numeric(df['closing_total'], errors='coerce')
+                elif 'consensus_total' in df.columns:
+                    df['market_total'] = pd.to_numeric(df['consensus_total'], errors='coerce')
+                elif 'line' in df.columns:
+                    df['market_total'] = pd.to_numeric(df['line'], errors='coerce')
+        except Exception:
+            pass
+        try:
+            if 'consensus_std' not in df.columns and 'dispersion_total_std' in df.columns:
+                df['consensus_std'] = pd.to_numeric(df['dispersion_total_std'], errors='coerce')
+        except Exception:
+            pass
+
         feature_cols = [
             'home_gpg_l3', 'away_gpg_l3', 'home_gpg_l5', 'away_gpg_l5', 'home_gpg_l10', 'away_gpg_l10',
             'home_gag_l3', 'away_gag_l3', 'home_gag_l5', 'away_gag_l5', 'home_gag_l10', 'away_gag_l10',
             'combined_gpg', 'combined_gag', 'expected_pace', 'pace_variance', 'pace_zscore',
+            'league_total_ewm',
             'venue_total_avg', 'altitude_bonus', 'rivalry_boost', 'b2b_penalty',
             'home_b2b', 'away_b2b', 'season_progress', 'late_season', 'rest_diff', 'schedule_density_diff',
             'base_total_prediction', 'total_adjustments', 'final_prediction_base', 'travel_fatigue_index',
@@ -3405,6 +3517,11 @@ class RealDataNHLModel:
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
             'skater_goalie_edge',
+            # Market line context
+            'market_total', 'market_total_mid', 'open_total', 'closing_total', 'consensus_total',
+            'line_movement', 'line_diff_vs_consensus',
+            'open_over_price', 'open_under_price', 'closing_over_price', 'closing_under_price',
+            'over_price_move', 'under_price_move', 'consensus_std',
             # Environment overlays
             'env_outdoor','env_start_hour','env_temp_f','env_wind_mph'
         ]
@@ -3456,7 +3573,9 @@ class RealDataNHLModel:
                 except Exception:
                     have_lines = 0
             # Require a decent sample; otherwise stay in total mode.
-            if have_lines >= max(120, int(0.35 * max(1, len(df)))):
+            min_lines = int(os.getenv('MIN_EDGE_LINES', '80'))
+            min_ratio = float(os.getenv('MIN_EDGE_LINE_RATIO', '0.2'))
+            if have_lines >= max(min_lines, int(min_ratio * max(1, len(df)))):
                 target_mode = 'edge'
             else:
                 target_mode = 'total'
@@ -3478,6 +3597,10 @@ class RealDataNHLModel:
         X = X[mask]
         y = y[mask]
         dates = dates[mask]
+        try:
+            self._training_frame = df.loc[mask].reset_index(drop=True)
+        except Exception:
+            self._training_frame = None
 
         # Capture per-game market lines aligned to X/y when available (even in total mode).
         self.market_lines = None
@@ -3636,6 +3759,10 @@ class RealDataNHLModel:
             ordered_indices = dates.sort_values().index
             X_sorted = X.loc[ordered_indices].reset_index(drop=True)
             y_sorted = y.loc[ordered_indices].reset_index(drop=True)
+            try:
+                dates_sorted = pd.to_datetime(dates.loc[ordered_indices], errors='coerce').reset_index(drop=True)
+            except Exception:
+                dates_sorted = None
             if lines_all is not None and len(lines_all) == len(X):
                 try:
                     lines_sorted = lines_all.loc[ordered_indices].reset_index(drop=True)
@@ -3657,12 +3784,27 @@ class RealDataNHLModel:
                     under_prices_sorted = None
             else:
                 under_prices_sorted = None
+            try:
+                if getattr(self, '_training_frame', None) is not None:
+                    frame_sorted = self._training_frame.loc[ordered_indices].reset_index(drop=True)
+                else:
+                    frame_sorted = None
+            except Exception:
+                frame_sorted = None
         else:
             X_sorted = X.reset_index(drop=True)
             y_sorted = y.reset_index(drop=True)
+            try:
+                dates_sorted = pd.to_datetime(dates, errors='coerce').reset_index(drop=True) if dates is not None else None
+            except Exception:
+                dates_sorted = None
             lines_sorted = lines_all.reset_index(drop=True) if lines_all is not None and len(lines_all) == len(X) else None
             over_prices_sorted = over_prices_all.reset_index(drop=True) if over_prices_all is not None and len(over_prices_all) == len(X) else None
             under_prices_sorted = under_prices_all.reset_index(drop=True) if under_prices_all is not None and len(under_prices_all) == len(X) else None
+            try:
+                frame_sorted = self._training_frame.reset_index(drop=True) if getattr(self, '_training_frame', None) is not None else None
+            except Exception:
+                frame_sorted = None
         split_index = max(1, min(len(X_sorted) - 1, int(len(X_sorted) * 0.75)))
         X_train = X_sorted.iloc[:split_index].reset_index(drop=True)
         y_train = y_sorted.iloc[:split_index].reset_index(drop=True)
@@ -3672,6 +3814,30 @@ class RealDataNHLModel:
         lines_test = lines_sorted.iloc[split_index:].reset_index(drop=True) if lines_sorted is not None else None
         over_prices_test = over_prices_sorted.iloc[split_index:].reset_index(drop=True) if over_prices_sorted is not None else None
         under_prices_test = under_prices_sorted.iloc[split_index:].reset_index(drop=True) if under_prices_sorted is not None else None
+        # Recency weights (default exponential decay by days or games)
+        weights_all = None
+        try:
+            if dates_sorted is not None and len(dates_sorted) == len(X_sorted):
+                max_dt = pd.to_datetime(dates_sorted, errors='coerce').max()
+                if pd.notna(max_dt):
+                    delta_days = (max_dt - pd.to_datetime(dates_sorted, errors='coerce')).dt.days.astype(float)
+                    half_life = max(1.0, float(getattr(self, 'recency_halflife_days', 120.0)))
+                    decay = np.log(2.0) / half_life
+                    weights_all = np.exp(-decay * delta_days)
+        except Exception:
+            weights_all = None
+        if weights_all is None or len(weights_all) != len(X_sorted):
+            try:
+                idx = np.arange(len(X_sorted), dtype=float)
+                dist = (len(X_sorted) - 1) - idx
+                half_life_games = max(1.0, float(getattr(self, 'recency_halflife_games', 260.0)))
+                decay = np.log(2.0) / half_life_games
+                weights_all = np.exp(-decay * dist)
+            except Exception:
+                weights_all = np.ones(len(X_sorted), dtype=float)
+        weights_train = np.asarray(weights_all[:len(X_train)], dtype=float)
+        weights_test = np.asarray(weights_all[len(X_train):], dtype=float) if len(X_test) else np.array([], dtype=float)
+        dates_train = dates_sorted.iloc[:len(X_train)] if dates_sorted is not None and len(dates_sorted) >= len(X_train) else None
         # Determine if we're training in edge mode (must be defined before any later references).
         is_edge_mode = str(getattr(self, 'target_mode', 'total') or 'total').strip().lower() == 'edge'
         # Default total line used only as fallback for missing market lines.
@@ -3725,13 +3891,17 @@ class RealDataNHLModel:
         search_n_jobs = self.train_n_jobs if getattr(self, 'train_n_jobs', None) is not None else -1
         hyper_cache = self._load_hyperparam_cache()
         hyper_cache_updated = False
+        fit_params = {}
+        if weights_train is not None and len(weights_train) == len(X_train):
+            fit_params = {'model__sample_weight': weights_train}
 
         def build_search(
             estimator_label: str,
             pipeline,
             param_grid,
             iter_count: int,
-            preset_params: Optional[Dict[str, Any]] = None
+            preset_params: Optional[Dict[str, Any]] = None,
+            fit_params: Optional[Dict[str, Any]] = None
         ):
             iter_count = int(iter_count)
             if iter_count <= 0:
@@ -3791,7 +3961,7 @@ class RealDataNHLModel:
             print(f"🔎 Tuning {estimator_label.upper()} with {search_label} (candidates≈{candidate_desc})")
             start_time = time.time()
             try:
-                search_obj.fit(X_train, y_train)
+                search_obj.fit(X_train, y_train, **(fit_params or {}))
                 elapsed = time.time() - start_time
                 best_score = getattr(search_obj, 'best_score_', None)
                 if best_score is not None:
@@ -3807,6 +3977,16 @@ class RealDataNHLModel:
                 print(f"⚠️  {estimator_label.upper()} tuning failed: {exc}. Using default settings.")
                 return clone(pipeline), False
 
+        def _fit_with_weights(estimator, X_fit, y_fit, weights):
+            if weights is None or len(weights) != len(X_fit):
+                return estimator.fit(X_fit, y_fit)
+            try:
+                if hasattr(estimator, 'named_steps'):
+                    return estimator.fit(X_fit, y_fit, model__sample_weight=weights)
+                return estimator.fit(X_fit, y_fit, sample_weight=weights)
+            except Exception:
+                return estimator.fit(X_fit, y_fit)
+
         rf_pipeline = make_model_pipeline(RandomForestRegressor(random_state=42))
         rf_params = {
             'model__n_estimators': speed_cfg['rf_estimators'],
@@ -3815,7 +3995,7 @@ class RealDataNHLModel:
         }
         rf_iter = int(speed_cfg.get('rf_iter', 6))
         rf_defaults = speed_cfg.get('rf_defaults')
-        rf_estimator, _ = build_search('rf', rf_pipeline, rf_params, rf_iter, rf_defaults)
+        rf_estimator, _ = build_search('rf', rf_pipeline, rf_params, rf_iter, rf_defaults, fit_params=fit_params)
 
         gb_pipeline = make_model_pipeline(GradientBoostingRegressor(random_state=42))
         gb_params = {
@@ -3825,7 +4005,7 @@ class RealDataNHLModel:
         }
         gb_iter = int(speed_cfg.get('gb_iter', 6))
         gb_defaults = speed_cfg.get('gb_defaults')
-        gb_estimator, _ = build_search('gb', gb_pipeline, gb_params, gb_iter, gb_defaults)
+        gb_estimator, _ = build_search('gb', gb_pipeline, gb_params, gb_iter, gb_defaults, fit_params=fit_params)
 
         hgb_pipeline = make_model_pipeline(HistGradientBoostingRegressor(
             random_state=42,
@@ -3841,7 +4021,7 @@ class RealDataNHLModel:
         }
         hgb_iter = int(speed_cfg.get('hgb_iter', 6))
         hgb_defaults = speed_cfg.get('hgb_defaults')
-        hgb_estimator, _ = build_search('hgb', hgb_pipeline, hgb_params, hgb_iter, hgb_defaults)
+        hgb_estimator, _ = build_search('hgb', hgb_pipeline, hgb_params, hgb_iter, hgb_defaults, fit_params=fit_params)
 
         ridge_pipeline = make_model_pipeline(Ridge())
         ridge_params = {'model__alpha': speed_cfg['ridge_alphas']}
@@ -3851,7 +4031,15 @@ class RealDataNHLModel:
         else:
             ridge_iter = max(1, min(ridge_iter_cfg, len(ridge_params['model__alpha'])))
         ridge_defaults = speed_cfg.get('ridge_defaults')
-        ridge_estimator, _ = build_search('ridge', ridge_pipeline, ridge_params, ridge_iter, ridge_defaults)
+        ridge_estimator, _ = build_search('ridge', ridge_pipeline, ridge_params, ridge_iter, ridge_defaults, fit_params=fit_params)
+
+        poisson_pipeline = make_model_pipeline(PoissonRegressor(alpha=0.5, max_iter=1000))
+        poisson_params = {'model__alpha': speed_cfg.get('poisson_alphas', [0.5])}
+        poisson_iter = int(speed_cfg.get('poisson_iter', len(poisson_params['model__alpha'])))
+        if poisson_iter <= 0:
+            poisson_iter = 0
+        poisson_defaults = speed_cfg.get('poisson_defaults')
+        poisson_estimator, _ = build_search('poisson', poisson_pipeline, poisson_params, poisson_iter, poisson_defaults, fit_params=fit_params)
 
         if hyper_cache_updated:
             self._save_hyperparam_cache(hyper_cache)
@@ -3864,9 +4052,42 @@ class RealDataNHLModel:
             'ridge': ridge_estimator,
             'hgb': hgb_estimator
         }
+        if not is_edge_mode:
+            model_order.append('poisson')
+            models['poisson'] = poisson_estimator
+        if LIGHTGBM_AVAILABLE and speed_profile in ('full', 'balanced'):
+            try:
+                lgbm_core = LGBMRegressor(
+                    n_estimators=400,
+                    learning_rate=0.05,
+                    num_leaves=31,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    random_state=42
+                )
+                models['lgbm'] = make_model_pipeline(lgbm_core)
+                model_order.append('lgbm')
+            except Exception:
+                pass
+        if CATBOOST_AVAILABLE and speed_profile in ('full', 'balanced'):
+            try:
+                cat_core = CatBoostRegressor(
+                    iterations=450,
+                    learning_rate=0.05,
+                    depth=6,
+                    loss_function='RMSE',
+                    random_seed=42,
+                    verbose=False
+                )
+                models['cat'] = make_model_pipeline(cat_core)
+                model_order.append('cat')
+            except Exception:
+                pass
 
         # Learn stacking weights via OOF predictions across time-series splits
-        weights_array = np.array(speed_cfg.get('default_weights', [0.32, 0.28, 0.20, 0.20]), dtype=float)
+        weights_array = np.array(speed_cfg.get('default_weights', []), dtype=float)
+        if len(weights_array) != len(model_order):
+            weights_array = np.ones(len(model_order), dtype=float)
         if speed_cfg.get('learn_weights', True):
             try:
                 X_all = X_sorted
@@ -3879,11 +4100,12 @@ class RealDataNHLModel:
                         X_tr_fold = X_all.iloc[tr_idx]
                         y_tr_fold = y_all.iloc[tr_idx]
                         X_val_fold = X_all.iloc[val_idx]
+                        w_tr_fold = weights_all[tr_idx] if weights_all is not None and len(weights_all) == len(X_all) else None
                         for name in model_order:
                             est = models[name]
                             est_fold = clone(est)
                             try:
-                                est_fold.fit(X_tr_fold, y_tr_fold)
+                                _fit_with_weights(est_fold, X_tr_fold, y_tr_fold, w_tr_fold)
                                 preds_fold = est_fold.predict(X_val_fold)
                             except Exception:
                                 preds_fold = np.zeros(len(X_val_fold))
@@ -3894,7 +4116,15 @@ class RealDataNHLModel:
                         P = np.vstack([oof[name][valid] for name in model_order]).T
                     y_oof = y_all.iloc[valid].values
                     if P is not None and P.size:
-                        coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
+                        try:
+                            w_oof = weights_all[valid] if weights_all is not None and len(weights_all) == len(X_all) else None
+                            if w_oof is not None:
+                                w_sqrt = np.sqrt(np.asarray(w_oof, dtype=float)).reshape(-1, 1)
+                                coefs, *_ = np.linalg.lstsq(P * w_sqrt, y_oof * w_sqrt.ravel(), rcond=None)
+                            else:
+                                coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
+                        except Exception:
+                            coefs, *_ = np.linalg.lstsq(P, y_oof, rcond=None)
                         coefs = np.clip(coefs, 0.0, None)
                         if coefs.sum() > 0:
                             weights_array = coefs / coefs.sum()
@@ -3911,13 +4141,17 @@ class RealDataNHLModel:
         for name in model_order:
             est = models[name]
             est_final = clone(est)
-            est_final.fit(X_train, y_train)
+            _fit_with_weights(est_final, X_train, y_train, weights_train)
             trained_models[name] = est_final
             test_preds.append(est_final.predict(X_test))
         test_preds = np.vstack(test_preds)  # shape (K, N)
         ensemble_pred = (weights_array.reshape(-1, 1) * test_preds).sum(axis=0)
 
-        def _fit_poisson_components(features_scaled: Any, target: pd.Series) -> Tuple[Optional[PoissonRegressor], Optional[Dict[str, float]], Optional[Any]]:
+        def _fit_poisson_components(
+            features_scaled: Any,
+            target: pd.Series,
+            sample_weight: Optional[np.ndarray] = None
+        ) -> Tuple[Optional[PoissonRegressor], Optional[Dict[str, float]], Optional[Any]]:
             poisson_local = None
             nb_local = None
             gp_local = None
@@ -3925,7 +4159,10 @@ class RealDataNHLModel:
                 return None, None, None
             try:
                 poisson_local = PoissonRegressor(alpha=0.5, max_iter=1000)
-                poisson_local.fit(features_scaled, target)
+                if sample_weight is not None and len(sample_weight) == len(target):
+                    poisson_local.fit(features_scaled, target, sample_weight=sample_weight)
+                else:
+                    poisson_local.fit(features_scaled, target)
                 mu_vals = poisson_local.predict(features_scaled)
                 resid = target.values - mu_vals
                 var_hat = float(np.var(resid)) + float(np.mean(mu_vals))
@@ -3954,13 +4191,41 @@ class RealDataNHLModel:
                     y_train_for_poisson = pd.Series(y_train.values + tr_lines_for_poisson, index=y_train.index)
             except Exception:
                 y_train_for_poisson = y_train
-        poisson_model, nb_params, gp_model = _fit_poisson_components(X_train_scaled, y_train_for_poisson)
+        poisson_model, nb_params, gp_model = _fit_poisson_components(X_train_scaled, y_train_for_poisson, weights_train)
 
         # Poisson expected totals on the test set
         if poisson_model is not None:
             poisson_pred = poisson_model.predict(X_test_scaled)
         else:
             poisson_pred = None
+
+        # Optional goal-based total head (home + away Poisson), trained on train split only
+        goal_total_pred = None
+        try:
+            if frame_sorted is not None and {'home_goals', 'away_goals'}.issubset(frame_sorted.columns):
+                goal_frame_train = frame_sorted.iloc[:len(X_train)].copy()
+                goal_frame_test = frame_sorted.iloc[len(X_train):].copy()
+                y_home = pd.to_numeric(goal_frame_train['home_goals'], errors='coerce')
+                y_away = pd.to_numeric(goal_frame_train['away_goals'], errors='coerce')
+                goal_pipeline_eval = Pipeline([
+                    ('imputer', SimpleImputer(strategy='median')),
+                    ('scaler', StandardScaler())
+                ])
+                X_goal_train = X_train.copy()
+                X_goal_test = X_test.copy()
+                X_goal_train_scaled = goal_pipeline_eval.fit_transform(X_goal_train)
+                X_goal_test_scaled = goal_pipeline_eval.transform(X_goal_test)
+                goal_home_model = PoissonRegressor(alpha=0.5, max_iter=1000)
+                goal_away_model = PoissonRegressor(alpha=0.5, max_iter=1000)
+                if weights_train is not None and len(weights_train) == len(y_home):
+                    goal_home_model.fit(X_goal_train_scaled, y_home, sample_weight=weights_train)
+                    goal_away_model.fit(X_goal_train_scaled, y_away, sample_weight=weights_train)
+                else:
+                    goal_home_model.fit(X_goal_train_scaled, y_home)
+                    goal_away_model.fit(X_goal_train_scaled, y_away)
+                goal_total_pred = goal_home_model.predict(X_goal_test_scaled) + goal_away_model.predict(X_goal_test_scaled)
+        except Exception:
+            goal_total_pred = None
         
         walk_metrics: Dict[str, Any] = {}
         if speed_cfg.get('walk_forward', True):
@@ -4018,6 +4283,36 @@ class RealDataNHLModel:
             rmse = float(np.sqrt(mean_squared_error(y_test, ensemble_pred)))
             mae = float(mean_absolute_error(y_test, ensemble_pred))
             residual_std = float(np.std(y_test.values - ensemble_pred)) if len(y_test) > 1 else 0.85
+
+        # Learn blend weights across ensemble/poisson/goal totals on holdout
+        blend_weights = None
+        try:
+            blend_targets = actual_total_test if is_edge_mode else y_test.values.astype(float)
+            blend_inputs: Dict[str, np.ndarray] = {
+                'ensemble': np.asarray(pred_total_test if is_edge_mode else ensemble_pred, dtype=float)
+            }
+            if poisson_pred is not None and len(poisson_pred) == len(blend_inputs['ensemble']):
+                blend_inputs['poisson'] = np.asarray(poisson_pred, dtype=float)
+            if goal_total_pred is not None and len(goal_total_pred) == len(blend_inputs['ensemble']):
+                blend_inputs['goal'] = np.asarray(goal_total_pred, dtype=float)
+            if len(blend_inputs) >= 2:
+                M = np.column_stack([blend_inputs[k] for k in blend_inputs.keys()])
+                w = None
+                try:
+                    if weights_test is not None and len(weights_test) == len(blend_targets):
+                        w_sqrt = np.sqrt(np.asarray(weights_test, dtype=float)).reshape(-1, 1)
+                        coefs, *_ = np.linalg.lstsq(M * w_sqrt, blend_targets * w_sqrt.ravel(), rcond=None)
+                    else:
+                        coefs, *_ = np.linalg.lstsq(M, blend_targets, rcond=None)
+                except Exception:
+                    coefs, *_ = np.linalg.lstsq(M, blend_targets, rcond=None)
+                coefs = np.clip(coefs, 0.0, None)
+                if np.isfinite(coefs).all() and coefs.sum() > 0:
+                    w = coefs / coefs.sum()
+                if w is not None:
+                    blend_weights = {k: float(w[i]) for i, k in enumerate(blend_inputs.keys())}
+        except Exception:
+            blend_weights = None
 
         # Symmetric conformal interval via absolute residual quantiles (configurable quantile)
         if is_edge_mode:
@@ -4157,7 +4452,8 @@ class RealDataNHLModel:
                             continue
                         est_fold = clone(est)
                         try:
-                            est_fold.fit(X_tr, y_tr)
+                            w_tr_fold = weights_train[tr_idx] if weights_train is not None and len(weights_train) == len(X_train) else None
+                            _fit_with_weights(est_fold, X_tr, y_tr, w_tr_fold)
                             fold_preds.append(np.asarray(est_fold.predict(X_val), dtype=float))
                         except Exception:
                             fold_preds.append(np.zeros(len(X_val), dtype=float))
@@ -4170,6 +4466,16 @@ class RealDataNHLModel:
                     except Exception:
                         oof_std[val_idx] = np.nan
                 valid = np.isfinite(oof_pred)
+                if dates_train is not None:
+                    try:
+                        cal_window = float(getattr(self, 'calibration_window_days', 365.0))
+                        if cal_window > 0:
+                            max_dt = pd.to_datetime(dates_train, errors='coerce').max()
+                            cutoff = max_dt - pd.Timedelta(days=cal_window)
+                            recent_mask = pd.to_datetime(dates_train, errors='coerce') >= cutoff
+                            valid = valid & recent_mask.to_numpy()
+                    except Exception:
+                        pass
                 if valid.any():
                     # Convert OOF predictions into TOTAL space and compute NB/Poisson over probabilities.
                     if is_edge_mode:
@@ -4189,7 +4495,14 @@ class RealDataNHLModel:
                     keep = ~is_push_train
                     oof_over = (actual_total > tr_lines[valid]).astype(int)
                     iso = IsotonicRegression(out_of_bounds='clip')
-                    iso.fit(raw_oof_prob[keep], oof_over[keep])
+                    try:
+                        w_cal = weights_train[valid] if weights_train is not None and len(weights_train) == len(X_train) else None
+                        if w_cal is not None:
+                            iso.fit(raw_oof_prob[keep], oof_over[keep], sample_weight=w_cal[keep])
+                        else:
+                            iso.fit(raw_oof_prob[keep], oof_over[keep])
+                    except Exception:
+                        iso.fit(raw_oof_prob[keep], oof_over[keep])
                     iso_over_model = iso
 
                     # Secondary probability calibrator: LogisticRegression on (pred_edge, model_std, line).
@@ -4207,7 +4520,11 @@ class RealDataNHLModel:
                                 ('scaler', StandardScaler()),
                                 ('lr', LogisticRegression(max_iter=1000))
                             ])
-                            prob_calibrator.fit(feats[keep_lr], y_bin[keep_lr])
+                            w_cal = weights_train[valid] if weights_train is not None and len(weights_train) == len(X_train) else None
+                            if w_cal is not None:
+                                prob_calibrator.fit(feats[keep_lr], y_bin[keep_lr], lr__sample_weight=w_cal[keep_lr])
+                            else:
+                                prob_calibrator.fit(feats[keep_lr], y_bin[keep_lr])
                     except Exception:
                         prob_calibrator = None
 
@@ -4238,7 +4555,11 @@ class RealDataNHLModel:
                                 ('scaler', StandardScaler()),
                                 ('lr', LogisticRegression(max_iter=1000))
                             ])
-                            p_over_model.fit(feats2[keep2], y_bin[keep2])
+                            w_cal = weights_train[valid] if weights_train is not None and len(weights_train) == len(X_train) else None
+                            if w_cal is not None:
+                                p_over_model.fit(feats2[keep2], y_bin[keep2], lr__sample_weight=w_cal[keep2])
+                            else:
+                                p_over_model.fit(feats2[keep2], y_bin[keep2])
                     except Exception:
                         p_over_model = None
         except Exception:
@@ -4450,7 +4771,7 @@ class RealDataNHLModel:
                 y_sorted_for_poisson = pd.Series(y_sorted.values + ls, index=y_sorted.index)
             except Exception:
                 y_sorted_for_poisson = y_sorted
-        final_poisson, final_nb_params, final_gp = _fit_poisson_components(X_full_scaled, y_sorted_for_poisson)
+        final_poisson, final_nb_params, final_gp = _fit_poisson_components(X_full_scaled, y_sorted_for_poisson, weights_all)
 
         self.locked_feature_pipeline = final_pipeline
 
@@ -4463,6 +4784,7 @@ class RealDataNHLModel:
             'poisson_model': final_poisson,
             'nb_params': final_nb_params,
             'gp_model': final_gp,
+            'blend_weights': blend_weights,
             'target_mode': 'edge' if is_edge_mode else 'total',
             'market_line_col': getattr(self, 'market_line_col', None),
             'cv_strategy_used': cv_label,
@@ -4500,6 +4822,7 @@ class RealDataNHLModel:
             'logloss': logloss,
             'cv_strategy': cv_label,
             'walk_forward': walk_metrics,
+            'blend_weights': blend_weights,
             'precision_edge_floor': self.precision_edge_floor,
             'precision_guard_accuracy': self.precision_guard_accuracy,
             'precision_guard_support': self.precision_guard_support,
@@ -4647,13 +4970,44 @@ class RealDataNHLModel:
             except Exception:
                 poisson_mu = None
 
-        # Blend predictions conservatively if Poisson available (blend in TOTAL space).
-        if poisson_mu is not None:
-            predicted_total = float(0.6 * predicted_total + 0.4 * poisson_mu)
-        if hm_flow is not None and am_flow is not None:
-            flow_total = hm_flow + am_flow
-            ref_total = poisson_mu if poisson_mu is not None else predicted_total
-            predicted_total = float(0.5 * predicted_total + 0.3 * flow_total + 0.2 * ref_total)
+        # Home/away Poisson totals for blend/probability
+        home_mu_model = (self.total_model or {}).get('home_goal_mu_model')
+        away_mu_model = (self.total_model or {}).get('away_goal_mu_model')
+        hm_lr: Optional[float] = None
+        am_lr: Optional[float] = None
+        if home_mu_model is not None and away_mu_model is not None and goal_features_scaled is not None:
+            try:
+                hm_lr = float(home_mu_model.predict(goal_features_scaled)[0])
+                am_lr = float(away_mu_model.predict(goal_features_scaled)[0])
+            except Exception:
+                home_mu_model = None
+                away_mu_model = None
+                hm_lr = None
+                am_lr = None
+        goal_total_lr = (hm_lr + am_lr) if hm_lr is not None and am_lr is not None else None
+        flow_total = (hm_flow + am_flow) if hm_flow is not None and am_flow is not None else None
+
+        # Blend predictions using learned weights when available
+        blend_weights = (self.total_model or {}).get('blend_weights')
+        if isinstance(blend_weights, dict) and blend_weights:
+            candidates = {
+                'ensemble': predicted_total,
+                'poisson': poisson_mu,
+                'goal': goal_total_lr,
+                'flow': flow_total
+            }
+            weights_use = {k: float(v) for k, v in blend_weights.items() if k in candidates and candidates[k] is not None}
+            if weights_use:
+                total_w = float(sum(weights_use.values()))
+                if total_w > 0:
+                    predicted_total = float(sum(candidates[k] * w for k, w in weights_use.items()) / total_w)
+        else:
+            # Blend predictions conservatively if Poisson available (blend in TOTAL space).
+            if poisson_mu is not None:
+                predicted_total = float(0.6 * predicted_total + 0.4 * poisson_mu)
+            if flow_total is not None:
+                ref_total = poisson_mu if poisson_mu is not None else predicted_total
+                predicted_total = float(0.5 * predicted_total + 0.3 * flow_total + 0.2 * ref_total)
         
         if ref_goal_value is not None:
             baseline_val = getattr(self, 'ref_goal_baseline', None)
@@ -4709,19 +5063,6 @@ class RealDataNHLModel:
 
         # Prefer NB/Poisson totals when available (fast + consistent with training);
         # use copula mixture primarily for moneyline/joint goal features.
-        home_mu_model = (self.total_model or {}).get('home_goal_mu_model')
-        away_mu_model = (self.total_model or {}).get('away_goal_mu_model')
-        hm_lr: Optional[float] = None
-        am_lr: Optional[float] = None
-        if home_mu_model is not None and away_mu_model is not None and goal_features_scaled is not None:
-            try:
-                hm_lr = float(home_mu_model.predict(goal_features_scaled)[0])
-                am_lr = float(away_mu_model.predict(goal_features_scaled)[0])
-            except Exception:
-                home_mu_model = None
-                away_mu_model = None
-                hm_lr = None
-                am_lr = None
         component_mus: List[Tuple[float, float]] = []
         component_rhos: List[float] = []
         component_weights: List[float] = []
@@ -9731,7 +10072,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             print(f"⚠️  Status history attach failed: {e}")
         # Configure training target mode (auto|total|edge). Auto uses edge when enough market lines exist.
         try:
-            model.train_target_mode = getattr(cli_args, 'train_target', None) if cli_args else None
+            if cli_args and getattr(cli_args, 'train_target', None):
+                model.train_target_mode = getattr(cli_args, 'train_target', None)
         except Exception:
             pass
         X, y, dates = model.prepare_model_data(enhanced_data)
@@ -10538,6 +10880,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'venue_total_avg': baseline_total,
                 'base_total_prediction': baseline_total,
                 'final_prediction_base': baseline_total,
+                'league_total_ewm': baseline_total,
                 'pace_zscore': 0.0,
                 'rest_diff': 0.0,
                 'schedule_density_diff': 0.0,
@@ -10547,20 +10890,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'home_save_pct_l5': 0.92,
                 'away_save_pct_l5': 0.92,
                 'special_teams_index': 0.0,
-                'special_teams_diff': 0.0
+                'special_teams_diff': 0.0,
+                'line_movement': 0.0,
+                'line_diff_vs_consensus': 0.0,
+                'over_price_move': 0.0,
+                'under_price_move': 0.0,
+                'market_total_mid': baseline_total
             }
 
             for idx, game in todays_features.iterrows():
                 try:
-                    feature_values = []
-                    for feature_name in model.feature_names:
-                        if feature_name in game.index and pd.notna(game[feature_name]):
-                            feature_values.append(float(game[feature_name]))
-                        elif feature_name in baseline_feature_map:
-                            feature_values.append(float(baseline_feature_map[feature_name]))
-                        else:
-                            feature_values.append(static_feature_defaults.get(feature_name, 0.0))
-                    
                     game_id = str(game.get('game_id', f'game_{idx}'))
                     odds_rec = betting_odds.get(game_id, {'total': 6.5, 'over': -110, 'under': -110})
                     betting_line = float(odds_rec.get('total', 6.5))
@@ -10574,6 +10913,60 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         if src_val is not None:
                             odds_source = str(src_val)
                     consensus_total = float(odds_rec.get('consensus_total', betting_line))
+                    # Market-derived feature defaults (open/close + price movement)
+                    open_total = odds_rec.get('open_total', odds_rec.get('opening_total', None))
+                    closing_total = odds_rec.get('closing_total', None)
+                    open_over = odds_rec.get('open_over', odds_rec.get('opening_over', None))
+                    open_under = odds_rec.get('open_under', odds_rec.get('opening_under', None))
+                    closing_over = odds_rec.get('closing_over', None)
+                    closing_under = odds_rec.get('closing_under', None)
+                    market_total = closing_total if isinstance(closing_total, (int, float)) else consensus_total
+                    if not isinstance(market_total, (int, float)):
+                        market_total = betting_line
+                    try:
+                        line_movement = float(closing_total) - float(open_total) if isinstance(open_total, (int, float)) and isinstance(closing_total, (int, float)) else 0.0
+                    except Exception:
+                        line_movement = 0.0
+                    try:
+                        market_total_mid = (float(open_total) + float(closing_total)) / 2.0 if isinstance(open_total, (int, float)) and isinstance(closing_total, (int, float)) else float(market_total)
+                    except Exception:
+                        market_total_mid = float(market_total) if isinstance(market_total, (int, float)) else betting_line
+                    def _implied_prob(a: Optional[float]) -> float:
+                        try:
+                            if a is None or not np.isfinite(a):
+                                return np.nan
+                            return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(a))))
+                        except Exception:
+                            return np.nan
+                    over_price_move = _implied_prob(closing_over) - _implied_prob(open_over) if open_over is not None and closing_over is not None else 0.0
+                    under_price_move = _implied_prob(closing_under) - _implied_prob(open_under) if open_under is not None and closing_under is not None else 0.0
+                    market_feature_defaults = {
+                        'market_total': market_total,
+                        'market_total_mid': market_total_mid,
+                        'open_total': open_total if isinstance(open_total, (int, float)) else market_total,
+                        'closing_total': closing_total if isinstance(closing_total, (int, float)) else market_total,
+                        'consensus_total': consensus_total,
+                        'line_movement': line_movement,
+                        'line_diff_vs_consensus': betting_line - consensus_total if isinstance(consensus_total, (int, float)) else 0.0,
+                        'open_over_price': open_over if isinstance(open_over, (int, float)) else over_price,
+                        'open_under_price': open_under if isinstance(open_under, (int, float)) else under_price,
+                        'closing_over_price': closing_over if isinstance(closing_over, (int, float)) else over_price,
+                        'closing_under_price': closing_under if isinstance(closing_under, (int, float)) else under_price,
+                        'over_price_move': over_price_move if np.isfinite(over_price_move) else 0.0,
+                        'under_price_move': under_price_move if np.isfinite(under_price_move) else 0.0,
+                        'consensus_std': odds_rec.get('dispersion_total_std', 0.0)
+                    }
+
+                    feature_values = []
+                    for feature_name in model.feature_names:
+                        if feature_name in game.index and pd.notna(game[feature_name]):
+                            feature_values.append(float(game[feature_name]))
+                        elif feature_name in market_feature_defaults:
+                            feature_values.append(float(market_feature_defaults[feature_name]))
+                        elif feature_name in baseline_feature_map:
+                            feature_values.append(float(baseline_feature_map[feature_name]))
+                        else:
+                            feature_values.append(static_feature_defaults.get(feature_name, 0.0))
                     best_over_book = odds_rec.get('best_over_book')
                     best_under_book = odds_rec.get('best_under_book')
                     home_moneyline_price = odds_rec.get('home_moneyline')
