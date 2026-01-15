@@ -610,6 +610,14 @@ class RealDataNHLModel:
             self.calibration_window_days: float = float(os.getenv('CALIBRATION_WINDOW_DAYS', '365'))
         except Exception:
             self.calibration_window_days = 365.0
+        try:
+            self.min_edge_lines: int = int(os.getenv('MIN_EDGE_LINES', '80'))
+        except Exception:
+            self.min_edge_lines = 80
+        try:
+            self.min_edge_line_ratio: float = float(os.getenv('MIN_EDGE_LINE_RATIO', '0.2'))
+        except Exception:
+            self.min_edge_line_ratio = 0.2
         # Store conformal quantiles for uncertainty intervals
         self.conformal_q80: Optional[float] = None
         self.conformal_q90: Optional[float] = None
@@ -3573,8 +3581,18 @@ class RealDataNHLModel:
                 except Exception:
                     have_lines = 0
             # Require a decent sample; otherwise stay in total mode.
-            min_lines = int(os.getenv('MIN_EDGE_LINES', '80'))
-            min_ratio = float(os.getenv('MIN_EDGE_LINE_RATIO', '0.2'))
+            try:
+                min_lines = int(getattr(self, 'min_edge_lines', None) or 0)
+            except Exception:
+                min_lines = 0
+            if min_lines <= 0:
+                min_lines = int(os.getenv('MIN_EDGE_LINES', '80'))
+            try:
+                min_ratio = float(getattr(self, 'min_edge_line_ratio', None) or 0)
+            except Exception:
+                min_ratio = 0.0
+            if min_ratio <= 0:
+                min_ratio = float(os.getenv('MIN_EDGE_LINE_RATIO', '0.2'))
             if have_lines >= max(min_lines, int(min_ratio * max(1, len(df)))):
                 target_mode = 'edge'
             else:
@@ -9820,6 +9838,26 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     train_jobs_val = -1
                 model.train_n_jobs = train_jobs_val if train_jobs_val not in (0,) else -1
+            try:
+                model.recency_halflife_days = float(getattr(cli_args, 'recency_halflife_days', model.recency_halflife_days))
+            except Exception:
+                pass
+            try:
+                model.recency_halflife_games = float(getattr(cli_args, 'recency_halflife_games', model.recency_halflife_games))
+            except Exception:
+                pass
+            try:
+                model.calibration_window_days = float(getattr(cli_args, 'calibration_window_days', model.calibration_window_days))
+            except Exception:
+                pass
+            try:
+                model.min_edge_lines = int(getattr(cli_args, 'min_edge_lines', model.min_edge_lines))
+            except Exception:
+                pass
+            try:
+                model.min_edge_line_ratio = float(getattr(cli_args, 'min_edge_line_ratio', model.min_edge_line_ratio))
+            except Exception:
+                pass
             # Surface MC sim budget via env var for downstream probability engine.
             try:
                 mc_sims = int(getattr(cli_args, 'mc_sims', 0) or 0)
@@ -10170,6 +10208,56 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         print("🛡️  Risk feedback loop: " + "; ".join(parts))
                 except Exception:
                     pass
+            try:
+                report_flag = bool(getattr(cli_args, 'calibration_report', False)) if cli_args else False
+                report_flag = report_flag or str(os.getenv('CALIBRATION_REPORT', '')).strip().lower() in TRUTHY_FLAGS
+                top_n = int(getattr(cli_args, 'calibration_report_top', 12)) if cli_args else int(os.getenv('CALIBRATION_REPORT_TOP', '12'))
+                if report_flag:
+                    def _fmt_stat_block(label: str, stats: Dict[str, Any]) -> str:
+                        bets = stats.get('bets')
+                        resolved = stats.get('resolved')
+                        win = stats.get('win_pct')
+                        roi = stats.get('avg_unit_profit')
+                        clv = stats.get('avg_clv')
+                        gap = stats.get('edge_gap')
+                        brier = stats.get('brier')
+                        parts = [f"{label}"]
+                        if isinstance(bets, (int, float)):
+                            parts.append(f"bets={int(bets)}")
+                        if isinstance(resolved, (int, float)):
+                            parts.append(f"resolved={int(resolved)}")
+                        if isinstance(win, (int, float)) and np.isfinite(win):
+                            parts.append(f"win={win:.1%}")
+                        if isinstance(roi, (int, float)) and np.isfinite(roi):
+                            parts.append(f"roi={roi:+.3f}")
+                        if isinstance(clv, (int, float)) and np.isfinite(clv):
+                            parts.append(f"clv={clv:+.3f}")
+                        if isinstance(gap, (int, float)) and np.isfinite(gap):
+                            parts.append(f"edge_gap={gap:+.3f}")
+                        if isinstance(brier, (int, float)) and np.isfinite(brier):
+                            parts.append(f"brier={brier:.4f}")
+                        return " | ".join(parts)
+
+                    by_month = calibration_snapshot.get('by_month', {}) if isinstance(calibration_snapshot, dict) else {}
+                    if isinstance(by_month, dict) and by_month:
+                        print("\nCalibration report by month:")
+                        month_keys = sorted(by_month.keys(), reverse=True)
+                        for key in month_keys[:max(1, top_n)]:
+                            stats = by_month.get(key, {})
+                            print("  " + _fmt_stat_block(str(key), stats))
+
+                    by_book = calibration_snapshot.get('by_book', {}) if isinstance(calibration_snapshot, dict) else {}
+                    if isinstance(by_book, dict) and by_book:
+                        print("\nCalibration report by book:")
+                        rows = []
+                        for key, stats in by_book.items():
+                            resolved = stats.get('resolved', 0)
+                            rows.append((key, stats, resolved))
+                        rows.sort(key=lambda r: (-float(r[2] or 0), str(r[0])))
+                        for key, stats, _ in rows[:max(1, top_n)]:
+                            print("  " + _fmt_stat_block(str(key), stats))
+            except Exception:
+                pass
         
         print("\n🏒 Step 4: Fetching today's games...")
         todays_games = model.get_todays_games(
@@ -11525,7 +11613,12 @@ if __name__ == "__main__":
         default_train_speed = 'balanced'
     parser.add_argument('--train-speed', choices=['fast','balanced','full'], default=default_train_speed, help='Training speed preset: fast trims CV + samples, balanced is default, full matches legacy exhaustive search')
     parser.add_argument('--fast-train', action='store_true', help='Shortcut for --train-speed fast')
-    parser.add_argument('--train-target', choices=['auto','total','edge'], default=str(os.getenv('TRAIN_TARGET', 'auto')).strip().lower(), help='Training target: auto (prefer edge vs closing lines when available), total (predict total goals), edge (predict total_goals - closing_total)')
+    parser.add_argument('--train-target', choices=['auto','total','edge'], default=str(os.getenv('TRAIN_TARGET', 'edge')).strip().lower(), help='Training target: auto (prefer edge vs closing lines when available), total (predict total goals), edge (predict total_goals - closing_total)')
+    parser.add_argument('--recency-halflife-days', type=float, default=float(os.getenv('RECENCY_HALFLIFE_DAYS', '120')), help='Recency decay half-life in days for training weights')
+    parser.add_argument('--recency-halflife-games', type=float, default=float(os.getenv('RECENCY_HALFLIFE_GAMES', '260')), help='Recency decay half-life in games when dates are missing')
+    parser.add_argument('--calibration-window-days', type=float, default=float(os.getenv('CALIBRATION_WINDOW_DAYS', '365')), help='Window size in days for probability calibration')
+    parser.add_argument('--min-edge-lines', type=int, default=int(os.getenv('MIN_EDGE_LINES', '80')), help='Minimum market line count to enable edge target in auto mode')
+    parser.add_argument('--min-edge-line-ratio', type=float, default=float(os.getenv('MIN_EDGE_LINE_RATIO', '0.2')), help='Minimum market line coverage ratio to enable edge target in auto mode')
     parser.add_argument('--max-train-samples', type=int, default=int(os.getenv('MAX_TRAIN_SAMPLES', '0')), help='Cap how many historical games are used for training (0 = no cap)')
     parser.add_argument('--model-path', type=str, default=os.getenv('TRAINED_MODEL_PATH', 'data/cache/trained_model.joblib'), help='Path to persist/load the trained ensemble artifact')
     parser.add_argument('--save-trained-model', action='store_true', help='Persist the trained ensemble to --model-path after fitting')
@@ -11600,6 +11693,8 @@ if __name__ == "__main__":
     parser.add_argument('--post-inline', action='store_true', help='Post a compact inline summary of predictions to Discord')
     parser.add_argument('--post-inline-top', type=int, default=int(os.getenv('POST_INLINE_TOP', '10')), help='How many rows to include in inline Discord posts')
     parser.add_argument('--use-compoisson', action='store_true', help='Enable Generalized Poisson (COM-Poisson proxy) calibration fallback')
+    parser.add_argument('--calibration-report', action='store_true', help='Print calibration report by month and book after training')
+    parser.add_argument('--calibration-report-top', type=int, default=int(os.getenv('CALIBRATION_REPORT_TOP', '12')), help='Max rows to show in calibration report sections')
     args = parser.parse_args()
 
     try:
