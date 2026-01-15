@@ -9086,7 +9086,11 @@ def save_predictions_image(
     df = df.replace({None: '—', np.nan: '—'})
     columns = list(df.columns)
 
-    fig_height = 0.27 * max(1, len(df)) + 1.0
+    n_table_rows = max(1, len(df) + 1)
+    row_height_in = 0.32
+    title_height_in = 0.9
+    bottom_pad_in = 0.25
+    fig_height = max(1.0, (n_table_rows * row_height_in) + title_height_in + bottom_pad_in)
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
     fig.patch.set_facecolor('white')
     ax.axis('off')
@@ -9100,6 +9104,9 @@ def save_predictions_image(
         "Odds from FanDuel."
     )
     ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
+    top_margin = title_height_in / fig_height
+    bottom_margin = bottom_pad_in / fig_height
+    ax.set_position([0.02, bottom_margin, 0.96, 1.0 - top_margin - bottom_margin])
 
     # Compute column widths dynamically so the layout stays stable if columns change
     default_col_widths = {
@@ -9127,7 +9134,7 @@ def save_predictions_image(
 
     table.auto_set_font_size(False)
     table.set_fontsize(12)
-    table.scale(1, 1.2)
+    table.scale(1, 1.0)
 
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_edgecolor('#bdc3c7')
