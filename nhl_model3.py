@@ -2820,10 +2820,20 @@ class RealDataNHLModel:
             # Infer features from enhanced_df
             return
         try:
-            df = enhanced_df.dropna(subset=['home_goals','away_goals']).copy()
+            source_df = None
+            if isinstance(getattr(self, '_training_frame', None), pd.DataFrame):
+                source_df = getattr(self, '_training_frame', None)
+            if source_df is None or not isinstance(source_df, pd.DataFrame):
+                source_df = enhanced_df
+            df = source_df.dropna(subset=['home_goals','away_goals']).copy()
             if df.empty:
                 print("⚠️  No completed games available for goal model training.")
                 return
+            # Ensure feature columns exist (market features are added in prepare_model_data only)
+            baseline_map = getattr(self, 'feature_baselines', {}) or {}
+            for col in self.feature_names:
+                if col not in df.columns:
+                    df[col] = baseline_map.get(col, 0.0)
             Xg = df[self.feature_names].copy()
             if Xg.empty:
                 print("⚠️  Goal feature matrix is empty; skipping goal model training.")
