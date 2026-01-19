@@ -4067,7 +4067,28 @@ class RealDataNHLModel:
         if poisson_iter <= 0:
             poisson_iter = 0
         poisson_defaults = speed_cfg.get('poisson_defaults')
-        poisson_estimator, _ = build_search('poisson', poisson_pipeline, poisson_params, poisson_iter, poisson_defaults, fit_params=fit_params)
+        poisson_estimator = poisson_pipeline
+        poisson_ready = False
+        if is_edge_mode:
+            print("⏭️  Skipping Poisson model in edge mode (target can be negative).")
+        else:
+            try:
+                y_train_numeric = pd.to_numeric(y_train, errors='coerce').to_numpy(dtype=float)
+                y_valid = np.isfinite(y_train_numeric).all() and np.all(y_train_numeric >= 0)
+            except Exception:
+                y_valid = False
+            if y_valid:
+                poisson_estimator, _ = build_search(
+                    'poisson',
+                    poisson_pipeline,
+                    poisson_params,
+                    poisson_iter,
+                    poisson_defaults,
+                    fit_params=fit_params
+                )
+                poisson_ready = True
+            else:
+                print("⚠️  Skipping Poisson model (target must be non-negative and finite).")
 
         if hyper_cache_updated:
             self._save_hyperparam_cache(hyper_cache)
@@ -4080,7 +4101,7 @@ class RealDataNHLModel:
             'ridge': ridge_estimator,
             'hgb': hgb_estimator
         }
-        if not is_edge_mode:
+        if poisson_ready:
             model_order.append('poisson')
             models['poisson'] = poisson_estimator
         if LIGHTGBM_AVAILABLE and speed_profile in ('full', 'balanced'):
