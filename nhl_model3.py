@@ -1900,7 +1900,32 @@ class RealDataNHLModel:
                 features['date'] = pd.to_datetime(features['date'], errors='coerce')
         
         print("Creating enhanced features from NHL data...")
-        features = features.sort_values(['date']).reset_index(drop=True)
+        # Build a robust sort key to avoid same-day ordering leakage.
+        sort_dt = pd.to_datetime(features.get('date'), errors='coerce', utc=True)
+        candidate_cols = [
+            'game_datetime', 'game_date', 'game_time', 'commence_time',
+            'start_time', 'startTimeUTC', 'gameDate', 'start_time_utc'
+        ]
+        for col in candidate_cols:
+            if col in features.columns:
+                try:
+                    sample = features[col].dropna().astype(str).head(5)
+                    has_date = sample.str.contains(r'\d{4}-\d{2}-\d{2}').any()
+                    if col in ('game_time',) and not has_date:
+                        # Skip time-only columns to avoid mis-ordering by today's date.
+                        continue
+                    candidate_dt = pd.to_datetime(features[col], errors='coerce', utc=True)
+                    sort_dt = candidate_dt.combine_first(sort_dt)
+                except Exception:
+                    continue
+        features['_sort_dt'] = sort_dt.dt.tz_convert(None) if hasattr(sort_dt, 'dt') else sort_dt
+        features['_date_only'] = pd.to_datetime(features['_sort_dt'], errors='coerce').dt.date
+        sort_keys = ['_sort_dt']
+        if 'game_id' in features.columns:
+            sort_keys.append('game_id')
+        elif 'matchup' in features.columns:
+            sort_keys.append('matchup')
+        features = features.sort_values(sort_keys).reset_index(drop=True)
 
         # Ensure critical counting stats exist even if upstream feeds omit them
         default_count_cols = {
@@ -1960,23 +1985,55 @@ class RealDataNHLModel:
         pace_mean = lagged_pace.expanding(min_periods=5).mean()
         pace_std = lagged_pace.expanding(min_periods=5).std().replace(0.0, np.nan)
         features['pace_zscore'] = ((lagged_pace - pace_mean) / pace_std).fillna(0.0)
-        # League scoring environment (shifted to avoid leakage)
+        # League scoring environment (use daily history to avoid same-day leakage)
         try:
-            league_total = pd.to_numeric(features.get('total_goals'), errors='coerce').shift()
+            league_total = pd.to_numeric(features.get('total_goals'), errors='coerce')
         except Exception:
             league_total = pd.Series(np.nan, index=features.index)
-        features['league_total_ewm'] = league_total.ewm(alpha=0.08, min_periods=5).mean().fillna(6.2)
+        date_key = features.get('_date_only')
+        if date_key is None:
+            date_key = pd.to_datetime(features.get('date'), errors='coerce').dt.date
+            features['_date_only'] = date_key
+        date_key_col = '_date_only'
+        try:
+            daily_total = league_total.groupby(date_key).mean()
+            daily_ewm = daily_total.shift().ewm(alpha=0.08, min_periods=5).mean()
+            features['league_total_ewm'] = date_key.map(daily_ewm).fillna(6.2)
+        except Exception:
+            league_total = league_total.shift()
+            features['league_total_ewm'] = league_total.ewm(alpha=0.08, min_periods=5).mean().fillna(6.2)
 
         # Opponent-adjusted strength-of-schedule approximation (initialized here; computed after Elo below).
         features['sos_elo'] = 1500.0
         
-        # Venue effects (leak-free: shift then expanding mean)
-        features['venue_total_avg'] = (
-            features.groupby('venue')['total_goals']
-            .apply(lambda s: s.shift().expanding().mean())
-            .reset_index(level=0, drop=True)
-            .fillna(6.2)
-        )
+        # Venue effects (leak-free: use daily history per venue)
+        try:
+            venue_series = features.get('venue')
+            if venue_series is None:
+                raise ValueError("venue column missing")
+            venue_df = pd.DataFrame({
+                'venue': venue_series,
+                date_key_col: date_key,
+                'total_goals': pd.to_numeric(features.get('total_goals'), errors='coerce')
+            })
+            venue_daily = venue_df.groupby(['venue', date_key_col], dropna=False)['total_goals'].mean().reset_index()
+            venue_daily['venue_total_avg'] = venue_daily.groupby('venue')['total_goals'].transform(
+                lambda s: s.shift().expanding().mean()
+            )
+            features = features.merge(
+                venue_daily[['venue', date_key_col, 'venue_total_avg']],
+                on=['venue', date_key_col],
+                how='left',
+                sort=False
+            )
+            features['venue_total_avg'] = features['venue_total_avg'].fillna(6.2)
+        except Exception:
+            features['venue_total_avg'] = (
+                features.groupby('venue')['total_goals']
+                .apply(lambda s: s.shift().expanding().mean())
+                .reset_index(level=0, drop=True)
+                .fillna(6.2)
+            )
         # Some historical sources can produce a non-string (or all-NA) venue column,
         # which breaks pandas' `.str` accessor. Normalize it to a safe string series.
         try:
@@ -2189,6 +2246,7 @@ class RealDataNHLModel:
         # ---------------- Advanced team stats: proxies and EWMAs ----------------
         # Proxies for 5v5 xGF/60 and HDCF/60 using available shots and goals (fallback when detailed feed not available)
         # Coefficients are heuristic; replace with real feed when available
+        pp_xgf_map: Dict[str, pd.Series] = {}
         for team in ['home', 'away']:
             shots_col = f'{team}_shots'
             opp = 'away' if team == 'home' else 'home'
@@ -2213,11 +2271,33 @@ class RealDataNHLModel:
             # 5v5 HDCF/60 proxy ~ shots_l5 * 0.35
             features[f'{team}_5v5_hdcf60'] = (features[f'{team}_shots_l5'].fillna(30.0) * 0.35)
 
-            # PP xGF/60 proxy ~ (pp_goals/opps) * 3.0 (scaled) with guards
-            pp_rate = (features[pp_goals_col].fillna(0.0) / features[pp_opps_col].replace(0, np.nan)).fillna(0.0)
-            features[f'{team}_pp_xgf60'] = (pp_rate * 3.0)
-            # PK xGA/60 proxy ~ opponent PP xGF/60
-            features[f'{team}_pk_xga60'] = features[f'{opp}_pp_xgf60'] if f'{opp}_pp_xgf60' in features else 0.0
+            # PP xGF/60 proxy ~ lagged rolling (pp_goals/opps) * 3.0 (scaled)
+            pp_goals_roll = lagged_rolling_sum(team_col, pp_goals_col, window=10, min_periods=2, fill_value=0.0)
+            pp_opps_roll = lagged_rolling_sum(team_col, pp_opps_col, window=10, min_periods=2, fill_value=0.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                pp_rate = pp_goals_roll / pp_opps_roll.replace(0, np.nan)
+            pp_xgf = (pp_rate * 3.0).fillna(0.0)
+            features[f'{team}_pp_xgf60'] = pp_xgf
+            pp_xgf_map[team] = pp_xgf
+        # PK xGA/60 proxy ~ opponent PP xGF/60 (lagged)
+        if 'home' in pp_xgf_map and 'away' in pp_xgf_map:
+            features['home_pk_xga60'] = pp_xgf_map['away']
+            features['away_pk_xga60'] = pp_xgf_map['home']
+        else:
+            for team in ['home', 'away']:
+                opp = 'away' if team == 'home' else 'home'
+                features[f'{team}_pk_xga60'] = features[f'{opp}_pp_xgf60'] if f'{opp}_pp_xgf60' in features else 0.0
+
+        # Refresh special teams composite metrics now that PP/PK features are lagged.
+        try:
+            home_pp = _safe_series('home_pp_xgf60')
+            away_pp = _safe_series('away_pp_xgf60')
+            home_pk = _safe_series('home_pk_xga60', default=2.0)
+            away_pk = _safe_series('away_pk_xga60', default=2.0)
+            features['special_teams_index'] = (home_pp - away_pk) + (away_pp - home_pk)
+            features['special_teams_diff'] = (home_pp - away_pp)
+        except Exception:
+            pass
 
         # Rolling GSAx proxy: negative deviation of goals against from rolling median baseline
         # Use team conceded (opponent goals) vs rolling median 2.9
@@ -2398,6 +2478,8 @@ class RealDataNHLModel:
         
         # Enrich only rows without final totals by default (i.e., today's games / future rows).
         features = self._merge_context_snapshots(features)
+        # Drop helper columns used for ordering/aggregation.
+        features = features.drop(columns=['_sort_dt', '_date_only'], errors='ignore')
         return features
 
     def _merge_context_snapshots(self, features: pd.DataFrame) -> pd.DataFrame:
@@ -3636,15 +3718,16 @@ class RealDataNHLModel:
             pass
         open_total = pd.to_numeric(df['open_total'], errors='coerce') if 'open_total' in df.columns else None
         asof_total = pd.to_numeric(df['asof_total'], errors='coerce') if 'asof_total' in df.columns else None
-        closing_total = pd.to_numeric(df['closing_total'], errors='coerce') if 'closing_total' in df.columns else None
+        consensus_total = pd.to_numeric(df['consensus_total'], errors='coerce') if 'consensus_total' in df.columns else None
+        line_total = pd.to_numeric(df['line'], errors='coerce') if 'line' in df.columns else None
         try:
             if open_total is not None:
                 if asof_total is not None:
                     line_move = asof_total - open_total
-                    if closing_total is not None:
-                        line_move = line_move.where(asof_total.notna(), closing_total - open_total)
-                elif closing_total is not None:
-                    line_move = closing_total - open_total
+                elif consensus_total is not None:
+                    line_move = consensus_total - open_total
+                elif line_total is not None:
+                    line_move = line_total - open_total
                 else:
                     line_move = None
                 if line_move is not None:
@@ -3666,10 +3749,8 @@ class RealDataNHLModel:
             open_under = pd.to_numeric(df['open_under_price'], errors='coerce') if 'open_under_price' in df.columns else None
             asof_over = pd.to_numeric(df['asof_over_price'], errors='coerce') if 'asof_over_price' in df.columns else None
             asof_under = pd.to_numeric(df['asof_under_price'], errors='coerce') if 'asof_under_price' in df.columns else None
-            closing_over = pd.to_numeric(df['closing_over_price'], errors='coerce') if 'closing_over_price' in df.columns else None
-            closing_under = pd.to_numeric(df['closing_under_price'], errors='coerce') if 'closing_under_price' in df.columns else None
-            over_ref = asof_over if asof_over is not None else closing_over
-            under_ref = asof_under if asof_under is not None else closing_under
+            over_ref = asof_over
+            under_ref = asof_under
             if open_over is not None and over_ref is not None:
                 df['over_price_move'] = _american_to_implied(over_ref) - _american_to_implied(open_over)
             if open_under is not None and under_ref is not None:
@@ -3680,10 +3761,10 @@ class RealDataNHLModel:
             if open_total is not None:
                 if asof_total is not None:
                     mid = (open_total + asof_total) / 2.0
-                    if closing_total is not None:
-                        mid = mid.where(asof_total.notna(), (open_total + closing_total) / 2.0)
-                elif closing_total is not None:
-                    mid = (open_total + closing_total) / 2.0
+                elif consensus_total is not None:
+                    mid = (open_total + consensus_total) / 2.0
+                elif line_total is not None:
+                    mid = (open_total + line_total) / 2.0
                 else:
                     mid = np.nan
                 df['market_total_mid'] = mid
@@ -3696,14 +3777,12 @@ class RealDataNHLModel:
                 market_total = None
                 if asof_total is not None:
                     market_total = asof_total
-                    if closing_total is not None:
-                        market_total = market_total.where(asof_total.notna(), closing_total)
-                elif closing_total is not None:
-                    market_total = closing_total
-                elif 'consensus_total' in df.columns:
-                    market_total = pd.to_numeric(df['consensus_total'], errors='coerce')
-                elif 'line' in df.columns:
-                    market_total = pd.to_numeric(df['line'], errors='coerce')
+                elif consensus_total is not None:
+                    market_total = consensus_total
+                elif line_total is not None:
+                    market_total = line_total
+                elif open_total is not None:
+                    market_total = open_total
                 if market_total is not None:
                     df['market_total'] = market_total
         except Exception:
@@ -3790,10 +3869,10 @@ class RealDataNHLModel:
         if target_mode_req not in ('auto', 'total', 'edge'):
             target_mode_req = 'auto'
 
-        # Prefer as-of market total when available, else closing/consensus/line.
+        # Prefer as-of market total when available, else market/consensus/line.
         self.market_line_col = None
         market_lines_raw = None
-        for candidate in ('asof_total', 'market_total', 'closing_total', 'consensus_total', 'line'):
+        for candidate in ('asof_total', 'market_total', 'consensus_total', 'line'):
             if candidate not in df.columns:
                 continue
             try:
