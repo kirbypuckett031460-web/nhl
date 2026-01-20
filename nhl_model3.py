@@ -36,7 +36,7 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
-from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss
+from sklearn.metrics import mean_squared_error, mean_absolute_error, brier_score_loss, log_loss, mean_poisson_deviance, make_scorer
 from sklearn.impute import SimpleImputer
 import warnings
 from datetime import datetime, timedelta, date
@@ -4231,6 +4231,42 @@ class RealDataNHLModel:
         fit_params = {}
         if weights_train is not None and len(weights_train) == len(X_train):
             fit_params = {'model__sample_weight': weights_train}
+        # Use target-appropriate scoring for hyperparameter search.
+        def _safe_poisson_deviance(y_true, y_pred) -> float:
+            try:
+                y_t = np.asarray(y_true, dtype=float)
+                y_p = np.asarray(y_pred, dtype=float)
+                y_t = np.clip(y_t, 0.0, None)
+                y_p = np.clip(y_p, 1e-6, None)
+                return float(mean_poisson_deviance(y_t, y_p))
+            except Exception:
+                return float(np.mean((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) ** 2))
+        def _edge_brier_loss(y_true, y_pred, scale: float) -> float:
+            try:
+                y_t = np.asarray(y_true, dtype=float)
+                y_p = np.asarray(y_pred, dtype=float)
+                s = max(0.2, float(scale))
+                probs = 1.0 / (1.0 + np.exp(-y_p / s))
+                actual = (y_t > 0).astype(float)
+                return float(np.mean((probs - actual) ** 2))
+            except Exception:
+                return float(np.mean((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) ** 2))
+        scoring_metric: Any = 'neg_mean_squared_error'
+        if is_edge_mode:
+            try:
+                edge_scale = float(np.nanstd(pd.to_numeric(y_train, errors='coerce').to_numpy(dtype=float)))
+                if not np.isfinite(edge_scale) or edge_scale <= 0:
+                    edge_scale = 1.5
+            except Exception:
+                edge_scale = 1.5
+            scoring_metric = make_scorer(_edge_brier_loss, greater_is_better=False, scale=edge_scale)
+        else:
+            try:
+                y_train_numeric = pd.to_numeric(y_train, errors='coerce').to_numpy(dtype=float)
+                if np.isfinite(y_train_numeric).all() and np.all(y_train_numeric >= 0):
+                    scoring_metric = make_scorer(_safe_poisson_deviance, greater_is_better=False)
+            except Exception:
+                scoring_metric = 'neg_mean_squared_error'
 
         def build_search(
             estimator_label: str,
@@ -4264,7 +4300,7 @@ class RealDataNHLModel:
             base_kwargs = {
                 'cv': cv_strategy,
                 'random_state': 42,
-                'scoring': 'neg_mean_squared_error',
+                'scoring': scoring_metric,
                 'n_jobs': search_n_jobs,
                 'verbose': 0
             }
@@ -4657,13 +4693,22 @@ class RealDataNHLModel:
                 M = np.column_stack([blend_inputs[k] for k in blend_inputs.keys()])
                 w = None
                 try:
+                    ridge_alpha = float(os.getenv('BLEND_RIDGE_ALPHA', '1.0'))
+                    blend_ridge = Ridge(alpha=ridge_alpha, fit_intercept=False, positive=True)
                     if weights_test is not None and len(weights_test) == len(blend_targets):
-                        w_sqrt = np.sqrt(np.asarray(weights_test, dtype=float)).reshape(-1, 1)
-                        coefs, *_ = np.linalg.lstsq(M * w_sqrt, blend_targets * w_sqrt.ravel(), rcond=None)
+                        blend_ridge.fit(M, blend_targets, sample_weight=weights_test)
                     else:
-                        coefs, *_ = np.linalg.lstsq(M, blend_targets, rcond=None)
+                        blend_ridge.fit(M, blend_targets)
+                    coefs = np.asarray(getattr(blend_ridge, 'coef_', []), dtype=float)
                 except Exception:
-                    coefs, *_ = np.linalg.lstsq(M, blend_targets, rcond=None)
+                    try:
+                        if weights_test is not None and len(weights_test) == len(blend_targets):
+                            w_sqrt = np.sqrt(np.asarray(weights_test, dtype=float)).reshape(-1, 1)
+                            coefs, *_ = np.linalg.lstsq(M * w_sqrt, blend_targets * w_sqrt.ravel(), rcond=None)
+                        else:
+                            coefs, *_ = np.linalg.lstsq(M, blend_targets, rcond=None)
+                    except Exception:
+                        coefs = np.zeros(M.shape[1], dtype=float)
                 coefs = np.clip(coefs, 0.0, None)
                 if np.isfinite(coefs).all() and coefs.sum() > 0:
                     w = coefs / coefs.sum()
@@ -5117,9 +5162,12 @@ class RealDataNHLModel:
             X_full_scaled = X_sorted.values
 
         final_models: Dict[str, Any] = {}
+        weights_full = None
+        if weights_all is not None and len(weights_all) == len(X_sorted):
+            weights_full = np.asarray(weights_all, dtype=float)
         for name in model_order:
             est_full = clone(models[name])
-            est_full.fit(X_sorted, y_sorted)
+            _fit_with_weights(est_full, X_sorted, y_sorted, weights_full)
             final_models[name] = est_full
 
         y_sorted_for_poisson = y_sorted
