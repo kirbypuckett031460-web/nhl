@@ -647,6 +647,8 @@ class RealDataNHLModel:
         self.market_calibration_snapshot: Optional[Dict[str, Any]] = None
         self.book_confidence_multipliers: Dict[str, float] = {}
         self.month_confidence_multipliers: Dict[str, float] = {}
+        self.train_month_multipliers: Dict[str, float] = {}
+        self.train_season_multipliers: Dict[str, float] = {}
         self.current_prediction_month: Optional[str] = None
         # Dynamic risk/edge feedback controls (populated from bet logs)
         self.risk_edge_floor: float = 0.22
@@ -795,6 +797,10 @@ class RealDataNHLModel:
         self.consensus_std_cap = total_model.get('consensus_std_cap')
         self.consensus_guard_accuracy = total_model.get('consensus_guard_accuracy')
         self.consensus_guard_support = total_model.get('consensus_guard_support')
+        if isinstance(total_model.get('train_month_multipliers'), dict):
+            self.train_month_multipliers = total_model.get('train_month_multipliers') or {}
+        if isinstance(total_model.get('train_season_multipliers'), dict):
+            self.train_season_multipliers = total_model.get('train_season_multipliers') or {}
         if isinstance(payload, dict):
             self.market_calibration_snapshot = payload.get('market_calibration_snapshot', self.market_calibration_snapshot)
             self.risk_feedback_snapshot = payload.get('risk_feedback_snapshot', self.risk_feedback_snapshot)
@@ -1419,6 +1425,10 @@ class RealDataNHLModel:
         mult = 1.0
         if bet_month:
             mult *= self.month_confidence_multipliers.get(bet_month, 1.0)
+            mult *= self.train_month_multipliers.get(bet_month, 1.0)
+            if bet_month and isinstance(self.train_season_multipliers, dict):
+                season_key = str(bet_month).split('-')[0]
+                mult *= self.train_season_multipliers.get(season_key, 1.0)
         if book:
             key = str(book).upper().strip()
             if key:
@@ -1927,6 +1937,31 @@ class RealDataNHLModel:
             sort_keys.append('matchup')
         features = features.sort_values(sort_keys).reset_index(drop=True)
 
+        # Normalize team abbreviations for stable identity features.
+        try:
+            if 'home_team' in features.columns:
+                features['home_team'] = features['home_team'].astype(str).str.upper().str.strip()
+            if 'away_team' in features.columns:
+                features['away_team'] = features['away_team'].astype(str).str.upper().str.strip()
+        except Exception:
+            pass
+        # Team identity one-hot (persistent style signal).
+        try:
+            team_map = NHLDataFetcher()._get_fallback_teams()
+            team_abbrs = sorted({v['abbreviation'].upper() for v in team_map.values() if v.get('abbreviation')})
+            if 'home_team' in features.columns:
+                for abbr in team_abbrs:
+                    col = f'home_team_{abbr}'
+                    if col not in features.columns:
+                        features[col] = (features['home_team'] == abbr).astype(int)
+            if 'away_team' in features.columns:
+                for abbr in team_abbrs:
+                    col = f'away_team_{abbr}'
+                    if col not in features.columns:
+                        features[col] = (features['away_team'] == abbr).astype(int)
+        except Exception:
+            pass
+
         # Ensure critical counting stats exist even if upstream feeds omit them
         default_count_cols = {
             'home_pp_goals': 0.0,
@@ -2242,6 +2277,39 @@ class RealDataNHLModel:
         for col in goalie_feature_cols:
             if col not in features.columns:
                 features[col] = 0.0
+        # Derived goalie context features (starter/backup/rest/fatigue).
+        try:
+            self._compute_goalie_derived_features(features)
+        except Exception:
+            pass
+
+        # Prefer real xG/shot-quality columns when provided (MoneyPuck/NST/EvolvingHockey).
+        def _coalesce_series(candidates: List[str]) -> Optional[pd.Series]:
+            for col in candidates:
+                if col in features.columns:
+                    series = pd.to_numeric(features[col], errors='coerce')
+                    if series.notna().any():
+                        return series
+            return None
+
+        real_metric_map = {
+            'home_5v5_xgf60': ['home_5v5_xgf60', 'home_xgf60_5v5', 'home_xgf60', 'xgf60_5v5_home'],
+            'away_5v5_xgf60': ['away_5v5_xgf60', 'away_xgf60_5v5', 'away_xgf60', 'xgf60_5v5_away'],
+            'home_5v5_hdcf60': ['home_5v5_hdcf60', 'home_hdcf60_5v5', 'home_hdcf60', 'hdcf60_5v5_home'],
+            'away_5v5_hdcf60': ['away_5v5_hdcf60', 'away_hdcf60_5v5', 'away_hdcf60', 'hdcf60_5v5_away'],
+            'home_pp_xgf60': ['home_pp_xgf60', 'home_pp_xgf', 'pp_xgf60_home'],
+            'away_pp_xgf60': ['away_pp_xgf60', 'away_pp_xgf', 'pp_xgf60_away'],
+            'home_pk_xga60': ['home_pk_xga60', 'home_pk_xga', 'pk_xga60_home'],
+            'away_pk_xga60': ['away_pk_xga60', 'away_pk_xga', 'pk_xga60_away'],
+        }
+        for target_col, candidates in real_metric_map.items():
+            real_series = _coalesce_series(candidates)
+            if real_series is None:
+                continue
+            if target_col not in features.columns:
+                features[target_col] = real_series
+            else:
+                features[target_col] = pd.to_numeric(features[target_col], errors='coerce').fillna(real_series)
 
         # ---------------- Advanced team stats: proxies and EWMAs ----------------
         # Proxies for 5v5 xGF/60 and HDCF/60 using available shots and goals (fallback when detailed feed not available)
@@ -2266,10 +2334,20 @@ class RealDataNHLModel:
                 .reset_index(level=0, drop=True)
             )
 
-            # 5v5 xGF/60 proxy ~ shots_l5 * 0.055
-            features[f'{team}_5v5_xgf60'] = (features[f'{team}_shots_l5'].fillna(30.0) * 0.055)
-            # 5v5 HDCF/60 proxy ~ shots_l5 * 0.35
-            features[f'{team}_5v5_hdcf60'] = (features[f'{team}_shots_l5'].fillna(30.0) * 0.35)
+            # 5v5 xGF/60 proxy ~ shots_l5 * 0.055 (fill only when real data missing)
+            proxy_xgf = (features[f'{team}_shots_l5'].fillna(30.0) * 0.055)
+            xgf_col = f'{team}_5v5_xgf60'
+            if xgf_col in features.columns:
+                features[xgf_col] = pd.to_numeric(features[xgf_col], errors='coerce').fillna(proxy_xgf)
+            else:
+                features[xgf_col] = proxy_xgf
+            # 5v5 HDCF/60 proxy ~ shots_l5 * 0.35 (fill only when real data missing)
+            proxy_hdcf = (features[f'{team}_shots_l5'].fillna(30.0) * 0.35)
+            hdcf_col = f'{team}_5v5_hdcf60'
+            if hdcf_col in features.columns:
+                features[hdcf_col] = pd.to_numeric(features[hdcf_col], errors='coerce').fillna(proxy_hdcf)
+            else:
+                features[hdcf_col] = proxy_hdcf
 
             # PP xGF/60 proxy ~ lagged rolling (pp_goals/opps) * 3.0 (scaled)
             pp_goals_roll = lagged_rolling_sum(team_col, pp_goals_col, window=10, min_periods=2, fill_value=0.0)
@@ -2277,12 +2355,22 @@ class RealDataNHLModel:
             with np.errstate(divide='ignore', invalid='ignore'):
                 pp_rate = pp_goals_roll / pp_opps_roll.replace(0, np.nan)
             pp_xgf = (pp_rate * 3.0).fillna(0.0)
-            features[f'{team}_pp_xgf60'] = pp_xgf
-            pp_xgf_map[team] = pp_xgf
+            pp_col = f'{team}_pp_xgf60'
+            if pp_col in features.columns:
+                features[pp_col] = pd.to_numeric(features[pp_col], errors='coerce').fillna(pp_xgf)
+            else:
+                features[pp_col] = pp_xgf
+            pp_xgf_map[team] = features[pp_col]
         # PK xGA/60 proxy ~ opponent PP xGF/60 (lagged)
         if 'home' in pp_xgf_map and 'away' in pp_xgf_map:
-            features['home_pk_xga60'] = pp_xgf_map['away']
-            features['away_pk_xga60'] = pp_xgf_map['home']
+            if 'home_pk_xga60' in features.columns:
+                features['home_pk_xga60'] = pd.to_numeric(features['home_pk_xga60'], errors='coerce').fillna(pp_xgf_map['away'])
+            else:
+                features['home_pk_xga60'] = pp_xgf_map['away']
+            if 'away_pk_xga60' in features.columns:
+                features['away_pk_xga60'] = pd.to_numeric(features['away_pk_xga60'], errors='coerce').fillna(pp_xgf_map['home'])
+            else:
+                features['away_pk_xga60'] = pp_xgf_map['home']
         else:
             for team in ['home', 'away']:
                 opp = 'away' if team == 'home' else 'home'
@@ -2353,11 +2441,26 @@ class RealDataNHLModel:
             shots_l5 = features.get(f'{team}_shots_l5', pd.Series(30.0, index=features.index)).fillna(30.0)
             hdcf60 = features.get(f'{team}_5v5_hdcf60', pd.Series(10.0, index=features.index)).fillna(10.0)
             # Rush chances correlate with transition rate; proxy from shots and hdcf
-            features[f'{team}_rush60'] = (0.20 * shots_l5) + (0.15 * hdcf60)
+            rush_proxy = (0.20 * shots_l5) + (0.15 * hdcf60)
+            rush_col = f'{team}_rush60'
+            if rush_col in features.columns:
+                features[rush_col] = pd.to_numeric(features[rush_col], errors='coerce').fillna(rush_proxy)
+            else:
+                features[rush_col] = rush_proxy
             # Rebounds created scale with shots on target and slot volume
-            features[f'{team}_rebounds60'] = (0.12 * shots_l5) + (0.08 * hdcf60)
+            rebound_proxy = (0.12 * shots_l5) + (0.08 * hdcf60)
+            rebound_col = f'{team}_rebounds60'
+            if rebound_col in features.columns:
+                features[rebound_col] = pd.to_numeric(features[rebound_col], errors='coerce').fillna(rebound_proxy)
+            else:
+                features[rebound_col] = rebound_proxy
             # Slot attempts approximate as blend of HDCF and overall volume
-            features[f'{team}_slot60'] = (0.60 * hdcf60) + (0.10 * shots_l5)
+            slot_proxy = (0.60 * hdcf60) + (0.10 * shots_l5)
+            slot_col = f'{team}_slot60'
+            if slot_col in features.columns:
+                features[slot_col] = pd.to_numeric(features[slot_col], errors='coerce').fillna(slot_proxy)
+            else:
+                features[slot_col] = slot_proxy
 
         # Finishing delta (over/under xG) using EWM goals vs xGF proxy
         for team in ['home', 'away']:
@@ -3297,6 +3400,55 @@ class RealDataNHLModel:
         except Exception:
             return {}
         return team_strength
+
+    def _compute_goalie_derived_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Add goalie starter/fatigue derived features to a feature frame."""
+        if features is None or not isinstance(features, pd.DataFrame) or features.empty:
+            return features
+        for prefix, rest_col, b2b_col in (
+            ('home', 'home_rest_days', 'home_b2b'),
+            ('away', 'away_rest_days', 'away_b2b')
+        ):
+            prob_col = f'{prefix}_goalie_prob'
+            gsax_col = f'{prefix}_goalie_gsax'
+            prob = pd.to_numeric(features.get(prob_col), errors='coerce') if prob_col in features.columns else None
+            if prob is None:
+                continue
+            prob = prob.fillna(0.0).clip(0.0, 1.0)
+            features[prob_col] = prob
+            backup_prob = (1.0 - prob).clip(0.0, 1.0)
+            features[f'{prefix}_goalie_backup_prob'] = backup_prob
+            features[f'{prefix}_goalie_is_backup'] = (prob < 0.5).astype(float)
+            if rest_col in features.columns:
+                rest = pd.to_numeric(features.get(rest_col), errors='coerce').fillna(0.0)
+                features[f'{prefix}_goalie_expected_rest'] = rest * prob
+                if b2b_col in features.columns:
+                    b2b = pd.to_numeric(features.get(b2b_col), errors='coerce').fillna(0.0)
+                    features[f'{prefix}_goalie_fatigue'] = b2b * (1.0 + backup_prob)
+                else:
+                    features[f'{prefix}_goalie_fatigue'] = 0.0
+            else:
+                features[f'{prefix}_goalie_expected_rest'] = 0.0
+                features[f'{prefix}_goalie_fatigue'] = 0.0
+            if gsax_col in features.columns:
+                gsax = pd.to_numeric(features.get(gsax_col), errors='coerce').fillna(0.0)
+                features[f'{prefix}_goalie_expected_gsax'] = gsax * prob
+            else:
+                features[f'{prefix}_goalie_expected_gsax'] = 0.0
+        try:
+            if 'home_goalie_prob' in features.columns and 'away_goalie_prob' in features.columns:
+                features['goalie_prob_diff'] = features['home_goalie_prob'] - features['away_goalie_prob']
+            if 'home_goalie_backup_prob' in features.columns and 'away_goalie_backup_prob' in features.columns:
+                features['goalie_backup_diff'] = features['home_goalie_backup_prob'] - features['away_goalie_backup_prob']
+            if 'home_goalie_gsax' in features.columns and 'away_goalie_gsax' in features.columns:
+                features['goalie_gsax_diff'] = features['home_goalie_gsax'] - features['away_goalie_gsax']
+            if 'home_goalie_expected_gsax' in features.columns and 'away_goalie_expected_gsax' in features.columns:
+                features['goalie_expected_gsax_diff'] = (
+                    features['home_goalie_expected_gsax'] - features['away_goalie_expected_gsax']
+                )
+        except Exception:
+            pass
+        return features
     
     def apply_goalie_context_features(
         self,
@@ -3379,6 +3531,11 @@ class RealDataNHLModel:
                 note_bits = [bit for bit in [home_note, away_note] if bit]
                 if note_bits:
                     notes[gid] = " vs ".join(note_bits)
+        # Refresh derived goalie context features after applying starter probabilities.
+        try:
+            self._compute_goalie_derived_features(todays_features)
+        except Exception:
+            pass
         return notes
 
     def write_environment_template(self, todays_games: pd.DataFrame, out_path: str, overwrite_today: bool = False) -> None:
@@ -3838,6 +3995,12 @@ class RealDataNHLModel:
             'home_goalie_gsax', 'away_goalie_gsax',
             'home_goalie_prob', 'away_goalie_prob',
             'skater_goalie_edge',
+            'home_goalie_backup_prob', 'away_goalie_backup_prob',
+            'home_goalie_is_backup', 'away_goalie_is_backup',
+            'home_goalie_expected_rest', 'away_goalie_expected_rest',
+            'home_goalie_fatigue', 'away_goalie_fatigue',
+            'home_goalie_expected_gsax', 'away_goalie_expected_gsax',
+            'goalie_prob_diff', 'goalie_backup_diff', 'goalie_gsax_diff', 'goalie_expected_gsax_diff',
             # Market line context (time-aligned)
             'market_total', 'market_total_mid', 'open_total', 'asof_total', 'consensus_total',
             'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'line_age_minutes',
@@ -3846,6 +4009,12 @@ class RealDataNHLModel:
             # Environment overlays
             'env_outdoor','env_start_hour','env_temp_f','env_wind_mph'
         ]
+        market_feature_cols = [
+            'market_total', 'market_total_mid', 'open_total', 'asof_total', 'consensus_total',
+            'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'line_age_minutes',
+            'open_over_price', 'open_under_price', 'asof_over_price', 'asof_under_price',
+            'over_price_move', 'under_price_move', 'consensus_std'
+        ]
         # Add rink bias proxy and penalties
         extra_optional = [
             'penalties_drawn60', 'penalties_taken60', 'ref_goals_gm', 'rink_bias'
@@ -3853,6 +4022,13 @@ class RealDataNHLModel:
         for col in extra_optional:
             if col in df.columns:
                 feature_cols.append(col)
+        # Team identity one-hot features (home_team_* / away_team_*).
+        try:
+            team_identity_cols = [c for c in df.columns if c.startswith('home_team_') or c.startswith('away_team_')]
+            if team_identity_cols:
+                feature_cols.extend(sorted(team_identity_cols))
+        except Exception:
+            pass
         
         # Filter to available columns
         available_features = [col for col in feature_cols if col in df.columns]
@@ -3930,6 +4106,11 @@ class RealDataNHLModel:
         X = X[mask]
         y = y[mask]
         dates = dates[mask]
+        if target_mode != 'edge':
+            drop_cols = [c for c in market_feature_cols if c in X.columns]
+            if drop_cols:
+                X = X.drop(columns=drop_cols, errors='ignore')
+                available_features = [c for c in available_features if c not in drop_cols]
         try:
             self._training_frame = df.loc[mask].reset_index(drop=True)
         except Exception:
@@ -4021,6 +4202,8 @@ class RealDataNHLModel:
         if speed_profile not in TRAIN_SPEED_PRESETS:
             speed_profile = 'balanced'
         self.train_speed_profile = speed_profile
+        self.train_month_multipliers = {}
+        self.train_season_multipliers = {}
         speed_cfg = TRAIN_SPEED_PRESETS[speed_profile]
         self.skip_goal_model_training = bool(speed_cfg.get('skip_goal_models', False))
         print(f"⏱️ Training preset: {speed_cfg.get('label', speed_profile.title())}")
@@ -4838,12 +5021,22 @@ class RealDataNHLModel:
                     tr_lines = pd.to_numeric(lines_train, errors='coerce').fillna(default_line).to_numpy(dtype=float)
                 else:
                     tr_lines = np.full(len(y_train), default_line, dtype=float)
-                n_splits_iso = min(5, max(3, len(X_train) // 50))
-                n_splits_iso = max(2, min(n_splits_iso, len(X_train) - 1))
-                tscv_iso = TimeSeriesSplit(n_splits=n_splits_iso)
+                cal_splits: List[Tuple[np.ndarray, np.ndarray]] = []
+                try:
+                    if isinstance(cv_strategy, list):
+                        cal_splits = list(cv_strategy)
+                    elif hasattr(cv_strategy, 'split'):
+                        cal_splits = list(cv_strategy.split(X_train))
+                except Exception:
+                    cal_splits = []
+                if not cal_splits:
+                    n_splits_iso = min(5, max(3, len(X_train) // 50))
+                    n_splits_iso = max(2, min(n_splits_iso, len(X_train) - 1))
+                    tscv_iso = TimeSeriesSplit(n_splits=n_splits_iso)
+                    cal_splits = list(tscv_iso.split(X_train))
                 oof_pred = np.full(len(X_train), np.nan, dtype=float)
                 oof_std = np.full(len(X_train), np.nan, dtype=float)
-                for tr_idx, val_idx in tscv_iso.split(X_train):
+                for tr_idx, val_idx in cal_splits:
                     X_tr = X_train.iloc[tr_idx]
                     y_tr = y_train.iloc[tr_idx]
                     X_val = X_train.iloc[val_idx]
@@ -4897,6 +5090,41 @@ class RealDataNHLModel:
                     is_push_train = np.isclose(actual_total, tr_lines[valid], atol=1e-9) & (np.abs(tr_lines[valid] - np.round(tr_lines[valid])) < 1e-9)
                     keep = ~is_push_train
                     oof_over = (actual_total > tr_lines[valid]).astype(int)
+                    # Month/season calibration offsets from OOF probabilities.
+                    try:
+                        if dates_train is not None:
+                            dt_vals = pd.to_datetime(dates_train, errors='coerce')
+                            month_keys = dt_vals.dt.to_period('M').astype(str).to_numpy()
+                            season_keys = dt_vals.dt.year.astype('Int64').astype(str).to_numpy()
+                            month_mults: Dict[str, float] = {}
+                            season_mults: Dict[str, float] = {}
+                            valid_idx = np.where(valid)[0]
+                            for mkey in np.unique(month_keys[valid_idx]):
+                                if not mkey or mkey.lower() == 'nan':
+                                    continue
+                                m_mask = valid & (month_keys == mkey) & keep
+                                if int(m_mask.sum()) < 12:
+                                    continue
+                                p_mean = float(np.mean(raw_oof_prob[m_mask]))
+                                a_mean = float(np.mean(oof_over[m_mask]))
+                                if p_mean > 0 and np.isfinite(p_mean) and np.isfinite(a_mean):
+                                    mult = a_mean / p_mean
+                                    month_mults[mkey] = float(max(0.75, min(1.25, mult)))
+                            for skey in np.unique(season_keys[valid_idx]):
+                                if not skey or skey.lower() == 'nan':
+                                    continue
+                                s_mask = valid & (season_keys == skey) & keep
+                                if int(s_mask.sum()) < 40:
+                                    continue
+                                p_mean = float(np.mean(raw_oof_prob[s_mask]))
+                                a_mean = float(np.mean(oof_over[s_mask]))
+                                if p_mean > 0 and np.isfinite(p_mean) and np.isfinite(a_mean):
+                                    mult = a_mean / p_mean
+                                    season_mults[skey] = float(max(0.8, min(1.2, mult)))
+                            self.train_month_multipliers = month_mults
+                            self.train_season_multipliers = season_mults
+                    except Exception:
+                        pass
                     iso = IsotonicRegression(out_of_bounds='clip')
                     try:
                         w_cal = weights_train[valid] if weights_train is not None and len(weights_train) == len(X_train) else None
@@ -5209,6 +5437,8 @@ class RealDataNHLModel:
             'consensus_std_cap': self.consensus_std_cap,
             'consensus_guard_accuracy': self.consensus_guard_accuracy,
             'consensus_guard_support': self.consensus_guard_support,
+            'train_month_multipliers': getattr(self, 'train_month_multipliers', {}),
+            'train_season_multipliers': getattr(self, 'train_season_multipliers', {}),
         }
         if walk_metrics:
             model_state['walk_forward_metrics'] = walk_metrics
