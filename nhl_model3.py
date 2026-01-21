@@ -1984,6 +1984,61 @@ class RealDataNHLModel:
         except Exception:
             pass
 
+        # Detect whether we have reliable intra-day times; if not, use daily history to avoid leakage.
+        use_daily_lag = False
+        try:
+            valid_dt = features['_sort_dt'].dropna()
+            if not valid_dt.empty:
+                use_daily_lag = (
+                    valid_dt.dt.hour.eq(0)
+                    & valid_dt.dt.minute.eq(0)
+                    & valid_dt.dt.second.eq(0)
+                ).all()
+        except Exception:
+            use_daily_lag = False
+        if '_date_only' not in features.columns:
+            try:
+                features['_date_only'] = pd.to_datetime(features.get('date'), errors='coerce').dt.date
+            except Exception:
+                features['_date_only'] = pd.NaT
+        date_key_col = '_date_only'
+        daily_cache: Dict[Tuple[str, str, str, int, float], pd.Series] = {}
+        def _daily_roll(
+            group_col: str,
+            value_col: str,
+            agg: str,
+            window: int,
+            min_periods: int,
+            alpha: Optional[float] = None,
+            fill_value: Optional[float] = None
+        ) -> pd.Series:
+            cache_key = (group_col, value_col, agg, window, float(alpha or 0.0))
+            if cache_key in daily_cache:
+                series = daily_cache[cache_key]
+                return series.fillna(fill_value) if fill_value is not None else series
+            df_tmp = features[[group_col, date_key_col]].copy()
+            if value_col in features.columns:
+                df_tmp['val'] = pd.to_numeric(features[value_col], errors='coerce')
+            else:
+                return pd.Series(fill_value, index=features.index)
+            if agg == 'sum':
+                daily = df_tmp.groupby([group_col, date_key_col], dropna=False)['val'].sum()
+            else:
+                daily = df_tmp.groupby([group_col, date_key_col], dropna=False)['val'].mean()
+            if agg == 'ewm' and alpha is not None:
+                daily_roll = daily.groupby(level=0).apply(
+                    lambda s: s.shift().ewm(alpha=alpha, min_periods=min_periods).mean()
+                )
+            else:
+                daily_roll = daily.groupby(level=0).apply(
+                    lambda s: s.shift().rolling(window, min_periods=min_periods).mean()
+                )
+            daily_roll = daily_roll.reset_index().rename(columns={'val': 'roll_val'})
+            merged = df_tmp.merge(daily_roll, on=[group_col, date_key_col], how='left')
+            series = merged['roll_val']
+            daily_cache[cache_key] = series
+            return series.fillna(fill_value) if fill_value is not None else series
+
         # Ensure critical counting stats exist even if upstream feeds omit them
         default_count_cols = {
             'home_pp_goals': 0.0,
@@ -1999,6 +2054,8 @@ class RealDataNHLModel:
         def lagged_rolling_mean(group_col: str, value_col: str, window: int, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
             if value_col not in features.columns:
                 return pd.Series(fill_value, index=features.index)
+            if use_daily_lag:
+                return _daily_roll(group_col, value_col, 'mean', window, min_periods, fill_value=fill_value)
             series = (
                 features.groupby(group_col)[value_col]
                 .transform(lambda s: s.shift().rolling(window, min_periods=min_periods).mean())
@@ -2008,6 +2065,8 @@ class RealDataNHLModel:
         def lagged_rolling_sum(group_col: str, value_col: str, window: int, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
             if value_col not in features.columns:
                 return pd.Series(fill_value, index=features.index)
+            if use_daily_lag:
+                return _daily_roll(group_col, value_col, 'sum', window, min_periods, fill_value=fill_value)
             series = (
                 features.groupby(group_col)[value_col]
                 .transform(lambda s: s.shift().rolling(window, min_periods=min_periods).sum())
@@ -2017,6 +2076,8 @@ class RealDataNHLModel:
         def lagged_ewm(group_col: str, value_col: str, alpha: float, min_periods: int = 2, fill_value: Optional[float] = None) -> pd.Series:
             if value_col not in features.columns:
                 return pd.Series(fill_value, index=features.index)
+            if use_daily_lag:
+                return _daily_roll(group_col, value_col, 'ewm', window=1, min_periods=min_periods, alpha=alpha, fill_value=fill_value)
             series = (
                 features.groupby(group_col)[value_col]
                 .transform(lambda s: s.shift().ewm(alpha=alpha, min_periods=min_periods).mean())
@@ -2059,6 +2120,21 @@ class RealDataNHLModel:
         except Exception:
             league_total = league_total.shift()
             features['league_total_ewm'] = league_total.ewm(alpha=0.08, min_periods=5).mean().fillna(6.2)
+        try:
+            features['expected_pace_shrunk'] = (
+                0.7 * pd.to_numeric(features['expected_pace'], errors='coerce').fillna(6.2)
+                + 0.3 * pd.to_numeric(features['league_total_ewm'], errors='coerce').fillna(6.2)
+            )
+        except Exception:
+            features['expected_pace_shrunk'] = features.get('expected_pace', 6.2)
+        try:
+            if 'injury_penalty_adj' in features.columns:
+                inj_adj = pd.to_numeric(features['injury_penalty_adj'], errors='coerce').fillna(0.0)
+                features['expected_pace_injury_adj'] = pd.to_numeric(features['expected_pace'], errors='coerce').fillna(6.2) + inj_adj
+            else:
+                features['expected_pace_injury_adj'] = features.get('expected_pace', 6.2)
+        except Exception:
+            features['expected_pace_injury_adj'] = features.get('expected_pace', 6.2)
 
         # Opponent-adjusted strength-of-schedule approximation (initialized here; computed after Elo below).
         features['sos_elo'] = 1500.0
@@ -2208,6 +2284,11 @@ class RealDataNHLModel:
         features['season_day'] = (features['date'] - features['date'].min()).dt.days
         features['season_progress'] = features['season_day'] / 200.0
         features['late_season'] = (features['season_progress'] > 0.8).astype(int)
+        try:
+            season_year = features['date'].dt.year + (features['date'].dt.month >= 7).astype(int)
+            features['season_year'] = season_year.fillna(features['date'].dt.year)
+        except Exception:
+            features['season_year'] = features.get('date', pd.Timestamp.utcnow()).year
         # Time of day / weekend
         try:
             local_hours = []
@@ -2332,6 +2413,20 @@ class RealDataNHLModel:
                 features[target_col] = real_series
             else:
                 features[target_col] = pd.to_numeric(features[target_col], errors='coerce').fillna(real_series)
+
+        # Optional injury-driven xG adjustments (player-level impacts) if provided.
+        injury_xg_map = {
+            'home_5v5_xgf60': ['home_xgf_adj', 'home_xgf_injury_adj', 'home_attack_adj'],
+            'away_5v5_xgf60': ['away_xgf_adj', 'away_xgf_injury_adj', 'away_attack_adj'],
+            'home_5v5_hdcf60': ['home_hdcf_adj', 'home_hdcf_injury_adj'],
+            'away_5v5_hdcf60': ['away_hdcf_adj', 'away_hdcf_injury_adj'],
+        }
+        for target_col, candidates in injury_xg_map.items():
+            adj_series = _coalesce_series(candidates)
+            if adj_series is None:
+                continue
+            if target_col in features.columns:
+                features[target_col] = pd.to_numeric(features[target_col], errors='coerce').fillna(0.0) + adj_series.fillna(0.0)
 
         # ---------------- Advanced team stats: proxies and EWMAs ----------------
         # Proxies for 5v5 xGF/60 and HDCF/60 using available shots and goals (fallback when detailed feed not available)
@@ -2790,9 +2885,11 @@ class RealDataNHLModel:
         for col in (
             'asof_total', 'asof_over_price', 'asof_under_price',
             'minutes_to_game', 'minutes_to_puck_drop', 'line_age_minutes',
-            'line_move_1h', 'line_move_2h', 'line_move_4h',
+            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_acceleration_1h',
             'line_volatility_4h', 'implied_prob_move_4h',
-            'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof'
+            'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof',
+            'sharp_total_asof', 'sharp_line_diff_asof', 'sharp_price_skew_asof',
+            'square_total_asof', 'square_line_diff_asof', 'square_price_skew_asof'
         ):
             if col not in df.columns:
                 df[col] = np.nan
@@ -2953,6 +3050,16 @@ class RealDataNHLModel:
                             return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(a))))
                         except Exception:
                             return None
+                    sharp_books = {
+                        token.strip().upper()
+                        for token in str(os.getenv('SHARP_BOOKS', 'PINN,CRIS,BOOKMAKER,BM,BO')).split(',')
+                        if token.strip()
+                    }
+                    square_books = {
+                        token.strip().upper()
+                        for token in str(os.getenv('SQUARE_BOOKS', 'DK,FD,BETMGM,CAESARS')).split(',')
+                        if token.strip()
+                    }
                     asof_mode = str(os.getenv('ODDS_ASOF_MODE', 'offset')).strip().lower()
                     if asof_mode not in ('offset', 'latest'):
                         asof_mode = 'offset'
@@ -3051,6 +3158,11 @@ class RealDataNHLModel:
                         line_move_1h = float(asof_pick.get('book_total')) - total_1h if total_1h is not None else np.nan
                         line_move_2h = float(asof_pick.get('book_total')) - total_2h if total_2h is not None else np.nan
                         line_move_4h = float(asof_pick.get('book_total')) - total_4h if total_4h is not None else np.nan
+                        line_acceleration_1h = (
+                            line_move_1h - (line_move_4h / 4.0)
+                            if np.isfinite(line_move_1h) and np.isfinite(line_move_4h)
+                            else np.nan
+                        )
                         line_velocity_6h = (float(asof_pick.get('book_total')) - total_6h) / 6.0 if total_6h is not None else np.nan
                         try:
                             if isinstance(asof_ts, pd.Timestamp):
@@ -3073,10 +3185,42 @@ class RealDataNHLModel:
                             if implied_over_asof is not None and implied_under_asof is not None
                             else np.nan
                         )
+                        sharp_total = np.nan
+                        sharp_price_skew = np.nan
+                        square_total = np.nan
+                        square_price_skew = np.nan
                         try:
                             if isinstance(asof_ts, pd.Timestamp):
-                                disp_rows = g[g['ts'] == asof_ts]
+                                disp_rows = g[g['ts'] == asof_ts].copy()
                                 line_dispersion_asof = float(np.std(pd.to_numeric(disp_rows['book_total'], errors='coerce'))) if len(disp_rows) >= 2 else np.nan
+                                book_col = None
+                                if 'book' in disp_rows.columns:
+                                    book_col = 'book'
+                                elif 'book_key' in disp_rows.columns:
+                                    book_col = 'book_key'
+                                if book_col:
+                                    disp_rows['book_norm'] = disp_rows[book_col].astype(str).str.upper().str.strip()
+                                    sharp_rows = disp_rows[disp_rows['book_norm'].isin(sharp_books)] if sharp_books else disp_rows.iloc[0:0]
+                                    if square_books:
+                                        square_rows = disp_rows[disp_rows['book_norm'].isin(square_books)]
+                                    else:
+                                        square_rows = disp_rows[~disp_rows['book_norm'].isin(sharp_books)]
+                                    if not sharp_rows.empty:
+                                        sharp_total = float(pd.to_numeric(sharp_rows['book_total'], errors='coerce').median())
+                                        sharp_over = float(pd.to_numeric(sharp_rows['book_over'], errors='coerce').median())
+                                        sharp_under = float(pd.to_numeric(sharp_rows['book_under'], errors='coerce').median())
+                                        sharp_over_imp = _implied_prob(sharp_over)
+                                        sharp_under_imp = _implied_prob(sharp_under)
+                                        if sharp_over_imp is not None and sharp_under_imp is not None:
+                                            sharp_price_skew = float(sharp_over_imp - sharp_under_imp)
+                                    if not square_rows.empty:
+                                        square_total = float(pd.to_numeric(square_rows['book_total'], errors='coerce').median())
+                                        square_over = float(pd.to_numeric(square_rows['book_over'], errors='coerce').median())
+                                        square_under = float(pd.to_numeric(square_rows['book_under'], errors='coerce').median())
+                                        square_over_imp = _implied_prob(square_over)
+                                        square_under_imp = _implied_prob(square_under)
+                                        if square_over_imp is not None and square_under_imp is not None:
+                                            square_price_skew = float(square_over_imp - square_under_imp)
                             else:
                                 line_dispersion_asof = np.nan
                         except Exception:
@@ -3102,11 +3246,22 @@ class RealDataNHLModel:
                             , 'derived_line_move_1h': line_move_1h
                             , 'derived_line_move_2h': line_move_2h
                             , 'derived_line_move_4h': line_move_4h
+                            , 'derived_line_acceleration_1h': line_acceleration_1h
                             , 'derived_line_volatility_4h': line_volatility_4h
                             , 'derived_implied_prob_move_4h': implied_prob_move_4h
                             , 'derived_line_velocity_6h': line_velocity_6h
                             , 'derived_line_dispersion_asof': line_dispersion_asof
                             , 'derived_price_skew_asof': price_skew_asof
+                            , 'derived_sharp_total_asof': sharp_total
+                            , 'derived_sharp_line_diff_asof': (
+                                sharp_total - float(asof_pick.get('book_total')) if np.isfinite(sharp_total) else np.nan
+                            )
+                            , 'derived_sharp_price_skew_asof': sharp_price_skew
+                            , 'derived_square_total_asof': square_total
+                            , 'derived_square_line_diff_asof': (
+                                square_total - float(asof_pick.get('book_total')) if np.isfinite(square_total) else np.nan
+                            )
+                            , 'derived_square_price_skew_asof': square_price_skew
                         })
                     if derived:
                         ddf = pd.DataFrame(derived).dropna(subset=['game_id'])
@@ -3198,18 +3353,25 @@ class RealDataNHLModel:
                             ('derived_line_move_1h', 'line_move_1h'),
                             ('derived_line_move_2h', 'line_move_2h'),
                             ('derived_line_move_4h', 'line_move_4h'),
+                            ('derived_line_acceleration_1h', 'line_acceleration_1h'),
                             ('derived_line_volatility_4h', 'line_volatility_4h'),
                             ('derived_implied_prob_move_4h', 'implied_prob_move_4h'),
                             ('derived_line_velocity_6h', 'line_velocity_6h'),
                             ('derived_line_dispersion_asof', 'line_dispersion_asof'),
                             ('derived_price_skew_asof', 'price_skew_asof'),
+                            ('derived_sharp_total_asof', 'sharp_total_asof'),
+                            ('derived_sharp_line_diff_asof', 'sharp_line_diff_asof'),
+                            ('derived_sharp_price_skew_asof', 'sharp_price_skew_asof'),
+                            ('derived_square_total_asof', 'square_total_asof'),
+                            ('derived_square_line_diff_asof', 'square_line_diff_asof'),
+                            ('derived_square_price_skew_asof', 'square_price_skew_asof'),
                         ):
                             try:
                                 miss = pd.to_numeric(df[dest], errors='coerce').isna()
                                 df.loc[miss, dest] = pd.to_numeric(df.loc[miss, src], errors='coerce')
                             except Exception:
                                 pass
-                        df.drop(columns=[c for c in adf.columns if c.startswith('derived_asof_') or c.startswith('derived_minutes_') or c.startswith('derived_line_') or c.startswith('derived_implied_') or c.startswith('derived_price_')], inplace=True, errors='ignore')
+                        df.drop(columns=[c for c in adf.columns if c.startswith('derived_asof_') or c.startswith('derived_minutes_') or c.startswith('derived_line_') or c.startswith('derived_implied_') or c.startswith('derived_price_') or c.startswith('derived_sharp_') or c.startswith('derived_square_')], inplace=True, errors='ignore')
 
         # Normalize types
         df['closing_total'] = pd.to_numeric(df['closing_total'], errors='coerce')
@@ -3232,6 +3394,15 @@ class RealDataNHLModel:
             df['minutes_to_game'] = pd.to_numeric(df['minutes_to_game'], errors='coerce')
         if 'line_age_minutes' in df.columns:
             df['line_age_minutes'] = pd.to_numeric(df['line_age_minutes'], errors='coerce')
+        for col in (
+            'minutes_to_puck_drop', 'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_acceleration_1h',
+            'line_volatility_4h', 'implied_prob_move_4h', 'line_velocity_6h',
+            'line_dispersion_asof', 'price_skew_asof',
+            'sharp_total_asof', 'sharp_line_diff_asof', 'sharp_price_skew_asof',
+            'square_total_asof', 'square_line_diff_asof', 'square_price_skew_asof',
+        ):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         if 'asof_source' in df.columns:
             df['asof_source'] = df['asof_source'].astype(str).fillna('')
         if 'asof_timestamp' in df.columns:
@@ -3548,6 +3719,13 @@ class RealDataNHLModel:
             else:
                 features[f'{prefix}_goalie_expected_rest'] = 0.0
                 features[f'{prefix}_goalie_fatigue'] = 0.0
+            try:
+                dens_3in4 = pd.to_numeric(features.get(f'{prefix}_3in4'), errors='coerce').fillna(0.0)
+                dens_4in6 = pd.to_numeric(features.get(f'{prefix}_4in6'), errors='coerce').fillna(0.0)
+                density = dens_3in4 + 0.5 * dens_4in6
+                features[f'{prefix}_goalie_schedule_density'] = density * (1.0 + backup_prob)
+            except Exception:
+                features[f'{prefix}_goalie_schedule_density'] = 0.0
             if gsax_col in features.columns:
                 gsax = pd.to_numeric(features.get(gsax_col), errors='coerce').fillna(0.0)
                 features[f'{prefix}_goalie_expected_gsax'] = gsax * prob
@@ -3563,6 +3741,10 @@ class RealDataNHLModel:
             if 'home_goalie_expected_gsax' in features.columns and 'away_goalie_expected_gsax' in features.columns:
                 features['goalie_expected_gsax_diff'] = (
                     features['home_goalie_expected_gsax'] - features['away_goalie_expected_gsax']
+                )
+            if 'home_goalie_schedule_density' in features.columns and 'away_goalie_schedule_density' in features.columns:
+                features['goalie_schedule_density_diff'] = (
+                    features['home_goalie_schedule_density'] - features['away_goalie_schedule_density']
                 )
         except Exception:
             pass
@@ -4110,6 +4292,13 @@ class RealDataNHLModel:
         except Exception:
             pass
         try:
+            if 'line_acceleration_1h' not in df.columns and 'line_move_1h' in df.columns and 'line_move_4h' in df.columns:
+                lm1 = pd.to_numeric(df['line_move_1h'], errors='coerce')
+                lm4 = pd.to_numeric(df['line_move_4h'], errors='coerce')
+                df['line_acceleration_1h'] = lm1 - (lm4 / 4.0)
+        except Exception:
+            pass
+        try:
             if 'consensus_std' not in df.columns and 'dispersion_total_std' in df.columns:
                 df['consensus_std'] = pd.to_numeric(df['dispersion_total_std'], errors='coerce')
         except Exception:
@@ -4118,10 +4307,10 @@ class RealDataNHLModel:
         feature_cols = [
             'home_gpg_l3', 'away_gpg_l3', 'home_gpg_l5', 'away_gpg_l5', 'home_gpg_l10', 'away_gpg_l10',
             'home_gag_l3', 'away_gag_l3', 'home_gag_l5', 'away_gag_l5', 'home_gag_l10', 'away_gag_l10',
-            'combined_gpg', 'combined_gag', 'expected_pace', 'pace_variance', 'pace_zscore',
+            'combined_gpg', 'combined_gag', 'expected_pace', 'expected_pace_shrunk', 'expected_pace_injury_adj', 'pace_variance', 'pace_zscore',
             'league_total_ewm',
             'venue_total_avg', 'altitude_bonus', 'rivalry_boost', 'b2b_penalty',
-            'home_b2b', 'away_b2b', 'season_progress', 'late_season', 'rest_diff', 'schedule_density_diff',
+            'home_b2b', 'away_b2b', 'season_progress', 'late_season', 'season_year', 'rest_diff', 'schedule_density_diff',
             'base_total_prediction', 'total_adjustments', 'final_prediction_base', 'travel_fatigue_index',
             'timezone_diff', 'travel_penalty', 'home_elo', 'away_elo', 'elo_diff',
             'sos_elo',
@@ -4149,13 +4338,17 @@ class RealDataNHLModel:
             'home_goalie_expected_rest', 'away_goalie_expected_rest',
             'home_goalie_fatigue', 'away_goalie_fatigue',
             'home_goalie_expected_gsax', 'away_goalie_expected_gsax',
+            'home_goalie_schedule_density', 'away_goalie_schedule_density',
             'goalie_prob_diff', 'goalie_backup_diff', 'goalie_gsax_diff', 'goalie_expected_gsax_diff',
+            'goalie_schedule_density_diff',
             # Market line context (time-aligned)
             'market_total', 'market_total_mid', 'open_total', 'asof_total', 'consensus_total',
             'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'minutes_to_puck_drop', 'line_age_minutes',
             'near_close',
-            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_volatility_4h',
+            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_acceleration_1h', 'line_volatility_4h',
             'implied_prob_move_4h', 'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof',
+            'sharp_total_asof', 'sharp_line_diff_asof', 'sharp_price_skew_asof',
+            'square_total_asof', 'square_line_diff_asof', 'square_price_skew_asof',
             'open_over_price', 'open_under_price', 'asof_over_price', 'asof_under_price',
             'over_price_move', 'under_price_move', 'consensus_std',
             # Environment overlays
@@ -4165,14 +4358,16 @@ class RealDataNHLModel:
             'market_total', 'market_total_mid', 'open_total', 'asof_total', 'consensus_total',
             'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'minutes_to_puck_drop', 'line_age_minutes',
             'near_close',
-            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_volatility_4h',
+            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_acceleration_1h', 'line_volatility_4h',
             'implied_prob_move_4h', 'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof',
+            'sharp_total_asof', 'sharp_line_diff_asof', 'sharp_price_skew_asof',
+            'square_total_asof', 'square_line_diff_asof', 'square_price_skew_asof',
             'open_over_price', 'open_under_price', 'asof_over_price', 'asof_under_price',
             'over_price_move', 'under_price_move', 'consensus_std'
         ]
         # Add rink bias proxy and penalties
         extra_optional = [
-            'penalties_drawn60', 'penalties_taken60', 'ref_goals_gm', 'rink_bias'
+            'penalties_drawn60', 'penalties_taken60', 'ref_goals_gm', 'rink_bias', 'injury_penalty_adj'
         ]
         for col in extra_optional:
             if col in df.columns:
@@ -4880,6 +5075,26 @@ class RealDataNHLModel:
         test_preds = np.vstack(test_preds)  # shape (K, N)
         ensemble_pred = (weights_array.reshape(-1, 1) * test_preds).sum(axis=0)
 
+        # Optional season-specific model (recent season) for drift mitigation.
+        recent_model = None
+        recent_pred = None
+        recent_season = None
+        try:
+            if isinstance(X_train, pd.DataFrame) and 'season_year' in X_train.columns:
+                season_vals = pd.to_numeric(X_train['season_year'], errors='coerce')
+                if season_vals.notna().any():
+                    recent_season = float(season_vals.max())
+                    recent_mask = season_vals == recent_season
+                    if int(recent_mask.sum()) >= 40:
+                        recent_model = make_model_pipeline(Ridge(alpha=1.0))
+                        w_recent = weights_train[recent_mask.values] if weights_train is not None and len(weights_train) == len(X_train) else None
+                        _fit_with_weights(recent_model, X_train.loc[recent_mask], y_train.loc[recent_mask], w_recent)
+                        recent_pred = recent_model.predict(X_test)
+        except Exception:
+            recent_model = None
+            recent_pred = None
+            recent_season = None
+
         def _fit_poisson_components(
             features_scaled: Any,
             target: pd.Series,
@@ -5028,6 +5243,8 @@ class RealDataNHLModel:
                 blend_inputs['poisson'] = np.asarray(poisson_pred, dtype=float)
             if goal_total_pred is not None and len(goal_total_pred) == len(blend_inputs['ensemble']):
                 blend_inputs['goal'] = np.asarray(goal_total_pred, dtype=float)
+            if recent_pred is not None and len(recent_pred) == len(blend_inputs['ensemble']):
+                blend_inputs['recent'] = np.asarray(recent_pred, dtype=float)
             if len(blend_inputs) >= 2:
                 M = np.column_stack([blend_inputs[k] for k in blend_inputs.keys()])
                 w = None
@@ -5323,10 +5540,25 @@ class RealDataNHLModel:
 
                     # Secondary probability calibrator: LogisticRegression on (pred_edge, model_std, line).
                     try:
+                        skew_feat = np.full(int(np.sum(valid)), np.nan)
+                        vel_feat = np.full(int(np.sum(valid)), np.nan)
+                        disp_feat = np.full(int(np.sum(valid)), np.nan)
+                        try:
+                            if 'price_skew_asof' in X_train.columns:
+                                skew_feat = np.asarray(X_train.loc[valid, 'price_skew_asof'], dtype=float)
+                            if 'line_velocity_6h' in X_train.columns:
+                                vel_feat = np.asarray(X_train.loc[valid, 'line_velocity_6h'], dtype=float)
+                            if 'line_dispersion_asof' in X_train.columns:
+                                disp_feat = np.asarray(X_train.loc[valid, 'line_dispersion_asof'], dtype=float)
+                        except Exception:
+                            pass
                         feats = np.column_stack([
                             np.asarray(pred_edge_feat, dtype=float),
                             np.asarray(oof_std[valid], dtype=float),
                             np.asarray(tr_lines[valid], dtype=float),
+                            np.asarray(skew_feat, dtype=float),
+                            np.asarray(vel_feat, dtype=float),
+                            np.asarray(disp_feat, dtype=float),
                         ])
                         y_bin = np.asarray(oof_over, dtype=int)
                         keep_lr = keep & np.isfinite(feats).all(axis=1)
@@ -5356,12 +5588,27 @@ class RealDataNHLModel:
                         if mu_feat is None or len(mu_feat) != int(np.sum(valid)):
                             mu_feat = np.full(int(np.sum(valid)), np.nan)
                         k_feat = np.full(int(np.sum(valid)), float(nb_k_eval) if nb_k_eval is not None else np.nan)
+                        skew_feat = np.full(int(np.sum(valid)), np.nan)
+                        vel_feat = np.full(int(np.sum(valid)), np.nan)
+                        disp_feat = np.full(int(np.sum(valid)), np.nan)
+                        try:
+                            if 'price_skew_asof' in X_train.columns:
+                                skew_feat = np.asarray(X_train.loc[valid, 'price_skew_asof'], dtype=float)
+                            if 'line_velocity_6h' in X_train.columns:
+                                vel_feat = np.asarray(X_train.loc[valid, 'line_velocity_6h'], dtype=float)
+                            if 'line_dispersion_asof' in X_train.columns:
+                                disp_feat = np.asarray(X_train.loc[valid, 'line_dispersion_asof'], dtype=float)
+                        except Exception:
+                            pass
                         feats2 = np.column_stack([
                             np.asarray(pred_edge_feat, dtype=float),
                             np.asarray(oof_std[valid], dtype=float),
                             np.asarray(tr_lines[valid], dtype=float),
                             np.asarray(mu_feat, dtype=float),
                             np.asarray(k_feat, dtype=float),
+                            np.asarray(skew_feat, dtype=float),
+                            np.asarray(vel_feat, dtype=float),
+                            np.asarray(disp_feat, dtype=float),
                         ])
                         y_bin = np.asarray(oof_over, dtype=int)
                         keep2 = keep & np.isfinite(feats2).all(axis=1)
@@ -5399,7 +5646,28 @@ class RealDataNHLModel:
                         model_std_eval = np.std(np.asarray(test_preds, dtype=float), axis=0) if isinstance(test_preds, np.ndarray) else np.full(len(test_lines), np.nan)
                         mu_eval2 = np.asarray(poisson_pred, dtype=float) if poisson_pred is not None and len(poisson_pred) == len(test_lines) else np.full(len(test_lines), np.nan)
                         k_eval2 = np.full(len(test_lines), float(nb_k_eval) if nb_k_eval is not None else np.nan)
-                        feats_eval = np.column_stack([pred_edge_eval, model_std_eval, np.asarray(test_lines, dtype=float), mu_eval2, k_eval2])
+                        skew_eval = np.full(len(test_lines), np.nan)
+                        vel_eval = np.full(len(test_lines), np.nan)
+                        disp_eval = np.full(len(test_lines), np.nan)
+                        try:
+                            if 'price_skew_asof' in X_test.columns:
+                                skew_eval = np.asarray(X_test['price_skew_asof'], dtype=float)
+                            if 'line_velocity_6h' in X_test.columns:
+                                vel_eval = np.asarray(X_test['line_velocity_6h'], dtype=float)
+                            if 'line_dispersion_asof' in X_test.columns:
+                                disp_eval = np.asarray(X_test['line_dispersion_asof'], dtype=float)
+                        except Exception:
+                            pass
+                        feats_eval = np.column_stack([
+                            pred_edge_eval,
+                            model_std_eval,
+                            np.asarray(test_lines, dtype=float),
+                            mu_eval2,
+                            k_eval2,
+                            skew_eval,
+                            vel_eval,
+                            disp_eval
+                        ])
                         probs_eval = p_over_model.predict_proba(feats_eval)[:, 1]
                     except Exception:
                         probs_eval = raw_over_prob
@@ -5412,7 +5680,26 @@ class RealDataNHLModel:
                         else:
                             pred_edge_eval = np.asarray(ensemble_pred, dtype=float) - np.asarray(test_lines, dtype=float)
                             model_std_eval = np.std(np.asarray(test_preds, dtype=float), axis=0) if isinstance(test_preds, np.ndarray) else np.full(len(test_lines), np.nan)
-                        feats_eval = np.column_stack([pred_edge_eval, model_std_eval, np.asarray(test_lines, dtype=float)])
+                        skew_eval = np.full(len(test_lines), np.nan)
+                        vel_eval = np.full(len(test_lines), np.nan)
+                        disp_eval = np.full(len(test_lines), np.nan)
+                        try:
+                            if 'price_skew_asof' in X_test.columns:
+                                skew_eval = np.asarray(X_test['price_skew_asof'], dtype=float)
+                            if 'line_velocity_6h' in X_test.columns:
+                                vel_eval = np.asarray(X_test['line_velocity_6h'], dtype=float)
+                            if 'line_dispersion_asof' in X_test.columns:
+                                disp_eval = np.asarray(X_test['line_dispersion_asof'], dtype=float)
+                        except Exception:
+                            pass
+                        feats_eval = np.column_stack([
+                            pred_edge_eval,
+                            model_std_eval,
+                            np.asarray(test_lines, dtype=float),
+                            skew_eval,
+                            vel_eval,
+                            disp_eval
+                        ])
                         probs_eval = prob_calibrator.predict_proba(feats_eval)[:, 1]
                     except Exception:
                         probs_eval = raw_over_prob
@@ -5583,6 +5870,22 @@ class RealDataNHLModel:
             _fit_with_weights(est_full, X_sorted, y_sorted, weights_full)
             final_models[name] = est_full
 
+        season_recent_model = None
+        season_recent_year = None
+        try:
+            if isinstance(X_sorted, pd.DataFrame) and 'season_year' in X_sorted.columns:
+                season_vals = pd.to_numeric(X_sorted['season_year'], errors='coerce')
+                if season_vals.notna().any():
+                    season_recent_year = float(season_vals.max())
+                    season_mask = season_vals == season_recent_year
+                    if int(season_mask.sum()) >= 40:
+                        season_recent_model = make_model_pipeline(Ridge(alpha=1.0))
+                        w_recent_full = weights_full[season_mask.values] if weights_full is not None and len(weights_full) == len(X_sorted) else None
+                        _fit_with_weights(season_recent_model, X_sorted.loc[season_mask], y_sorted.loc[season_mask], w_recent_full)
+        except Exception:
+            season_recent_model = None
+            season_recent_year = None
+
         y_sorted_for_poisson = y_sorted
         if is_edge_mode and lines_sorted is not None:
             try:
@@ -5625,6 +5928,8 @@ class RealDataNHLModel:
             'train_month_multipliers': getattr(self, 'train_month_multipliers', {}),
             'train_season_multipliers': getattr(self, 'train_season_multipliers', {}),
             'train_time_multipliers': getattr(self, 'train_time_multipliers', {}),
+            'season_recent_model': season_recent_model,
+            'season_recent_year': season_recent_year,
         }
         if walk_metrics:
             model_state['walk_forward_metrics'] = walk_metrics
@@ -5725,6 +6030,28 @@ class RealDataNHLModel:
                 line_age_minutes_val = float(game_features[idx])
         except Exception:
             line_age_minutes_val = None
+        # Market microstructure features (optional)
+        price_skew_val = np.nan
+        line_velocity_val = np.nan
+        line_dispersion_val = np.nan
+        try:
+            if 'price_skew_asof' in self.feature_names:
+                idx = self.feature_names.index('price_skew_asof')
+                price_skew_val = float(game_features[idx])
+        except Exception:
+            price_skew_val = np.nan
+        try:
+            if 'line_velocity_6h' in self.feature_names:
+                idx = self.feature_names.index('line_velocity_6h')
+                line_velocity_val = float(game_features[idx])
+        except Exception:
+            line_velocity_val = np.nan
+        try:
+            if 'line_dispersion_asof' in self.feature_names:
+                idx = self.feature_names.index('line_dispersion_asof')
+                line_dispersion_val = float(game_features[idx])
+        except Exception:
+            line_dispersion_val = np.nan
         
         # Prepare feature row & locked pipeline transforms
         feature_row = game_features.reshape(1, -1)
@@ -5831,6 +6158,18 @@ class RealDataNHLModel:
                 am_lr = None
         goal_total_lr = (hm_lr + am_lr) if hm_lr is not None and am_lr is not None else None
         flow_total = (hm_flow + am_flow) if hm_flow is not None and am_flow is not None else None
+        # Recent-season model (drift-aware) prediction
+        recent_total = None
+        recent_model = (self.total_model or {}).get('season_recent_model')
+        if recent_model is not None:
+            try:
+                recent_pred = float(recent_model.predict(feature_row)[0])
+                if is_edge_mode:
+                    recent_total = float(betting_line) + recent_pred
+                else:
+                    recent_total = float(recent_pred)
+            except Exception:
+                recent_total = None
 
         # Blend predictions using learned weights when available
         blend_weights = (self.total_model or {}).get('blend_weights')
@@ -5839,7 +6178,8 @@ class RealDataNHLModel:
                 'ensemble': predicted_total,
                 'poisson': poisson_mu,
                 'goal': goal_total_lr,
-                'flow': flow_total
+                'flow': flow_total,
+                'recent': recent_total
             }
             weights_use = {k: float(v) for k, v in blend_weights.items() if k in candidates and candidates[k] is not None}
             if weights_use:
@@ -5853,6 +6193,13 @@ class RealDataNHLModel:
             if flow_total is not None:
                 ref_total = poisson_mu if poisson_mu is not None else predicted_total
                 predicted_total = float(0.5 * predicted_total + 0.3 * flow_total + 0.2 * ref_total)
+            if recent_total is not None:
+                try:
+                    blend_recent = float(os.getenv('RECENT_SEASON_BLEND', '0.15'))
+                except Exception:
+                    blend_recent = 0.15
+                blend_recent = max(0.0, min(0.5, blend_recent))
+                predicted_total = float((1.0 - blend_recent) * predicted_total + blend_recent * recent_total)
         
         if ref_goal_value is not None:
             baseline_val = getattr(self, 'ref_goal_baseline', None)
@@ -6192,7 +6539,16 @@ class RealDataNHLModel:
                         k_val = float(nb.get('k'))
                 except Exception:
                     k_val = None
-                feats = np.array([[pred_edge, float(consensus_std_val), float(betting_line), float(poisson_mu), float(k_val) if k_val is not None else np.nan]], dtype=float)
+                feats = np.array([[
+                    pred_edge,
+                    float(consensus_std_val),
+                    float(betting_line),
+                    float(poisson_mu),
+                    float(k_val) if k_val is not None else np.nan,
+                    float(price_skew_val),
+                    float(line_velocity_val),
+                    float(line_dispersion_val)
+                ]], dtype=float)
                 p_lr = float(p_over_model.predict_proba(feats)[0][1])
                 p_lr = float(np.clip(p_lr, 1e-6, 1.0 - 1e-6))
                 blended = float(0.70 * p_lr + 0.30 * float(over_prob))
@@ -6207,7 +6563,14 @@ class RealDataNHLModel:
             prob_cal = (self.total_model or {}).get('prob_calibrator')
             if prob_cal is not None:
                 pred_edge = float(predicted_total - float(betting_line))
-                feats = np.array([[pred_edge, float(consensus_std_val), float(betting_line)]], dtype=float)
+                feats = np.array([[
+                    pred_edge,
+                    float(consensus_std_val),
+                    float(betting_line),
+                    float(price_skew_val),
+                    float(line_velocity_val),
+                    float(line_dispersion_val)
+                ]], dtype=float)
                 p_lr = float(prob_cal.predict_proba(feats)[0][1])
                 # Blend (LR is powerful but can overfit; keep some distribution info)
                 p_lr = float(np.clip(p_lr, 1e-6, 1.0 - 1e-6))
@@ -11733,6 +12096,23 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             velocity_map = {}
             odds_snapshot_map: Dict[str, Dict[str, Any]] = {}
             now_ts = datetime.utcnow()
+            asof_mode = str(os.getenv('ODDS_ASOF_MODE', 'latest')).strip().lower()
+            if asof_mode not in ('offset', 'latest'):
+                asof_mode = 'latest'
+            try:
+                asof_offset_hours = float(os.getenv('ODDS_ASOF_OFFSET_HOURS', '6'))
+            except Exception:
+                asof_offset_hours = 6.0
+            game_dt_map: Dict[str, Optional[pd.Timestamp]] = {}
+            try:
+                for _, g in todays_games.iterrows():
+                    gid = str(g.get('game_id'))
+                    gd = g.get('date') or g.get('gameDate')
+                    dt_val = pd.to_datetime(gd, utc=True, errors='coerce')
+                    if pd.notna(dt_val):
+                        game_dt_map[gid] = dt_val.tz_convert(None)
+            except Exception:
+                game_dt_map = {}
             # Environment and lineup data
             env_data = {}
             try:
@@ -11775,6 +12155,16 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(a))))
                             except Exception:
                                 return None
+                        sharp_books = {
+                            token.strip().upper()
+                            for token in str(os.getenv('SHARP_BOOKS', 'PINN,CRIS,BOOKMAKER,BM,BO')).split(',')
+                            if token.strip()
+                        }
+                        square_books = {
+                            token.strip().upper()
+                            for token in str(os.getenv('SQUARE_BOOKS', 'DK,FD,BETMGM,CAESARS')).split(',')
+                            if token.strip()
+                        }
                         for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
                             g = grp.sort_values('ts')
                             if g.empty:
@@ -11794,8 +12184,14 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 except Exception:
                                     pass
                             open_row = g_agg.iloc[0]
-                            # As-of snapshot = latest <= now, else latest
-                            pre_now = g_agg[g_agg['ts'] <= now_ts]
+                            # As-of snapshot = latest <= target time
+                            target_ts = now_ts
+                            if asof_mode == 'offset':
+                                gid_key = str(gid)
+                                game_dt = game_dt_map.get(gid_key)
+                                if isinstance(game_dt, pd.Timestamp):
+                                    target_ts = game_dt - pd.Timedelta(hours=asof_offset_hours)
+                            pre_now = g_agg[g_agg['ts'] <= target_ts]
                             asof_row = pre_now.iloc[-1] if not pre_now.empty else g_agg.iloc[-1]
                             open_ts = open_row.get('ts')
                             asof_ts = asof_row.get('ts')
@@ -11828,6 +12224,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             line_move_1h = float(asof_row.get('book_total')) - total_1h if total_1h is not None else 0.0
                             line_move_2h = float(asof_row.get('book_total')) - total_2h if total_2h is not None else 0.0
                             line_move_4h = float(asof_row.get('book_total')) - total_4h if total_4h is not None else 0.0
+                            line_acceleration_1h = line_move_1h - (line_move_4h / 4.0) if line_move_4h is not None else 0.0
                             line_velocity_6h = (float(asof_row.get('book_total')) - total_6h) / 6.0 if total_6h is not None else 0.0
                             try:
                                 if isinstance(asof_ts, pd.Timestamp):
@@ -11850,10 +12247,42 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 if implied_over_asof is not None and implied_under_asof is not None
                                 else 0.0
                             )
+                            sharp_total = 0.0
+                            sharp_price_skew = 0.0
+                            square_total = 0.0
+                            square_price_skew = 0.0
                             try:
                                 if isinstance(asof_ts, pd.Timestamp):
-                                    disp_rows = g[g['ts'] == asof_ts]
+                                    disp_rows = g[g['ts'] == asof_ts].copy()
                                     line_dispersion_asof = float(np.std(pd.to_numeric(disp_rows['book_total'], errors='coerce'))) if len(disp_rows) >= 2 else 0.0
+                                    book_col = None
+                                    if 'book' in disp_rows.columns:
+                                        book_col = 'book'
+                                    elif 'book_key' in disp_rows.columns:
+                                        book_col = 'book_key'
+                                    if book_col:
+                                        disp_rows['book_norm'] = disp_rows[book_col].astype(str).str.upper().str.strip()
+                                        sharp_rows = disp_rows[disp_rows['book_norm'].isin(sharp_books)] if sharp_books else disp_rows.iloc[0:0]
+                                        if square_books:
+                                            square_rows = disp_rows[disp_rows['book_norm'].isin(square_books)]
+                                        else:
+                                            square_rows = disp_rows[~disp_rows['book_norm'].isin(sharp_books)]
+                                        if not sharp_rows.empty:
+                                            sharp_total = float(pd.to_numeric(sharp_rows['book_total'], errors='coerce').median())
+                                            sharp_over = float(pd.to_numeric(sharp_rows['book_over'], errors='coerce').median())
+                                            sharp_under = float(pd.to_numeric(sharp_rows['book_under'], errors='coerce').median())
+                                            sharp_over_imp = _implied_prob(sharp_over)
+                                            sharp_under_imp = _implied_prob(sharp_under)
+                                            if sharp_over_imp is not None and sharp_under_imp is not None:
+                                                sharp_price_skew = float(sharp_over_imp - sharp_under_imp)
+                                        if not square_rows.empty:
+                                            square_total = float(pd.to_numeric(square_rows['book_total'], errors='coerce').median())
+                                            square_over = float(pd.to_numeric(square_rows['book_over'], errors='coerce').median())
+                                            square_under = float(pd.to_numeric(square_rows['book_under'], errors='coerce').median())
+                                            square_over_imp = _implied_prob(square_over)
+                                            square_under_imp = _implied_prob(square_under)
+                                            if square_over_imp is not None and square_under_imp is not None:
+                                                square_price_skew = float(square_over_imp - square_under_imp)
                                 else:
                                     line_dispersion_asof = 0.0
                             except Exception:
@@ -11871,11 +12300,18 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 'line_move_1h': line_move_1h,
                                 'line_move_2h': line_move_2h,
                                 'line_move_4h': line_move_4h,
+                                'line_acceleration_1h': line_acceleration_1h,
                                 'line_volatility_4h': line_volatility_4h,
                                 'implied_prob_move_4h': implied_prob_move_4h,
                                 'line_velocity_6h': line_velocity_6h,
                                 'line_dispersion_asof': line_dispersion_asof,
-                                'price_skew_asof': price_skew_asof
+                                'price_skew_asof': price_skew_asof,
+                                'sharp_total_asof': sharp_total,
+                                'sharp_line_diff_asof': sharp_total - float(asof_row.get('book_total')) if np.isfinite(sharp_total) else 0.0,
+                                'sharp_price_skew_asof': sharp_price_skew,
+                                'square_total_asof': square_total,
+                                'square_line_diff_asof': square_total - float(asof_row.get('book_total')) if np.isfinite(square_total) else 0.0,
+                                'square_price_skew_asof': square_price_skew
                             }
             except Exception:
                 velocity_map = {}
@@ -11916,6 +12352,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'pace_zscore': 0.0,
                 'rest_diff': 0.0,
                 'schedule_density_diff': 0.0,
+                'season_year': float(pd.Timestamp.utcnow().year),
                 'travel_fatigue_index': 0.0,
                 'home_shoot_pct_l5': 0.10,
                 'away_shoot_pct_l5': 0.10,
@@ -11923,6 +12360,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'away_save_pct_l5': 0.92,
                 'special_teams_index': 0.0,
                 'special_teams_diff': 0.0,
+                'injury_penalty_adj': 0.0,
+                'expected_pace_injury_adj': baseline_total,
                 'line_movement': 0.0,
                 'line_diff_vs_consensus': 0.0,
                 'over_price_move': 0.0,
@@ -11938,11 +12377,22 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'line_move_1h': 0.0,
                 'line_move_2h': 0.0,
                 'line_move_4h': 0.0,
+                'line_acceleration_1h': 0.0,
                 'line_volatility_4h': 0.0,
                 'implied_prob_move_4h': 0.0,
                 'line_velocity_6h': 0.0,
                 'line_dispersion_asof': 0.0,
-                'price_skew_asof': 0.0
+                'price_skew_asof': 0.0,
+                'sharp_total_asof': baseline_total,
+                'sharp_line_diff_asof': 0.0,
+                'sharp_price_skew_asof': 0.0,
+                'square_total_asof': baseline_total,
+                'square_line_diff_asof': 0.0,
+                'square_price_skew_asof': 0.0,
+                'home_goalie_schedule_density': 0.0,
+                'away_goalie_schedule_density': 0.0,
+                'goalie_schedule_density_diff': 0.0,
+                'expected_pace_shrunk': baseline_total
             }
 
             for idx, game in todays_features.iterrows():
@@ -12020,11 +12470,18 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         'line_move_1h': snap.get('line_move_1h', 0.0),
                         'line_move_2h': snap.get('line_move_2h', 0.0),
                         'line_move_4h': snap.get('line_move_4h', 0.0),
+                        'line_acceleration_1h': snap.get('line_acceleration_1h', 0.0),
                         'line_volatility_4h': snap.get('line_volatility_4h', 0.0),
                         'implied_prob_move_4h': snap.get('implied_prob_move_4h', 0.0),
                         'line_velocity_6h': snap.get('line_velocity_6h', 0.0),
                         'line_dispersion_asof': snap.get('line_dispersion_asof', 0.0),
                         'price_skew_asof': snap.get('price_skew_asof', 0.0),
+                        'sharp_total_asof': snap.get('sharp_total_asof', market_total),
+                        'sharp_line_diff_asof': snap.get('sharp_line_diff_asof', 0.0),
+                        'sharp_price_skew_asof': snap.get('sharp_price_skew_asof', 0.0),
+                        'square_total_asof': snap.get('square_total_asof', market_total),
+                        'square_line_diff_asof': snap.get('square_line_diff_asof', 0.0),
+                        'square_price_skew_asof': snap.get('square_price_skew_asof', 0.0),
                         'open_over_price': open_over if isinstance(open_over, (int, float)) else over_price,
                         'open_under_price': open_under if isinstance(open_under, (int, float)) else under_price,
                         'asof_over_price': asof_over if isinstance(asof_over, (int, float)) else over_price,
