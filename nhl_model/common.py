@@ -259,6 +259,10 @@ class OverUnderPrediction:
     ref_goal_adjustment: Optional[float] = None
     # Market velocity (change in total per hour), optional
     market_velocity: Optional[float] = None
+    # Time-to-game context (minutes) and line age
+    minutes_to_game: Optional[float] = None
+    minutes_to_puck_drop: Optional[float] = None
+    line_age_minutes: Optional[float] = None
     # Model diagnostics for higher-precision gating
     model_consensus_std: Optional[float] = None
     model_consensus_range: Optional[float] = None
