@@ -4160,7 +4160,7 @@ class RealDataNHLModel:
         df = df.copy()
         # Market context features (open/as-of, price movement, consensus dispersion)
         try:
-        if 'minutes_to_game' not in df.columns and 'asof_timestamp' in df.columns and 'date' in df.columns:
+            if 'minutes_to_game' not in df.columns and 'asof_timestamp' in df.columns and 'date' in df.columns:
                 game_dt = pd.to_datetime(df['date'], errors='coerce', utc=True).dt.tz_convert(None)
                 asof_ts = pd.to_datetime(df['asof_timestamp'], errors='coerce', utc=True).dt.tz_convert(None)
                 df['minutes_to_game'] = (game_dt - asof_ts).dt.total_seconds() / 60.0
