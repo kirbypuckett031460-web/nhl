@@ -649,6 +649,7 @@ class RealDataNHLModel:
         self.month_confidence_multipliers: Dict[str, float] = {}
         self.train_month_multipliers: Dict[str, float] = {}
         self.train_season_multipliers: Dict[str, float] = {}
+        self.train_time_multipliers: Dict[str, float] = {}
         self.current_prediction_month: Optional[str] = None
         # Dynamic risk/edge feedback controls (populated from bet logs)
         self.risk_edge_floor: float = 0.22
@@ -801,6 +802,8 @@ class RealDataNHLModel:
             self.train_month_multipliers = total_model.get('train_month_multipliers') or {}
         if isinstance(total_model.get('train_season_multipliers'), dict):
             self.train_season_multipliers = total_model.get('train_season_multipliers') or {}
+        if isinstance(total_model.get('train_time_multipliers'), dict):
+            self.train_time_multipliers = total_model.get('train_time_multipliers') or {}
         if isinstance(payload, dict):
             self.market_calibration_snapshot = payload.get('market_calibration_snapshot', self.market_calibration_snapshot)
             self.risk_feedback_snapshot = payload.get('risk_feedback_snapshot', self.risk_feedback_snapshot)
@@ -1438,6 +1441,25 @@ class RealDataNHLModel:
     def apply_market_calibration_adjustments(self, prediction: OverUnderPrediction, bet_month: Optional[str]) -> None:
         book = prediction.best_over_book if prediction.recommendation == 'OVER' else prediction.best_under_book
         mult = self.get_market_multiplier(book, bet_month)
+        # Time-to-game multiplier (bucketed).
+        try:
+            mtg = getattr(prediction, 'minutes_to_game', None)
+            if mtg is None:
+                mtg = getattr(prediction, 'minutes_to_puck_drop', None)
+            if mtg is not None and isinstance(self.train_time_multipliers, dict):
+                tval = float(mtg)
+                if tval >= 720:
+                    mult *= self.train_time_multipliers.get('t_12h', 1.0)
+                elif tval >= 360:
+                    mult *= self.train_time_multipliers.get('t_6h', 1.0)
+                elif tval >= 120:
+                    mult *= self.train_time_multipliers.get('t_2h', 1.0)
+                elif tval >= 30:
+                    mult *= self.train_time_multipliers.get('t_30m', 1.0)
+                else:
+                    mult *= self.train_time_multipliers.get('t_lt30m', 1.0)
+        except Exception:
+            pass
         prediction.calibration_multiplier = mult
         if prediction.recommendation == 'No Bet':
             return
@@ -2765,7 +2787,13 @@ class RealDataNHLModel:
             if col not in df.columns:
                 df[col] = np.nan if 'source' not in col and 'timestamp' not in col else ''
         # Time-aligned snapshot columns (as-of prediction time)
-        for col in ('asof_total', 'asof_over_price', 'asof_under_price', 'minutes_to_game', 'line_age_minutes'):
+        for col in (
+            'asof_total', 'asof_over_price', 'asof_under_price',
+            'minutes_to_game', 'minutes_to_puck_drop', 'line_age_minutes',
+            'line_move_1h', 'line_move_2h', 'line_move_4h',
+            'line_volatility_4h', 'implied_prob_move_4h',
+            'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof'
+        ):
             if col not in df.columns:
                 df[col] = np.nan
         for col in ('asof_source', 'asof_timestamp'):
@@ -2918,6 +2946,13 @@ class RealDataNHLModel:
                             game_dt_lookup = dict(zip(df['game_id'].astype(str), tmp_dt))
                     except Exception:
                         game_dt_lookup = {}
+                    def _implied_prob(a: Any) -> Optional[float]:
+                        try:
+                            if a is None or not np.isfinite(float(a)):
+                                return None
+                            return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(a))))
+                        except Exception:
+                            return None
                     asof_mode = str(os.getenv('ODDS_ASOF_MODE', 'offset')).strip().lower()
                     if asof_mode not in ('offset', 'latest'):
                         asof_mode = 'offset'
@@ -2992,6 +3027,60 @@ class RealDataNHLModel:
                                 minutes_to_game = max(0.0, (gdt - asof_ts).total_seconds() / 60.0)
                         except Exception:
                             minutes_to_game = None
+                        # microstructure snapshots
+                        def _lookup_total(delta_h: float) -> Optional[float]:
+                            if not isinstance(asof_ts, pd.Timestamp):
+                                return None
+                            cutoff = asof_ts - pd.Timedelta(hours=delta_h)
+                            pre = g_agg[g_agg['ts'] <= cutoff]
+                            if pre.empty:
+                                return None
+                            return float(pre.iloc[-1].get('book_total'))
+                        def _lookup_over(delta_h: float) -> Optional[float]:
+                            if not isinstance(asof_ts, pd.Timestamp):
+                                return None
+                            cutoff = asof_ts - pd.Timedelta(hours=delta_h)
+                            pre = g_agg[g_agg['ts'] <= cutoff]
+                            if pre.empty:
+                                return None
+                            return float(pre.iloc[-1].get('book_over'))
+                        total_1h = _lookup_total(1.0)
+                        total_2h = _lookup_total(2.0)
+                        total_4h = _lookup_total(4.0)
+                        total_6h = _lookup_total(6.0)
+                        line_move_1h = float(asof_pick.get('book_total')) - total_1h if total_1h is not None else np.nan
+                        line_move_2h = float(asof_pick.get('book_total')) - total_2h if total_2h is not None else np.nan
+                        line_move_4h = float(asof_pick.get('book_total')) - total_4h if total_4h is not None else np.nan
+                        line_velocity_6h = (float(asof_pick.get('book_total')) - total_6h) / 6.0 if total_6h is not None else np.nan
+                        try:
+                            if isinstance(asof_ts, pd.Timestamp):
+                                window = g_agg[(g_agg['ts'] >= (asof_ts - pd.Timedelta(hours=4))) & (g_agg['ts'] <= asof_ts)]
+                                line_volatility_4h = float(window['book_total'].std()) if len(window) >= 2 else np.nan
+                            else:
+                                line_volatility_4h = np.nan
+                        except Exception:
+                            line_volatility_4h = np.nan
+                        implied_over_asof = _implied_prob(asof_pick.get('book_over'))
+                        implied_over_4h = _implied_prob(_lookup_over(4.0))
+                        implied_prob_move_4h = (
+                            float(implied_over_asof - implied_over_4h)
+                            if implied_over_asof is not None and implied_over_4h is not None
+                            else np.nan
+                        )
+                        implied_under_asof = _implied_prob(asof_pick.get('book_under'))
+                        price_skew_asof = (
+                            float(implied_over_asof - implied_under_asof)
+                            if implied_over_asof is not None and implied_under_asof is not None
+                            else np.nan
+                        )
+                        try:
+                            if isinstance(asof_ts, pd.Timestamp):
+                                disp_rows = g[g['ts'] == asof_ts]
+                                line_dispersion_asof = float(np.std(pd.to_numeric(disp_rows['book_total'], errors='coerce'))) if len(disp_rows) >= 2 else np.nan
+                            else:
+                                line_dispersion_asof = np.nan
+                        except Exception:
+                            line_dispersion_asof = np.nan
                         line_age_minutes = None
                         try:
                             if open_row is not None and isinstance(asof_ts, pd.Timestamp):
@@ -3008,7 +3097,16 @@ class RealDataNHLModel:
                             'derived_asof_source': str(asof_pick.get('book') or asof_pick.get('book_key') or 'odds_history.csv'),
                             'derived_asof_timestamp': asof_pick.get('ts'),
                             'derived_minutes_to_game': minutes_to_game,
+                            'derived_minutes_to_puck_drop': minutes_to_game,
                             'derived_line_age_minutes': line_age_minutes
+                            , 'derived_line_move_1h': line_move_1h
+                            , 'derived_line_move_2h': line_move_2h
+                            , 'derived_line_move_4h': line_move_4h
+                            , 'derived_line_volatility_4h': line_volatility_4h
+                            , 'derived_implied_prob_move_4h': implied_prob_move_4h
+                            , 'derived_line_velocity_6h': line_velocity_6h
+                            , 'derived_line_dispersion_asof': line_dispersion_asof
+                            , 'derived_price_skew_asof': price_skew_asof
                         })
                     if derived:
                         ddf = pd.DataFrame(derived).dropna(subset=['game_id'])
@@ -3087,11 +3185,31 @@ class RealDataNHLModel:
                         except Exception:
                             pass
                         try:
+                            miss = pd.to_numeric(df['minutes_to_puck_drop'], errors='coerce').isna()
+                            df.loc[miss, 'minutes_to_puck_drop'] = pd.to_numeric(df.loc[miss, 'derived_minutes_to_puck_drop'], errors='coerce')
+                        except Exception:
+                            pass
+                        try:
                             miss = pd.to_numeric(df['line_age_minutes'], errors='coerce').isna()
                             df.loc[miss, 'line_age_minutes'] = pd.to_numeric(df.loc[miss, 'derived_line_age_minutes'], errors='coerce')
                         except Exception:
                             pass
-                        df.drop(columns=[c for c in adf.columns if c.startswith('derived_asof_') or c.startswith('derived_minutes_') or c.startswith('derived_line_')], inplace=True, errors='ignore')
+                        for src, dest in (
+                            ('derived_line_move_1h', 'line_move_1h'),
+                            ('derived_line_move_2h', 'line_move_2h'),
+                            ('derived_line_move_4h', 'line_move_4h'),
+                            ('derived_line_volatility_4h', 'line_volatility_4h'),
+                            ('derived_implied_prob_move_4h', 'implied_prob_move_4h'),
+                            ('derived_line_velocity_6h', 'line_velocity_6h'),
+                            ('derived_line_dispersion_asof', 'line_dispersion_asof'),
+                            ('derived_price_skew_asof', 'price_skew_asof'),
+                        ):
+                            try:
+                                miss = pd.to_numeric(df[dest], errors='coerce').isna()
+                                df.loc[miss, dest] = pd.to_numeric(df.loc[miss, src], errors='coerce')
+                            except Exception:
+                                pass
+                        df.drop(columns=[c for c in adf.columns if c.startswith('derived_asof_') or c.startswith('derived_minutes_') or c.startswith('derived_line_') or c.startswith('derived_implied_') or c.startswith('derived_price_')], inplace=True, errors='ignore')
 
         # Normalize types
         df['closing_total'] = pd.to_numeric(df['closing_total'], errors='coerce')
@@ -3860,10 +3978,41 @@ class RealDataNHLModel:
         df = df.copy()
         # Market context features (open/as-of, price movement, consensus dispersion)
         try:
-            if 'minutes_to_game' not in df.columns and 'asof_timestamp' in df.columns and 'date' in df.columns:
+        if 'minutes_to_game' not in df.columns and 'asof_timestamp' in df.columns and 'date' in df.columns:
                 game_dt = pd.to_datetime(df['date'], errors='coerce', utc=True).dt.tz_convert(None)
                 asof_ts = pd.to_datetime(df['asof_timestamp'], errors='coerce', utc=True).dt.tz_convert(None)
                 df['minutes_to_game'] = (game_dt - asof_ts).dt.total_seconds() / 60.0
+        except Exception:
+            pass
+        try:
+            if 'minutes_to_puck_drop' not in df.columns:
+                if 'minutes_to_game' in df.columns:
+                    df['minutes_to_puck_drop'] = pd.to_numeric(df['minutes_to_game'], errors='coerce')
+                elif 'asof_timestamp' in df.columns and 'date' in df.columns:
+                    game_dt = pd.to_datetime(df['date'], errors='coerce', utc=True).dt.tz_convert(None)
+                    asof_ts = pd.to_datetime(df['asof_timestamp'], errors='coerce', utc=True).dt.tz_convert(None)
+                    df['minutes_to_puck_drop'] = (game_dt - asof_ts).dt.total_seconds() / 60.0
+        except Exception:
+            pass
+        # If prediction time is within the near-close window, prefer closing prices.
+        try:
+            close_minutes = float(os.getenv('NEAR_CLOSE_MINUTES', '60'))
+        except Exception:
+            close_minutes = 60.0
+        try:
+            if close_minutes > 0 and 'minutes_to_game' in df.columns:
+                mtg_vals = pd.to_numeric(df['minutes_to_game'], errors='coerce')
+                near_close = (mtg_vals <= close_minutes).astype(float)
+                df['near_close'] = near_close
+                if 'closing_total' in df.columns and 'asof_total' in df.columns:
+                    close_total = pd.to_numeric(df['closing_total'], errors='coerce')
+                    df['asof_total'] = df['asof_total'].where(~near_close.astype(bool), close_total)
+                if 'closing_over_price' in df.columns and 'asof_over_price' in df.columns:
+                    close_over = pd.to_numeric(df['closing_over_price'], errors='coerce')
+                    df['asof_over_price'] = df['asof_over_price'].where(~near_close.astype(bool), close_over)
+                if 'closing_under_price' in df.columns and 'asof_under_price' in df.columns:
+                    close_under = pd.to_numeric(df['closing_under_price'], errors='coerce')
+                    df['asof_under_price'] = df['asof_under_price'].where(~near_close.astype(bool), close_under)
         except Exception:
             pass
         try:
@@ -4003,7 +4152,10 @@ class RealDataNHLModel:
             'goalie_prob_diff', 'goalie_backup_diff', 'goalie_gsax_diff', 'goalie_expected_gsax_diff',
             # Market line context (time-aligned)
             'market_total', 'market_total_mid', 'open_total', 'asof_total', 'consensus_total',
-            'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'line_age_minutes',
+            'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'minutes_to_puck_drop', 'line_age_minutes',
+            'near_close',
+            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_volatility_4h',
+            'implied_prob_move_4h', 'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof',
             'open_over_price', 'open_under_price', 'asof_over_price', 'asof_under_price',
             'over_price_move', 'under_price_move', 'consensus_std',
             # Environment overlays
@@ -4011,7 +4163,10 @@ class RealDataNHLModel:
         ]
         market_feature_cols = [
             'market_total', 'market_total_mid', 'open_total', 'asof_total', 'consensus_total',
-            'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'line_age_minutes',
+            'line_movement', 'line_diff_vs_consensus', 'minutes_to_game', 'minutes_to_puck_drop', 'line_age_minutes',
+            'near_close',
+            'line_move_1h', 'line_move_2h', 'line_move_4h', 'line_volatility_4h',
+            'implied_prob_move_4h', 'line_velocity_6h', 'line_dispersion_asof', 'price_skew_asof',
             'open_over_price', 'open_under_price', 'asof_over_price', 'asof_under_price',
             'over_price_move', 'under_price_move', 'consensus_std'
         ]
@@ -4204,6 +4359,7 @@ class RealDataNHLModel:
         self.train_speed_profile = speed_profile
         self.train_month_multipliers = {}
         self.train_season_multipliers = {}
+        self.train_time_multipliers = {}
         speed_cfg = TRAIN_SPEED_PRESETS[speed_profile]
         self.skip_goal_model_training = bool(speed_cfg.get('skip_goal_models', False))
         print(f"⏱️ Training preset: {speed_cfg.get('label', speed_profile.title())}")
@@ -5123,6 +5279,35 @@ class RealDataNHLModel:
                                     season_mults[skey] = float(max(0.8, min(1.2, mult)))
                             self.train_month_multipliers = month_mults
                             self.train_season_multipliers = season_mults
+                            # Time-to-game bucket calibration (minutes_to_game feature).
+                            try:
+                                if 'minutes_to_game' in X_train.columns or 'minutes_to_puck_drop' in X_train.columns:
+                                    mtg_series = (
+                                        X_train['minutes_to_game']
+                                        if 'minutes_to_game' in X_train.columns
+                                        else X_train['minutes_to_puck_drop']
+                                    )
+                                    mtg_vals = pd.to_numeric(mtg_series, errors='coerce').to_numpy(dtype=float)
+                                    time_mults: Dict[str, float] = {}
+                                    buckets = [
+                                        ('t_12h', mtg_vals >= 720),
+                                        ('t_6h', (mtg_vals >= 360) & (mtg_vals < 720)),
+                                        ('t_2h', (mtg_vals >= 120) & (mtg_vals < 360)),
+                                        ('t_30m', (mtg_vals >= 30) & (mtg_vals < 120)),
+                                        ('t_lt30m', mtg_vals < 30),
+                                    ]
+                                    for key, mask_bucket in buckets:
+                                        bucket_mask = valid & keep & mask_bucket
+                                        if int(bucket_mask.sum()) < 10:
+                                            continue
+                                        p_mean = float(np.mean(raw_oof_prob[bucket_mask]))
+                                        a_mean = float(np.mean(oof_over[bucket_mask]))
+                                        if p_mean > 0 and np.isfinite(p_mean) and np.isfinite(a_mean):
+                                            mult = a_mean / p_mean
+                                            time_mults[key] = float(max(0.75, min(1.25, mult)))
+                                    self.train_time_multipliers = time_mults
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     iso = IsotonicRegression(out_of_bounds='clip')
@@ -5439,6 +5624,7 @@ class RealDataNHLModel:
             'consensus_guard_support': self.consensus_guard_support,
             'train_month_multipliers': getattr(self, 'train_month_multipliers', {}),
             'train_season_multipliers': getattr(self, 'train_season_multipliers', {}),
+            'train_time_multipliers': getattr(self, 'train_time_multipliers', {}),
         }
         if walk_metrics:
             model_state['walk_forward_metrics'] = walk_metrics
@@ -5516,6 +5702,29 @@ class RealDataNHLModel:
                 candidate_val = np.nan
             if np.isfinite(candidate_val):
                 ref_goal_value = candidate_val
+
+        # Extract time-to-game features when available.
+        minutes_to_game_val: Optional[float] = None
+        minutes_to_puck_drop_val: Optional[float] = None
+        line_age_minutes_val: Optional[float] = None
+        try:
+            if 'minutes_to_game' in self.feature_names:
+                idx = self.feature_names.index('minutes_to_game')
+                minutes_to_game_val = float(game_features[idx])
+        except Exception:
+            minutes_to_game_val = None
+        try:
+            if 'minutes_to_puck_drop' in self.feature_names:
+                idx = self.feature_names.index('minutes_to_puck_drop')
+                minutes_to_puck_drop_val = float(game_features[idx])
+        except Exception:
+            minutes_to_puck_drop_val = minutes_to_game_val
+        try:
+            if 'line_age_minutes' in self.feature_names:
+                idx = self.feature_names.index('line_age_minutes')
+                line_age_minutes_val = float(game_features[idx])
+        except Exception:
+            line_age_minutes_val = None
         
         # Prepare feature row & locked pipeline transforms
         feature_row = game_features.reshape(1, -1)
@@ -6147,6 +6356,9 @@ class RealDataNHLModel:
             'decision_side': line_decision_side,
             'ref_goals_gm': ref_goal_value,
             'ref_goal_adjustment': ref_goal_adjustment,
+            'minutes_to_game': minutes_to_game_val,
+            'minutes_to_puck_drop': minutes_to_puck_drop_val,
+            'line_age_minutes': line_age_minutes_val,
             'model_consensus_std': consensus_std_val,
             'model_consensus_range': consensus_range_val,
             'edge_threshold_used': edge_threshold_used,
@@ -11556,6 +11768,13 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         oh['book_total'] = pd.to_numeric(oh['book_total'], errors='coerce')
                         oh['book_over'] = pd.to_numeric(oh.get('book_over'), errors='coerce')
                         oh['book_under'] = pd.to_numeric(oh.get('book_under'), errors='coerce')
+                        def _implied_prob(a: Any) -> Optional[float]:
+                            try:
+                                if a is None or not np.isfinite(float(a)):
+                                    return None
+                                return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(a))))
+                            except Exception:
+                                return None
                         for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
                             g = grp.sort_values('ts')
                             if g.empty:
@@ -11575,7 +11794,9 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 except Exception:
                                     pass
                             open_row = g_agg.iloc[0]
-                            asof_row = g_agg.iloc[-1]
+                            # As-of snapshot = latest <= now, else latest
+                            pre_now = g_agg[g_agg['ts'] <= now_ts]
+                            asof_row = pre_now.iloc[-1] if not pre_now.empty else g_agg.iloc[-1]
                             open_ts = open_row.get('ts')
                             asof_ts = asof_row.get('ts')
                             line_age_minutes = None
@@ -11584,6 +11805,59 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                     line_age_minutes = max(0.0, (asof_ts - open_ts).total_seconds() / 60.0)
                             except Exception:
                                 line_age_minutes = None
+                            def _lookup_total(delta_h: float) -> Optional[float]:
+                                if not isinstance(asof_ts, pd.Timestamp):
+                                    return None
+                                cutoff = asof_ts - pd.Timedelta(hours=delta_h)
+                                pre = g_agg[g_agg['ts'] <= cutoff]
+                                if pre.empty:
+                                    return None
+                                return float(pre.iloc[-1].get('book_total'))
+                            def _lookup_over(delta_h: float) -> Optional[float]:
+                                if not isinstance(asof_ts, pd.Timestamp):
+                                    return None
+                                cutoff = asof_ts - pd.Timedelta(hours=delta_h)
+                                pre = g_agg[g_agg['ts'] <= cutoff]
+                                if pre.empty:
+                                    return None
+                                return float(pre.iloc[-1].get('book_over'))
+                            total_1h = _lookup_total(1.0)
+                            total_2h = _lookup_total(2.0)
+                            total_4h = _lookup_total(4.0)
+                            total_6h = _lookup_total(6.0)
+                            line_move_1h = float(asof_row.get('book_total')) - total_1h if total_1h is not None else 0.0
+                            line_move_2h = float(asof_row.get('book_total')) - total_2h if total_2h is not None else 0.0
+                            line_move_4h = float(asof_row.get('book_total')) - total_4h if total_4h is not None else 0.0
+                            line_velocity_6h = (float(asof_row.get('book_total')) - total_6h) / 6.0 if total_6h is not None else 0.0
+                            try:
+                                if isinstance(asof_ts, pd.Timestamp):
+                                    window = g_agg[(g_agg['ts'] >= (asof_ts - pd.Timedelta(hours=4))) & (g_agg['ts'] <= asof_ts)]
+                                    line_volatility_4h = float(window['book_total'].std()) if len(window) >= 2 else 0.0
+                                else:
+                                    line_volatility_4h = 0.0
+                            except Exception:
+                                line_volatility_4h = 0.0
+                            implied_over_asof = _implied_prob(asof_row.get('book_over'))
+                            implied_over_4h = _implied_prob(_lookup_over(4.0))
+                            implied_prob_move_4h = (
+                                float(implied_over_asof - implied_over_4h)
+                                if implied_over_asof is not None and implied_over_4h is not None
+                                else 0.0
+                            )
+                            implied_under_asof = _implied_prob(asof_row.get('book_under'))
+                            price_skew_asof = (
+                                float(implied_over_asof - implied_under_asof)
+                                if implied_over_asof is not None and implied_under_asof is not None
+                                else 0.0
+                            )
+                            try:
+                                if isinstance(asof_ts, pd.Timestamp):
+                                    disp_rows = g[g['ts'] == asof_ts]
+                                    line_dispersion_asof = float(np.std(pd.to_numeric(disp_rows['book_total'], errors='coerce'))) if len(disp_rows) >= 2 else 0.0
+                                else:
+                                    line_dispersion_asof = 0.0
+                            except Exception:
+                                line_dispersion_asof = 0.0
                             odds_snapshot_map[str(gid)] = {
                                 'open_total': open_row.get('book_total'),
                                 'open_over': open_row.get('book_over'),
@@ -11593,7 +11867,15 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 'asof_over': asof_row.get('book_over'),
                                 'asof_under': asof_row.get('book_under'),
                                 'asof_ts': asof_ts,
-                                'line_age_minutes': line_age_minutes
+                                'line_age_minutes': line_age_minutes,
+                                'line_move_1h': line_move_1h,
+                                'line_move_2h': line_move_2h,
+                                'line_move_4h': line_move_4h,
+                                'line_volatility_4h': line_volatility_4h,
+                                'implied_prob_move_4h': implied_prob_move_4h,
+                                'line_velocity_6h': line_velocity_6h,
+                                'line_dispersion_asof': line_dispersion_asof,
+                                'price_skew_asof': price_skew_asof
                             }
             except Exception:
                 velocity_map = {}
@@ -11647,10 +11929,20 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'under_price_move': 0.0,
                 'market_total_mid': baseline_total,
                 'minutes_to_game': float(os.getenv('DEFAULT_MINUTES_TO_GAME', '360')),
+                'minutes_to_puck_drop': float(os.getenv('DEFAULT_MINUTES_TO_GAME', '360')),
                 'line_age_minutes': 0.0,
+                'near_close': 0.0,
                 'asof_total': baseline_total,
                 'asof_over_price': -110,
-                'asof_under_price': -110
+                'asof_under_price': -110,
+                'line_move_1h': 0.0,
+                'line_move_2h': 0.0,
+                'line_move_4h': 0.0,
+                'line_volatility_4h': 0.0,
+                'implied_prob_move_4h': 0.0,
+                'line_velocity_6h': 0.0,
+                'line_dispersion_asof': 0.0,
+                'price_skew_asof': 0.0
             }
 
             for idx, game in todays_features.iterrows():
@@ -11722,7 +12014,17 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         'line_movement': line_movement,
                         'line_diff_vs_consensus': market_total - consensus_total if isinstance(consensus_total, (int, float)) else 0.0,
                         'minutes_to_game': minutes_to_game if minutes_to_game is not None else float(os.getenv('DEFAULT_MINUTES_TO_GAME', '360')),
+                        'minutes_to_puck_drop': minutes_to_game if minutes_to_game is not None else float(os.getenv('DEFAULT_MINUTES_TO_GAME', '360')),
                         'line_age_minutes': line_age_minutes if line_age_minutes is not None else 0.0,
+                        'near_close': 1.0 if isinstance(minutes_to_game, (int, float)) and minutes_to_game <= float(os.getenv('NEAR_CLOSE_MINUTES', '60')) else 0.0,
+                        'line_move_1h': snap.get('line_move_1h', 0.0),
+                        'line_move_2h': snap.get('line_move_2h', 0.0),
+                        'line_move_4h': snap.get('line_move_4h', 0.0),
+                        'line_volatility_4h': snap.get('line_volatility_4h', 0.0),
+                        'implied_prob_move_4h': snap.get('implied_prob_move_4h', 0.0),
+                        'line_velocity_6h': snap.get('line_velocity_6h', 0.0),
+                        'line_dispersion_asof': snap.get('line_dispersion_asof', 0.0),
+                        'price_skew_asof': snap.get('price_skew_asof', 0.0),
                         'open_over_price': open_over if isinstance(open_over, (int, float)) else over_price,
                         'open_under_price': open_under if isinstance(open_under, (int, float)) else under_price,
                         'asof_over_price': asof_over if isinstance(asof_over, (int, float)) else over_price,
