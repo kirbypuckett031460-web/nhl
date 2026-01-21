@@ -80,6 +80,10 @@ def attach_status_history(
         "away_goalie_gsax": ["away_goalie_gsax", "ag_gsax", "away_gsax"],
         "home_goalie_prob": ["home_goalie_prob", "hg_prob", "home_prob"],
         "away_goalie_prob": ["away_goalie_prob", "ag_prob", "away_prob"],
+        "home_xgf_adj": ["home_xgf_adj", "home_xgf_injury_adj", "home_attack_adj"],
+        "away_xgf_adj": ["away_xgf_adj", "away_xgf_injury_adj", "away_attack_adj"],
+        "home_hdcf_adj": ["home_hdcf_adj", "home_hdcf_injury_adj"],
+        "away_hdcf_adj": ["away_hdcf_adj", "away_hdcf_injury_adj"],
     }
     for target, aliases in col_map.items():
         if target in hist.columns:
