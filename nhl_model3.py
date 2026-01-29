@@ -10140,9 +10140,19 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
-    ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
-    yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
+    ytd_str = "Totals YTD: 0.0% (0/0)"
+    yesterday_str = "Totals Yesterday: — (no bets)"
+    ytd_ml_str = "ML YTD: — (no bets)"
+    yesterday_ml_str = "ML Yesterday: — (no bets)"
+    try:
+        summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
+        if isinstance(summary_stats, dict):
+            ytd_str = summary_stats.get('ytd_str', ytd_str)
+            yesterday_str = summary_stats.get('yesterday_str', yesterday_str)
+            ytd_ml_str = summary_stats.get('ytd_ml_str', ytd_ml_str)
+            yesterday_ml_str = summary_stats.get('yesterday_ml_str', yesterday_ml_str)
+    except Exception as exc:
+        print(f"⚠️  Failed to compute bet performance summary: {exc}")
 
     def _strip_since(text: str) -> str:
         if not text:
@@ -10307,22 +10317,21 @@ def save_predictions_image(
 
     n_table_rows = max(1, len(df) + 1)
     row_height_in = 0.32
-    title_height_in = 0.9
+    title_height_in = 1.15
     bottom_pad_in = 0.25
     fig_height = max(1.0, (n_table_rows * row_height_in) + title_height_in + bottom_pad_in)
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
     fig.patch.set_facecolor('white')
     ax.axis('off')
 
-    ytd_str = locals().get('ytd_str', "Totals YTD: 0.0% (0/0)")
-    yesterday_str = locals().get('yesterday_str', "Totals Yesterday: — (no bets)")
-    ytd_ml_str = locals().get('ytd_ml_str', "ML YTD: — (no bets)")
-    yesterday_ml_str = locals().get('yesterday_ml_str', "ML Yesterday: — (no bets)")
     perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
     perf_line = " | ".join(perf_line_segments)
+    ml_line_segments = [segment for segment in [ytd_ml_str, yesterday_ml_str] if segment]
+    ml_line = " | ".join(ml_line_segments)
     title_text = (
         f"NHL Predictions\n"
         f"{perf_line}\n"
+        f"{ml_line}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds from FanDuel."
     )
