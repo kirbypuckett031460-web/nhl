@@ -10343,6 +10343,19 @@ def save_predictions_image(
     ytd_ml_str = summary_stats.get('ytd_ml_str', "ML YTD: — (no bets)")
     yesterday_ml_str = summary_stats.get('yesterday_ml_str', "ML Yesterday: — (no bets)")
 
+    def _strip_since(text: str) -> str:
+        if not text:
+            return text
+        try:
+            cleaned = re.sub(r"\s*\(since [^)]+\)", "", str(text), flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s+since\s+\d{4}-\d{2}-\d{2}", "", cleaned, flags=re.IGNORECASE)
+            return cleaned.strip()
+        except Exception:
+            return text
+
+    ytd_str = _strip_since(ytd_str)
+    ytd_ml_str = _strip_since(ytd_ml_str)
+
     rows: List[Dict[str, str]] = []
     for pred in predictions:
         # Determine scheduled time (Eastern) when available
