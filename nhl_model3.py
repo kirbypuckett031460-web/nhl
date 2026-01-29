@@ -10356,6 +10356,19 @@ def save_predictions_image(
     ytd_str = _strip_since(ytd_str)
     ytd_ml_str = _strip_since(ytd_ml_str)
 
+    def _label_totals(text: str) -> str:
+        if not text:
+            return text
+        try:
+            updated = re.sub(r"^Totals YTD\b", "Totals YTD (O/U)", text)
+            updated = re.sub(r"^Totals Yesterday\b", "Totals Yesterday (O/U)", updated)
+            return updated
+        except Exception:
+            return text
+
+    ytd_str = _label_totals(ytd_str)
+    yesterday_str = _label_totals(yesterday_str)
+
     rows: List[Dict[str, str]] = []
     for pred in predictions:
         # Determine scheduled time (Eastern) when available
