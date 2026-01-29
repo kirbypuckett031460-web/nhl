@@ -8998,11 +8998,9 @@ def compute_bet_performance_summary(
     """Return YTD/last-week bet performance strings and record counts."""
 
     summary: Dict[str, Any] = {
-        'ytd_str': "Totals YTD: 0.0% (0/0)",
+        'ytd_str': "YTD: 0.0% (0/0)",
         'last_week_str': "Last Week: 0.0% (0/0)",
-        'yesterday_str': "Totals Yesterday: — (no bets)",
-        'ytd_ml_str': "ML YTD: — (no bets)",
-        'yesterday_ml_str': "ML Yesterday: — (no bets)",
+        'yesterday_str': "Yesterday: — (no bets)",
         'wins': None,
         'losses': None,
         'total': None,
@@ -9078,21 +9076,6 @@ def compute_bet_performance_summary(
             # Without a side/pick column we cannot attribute picks to OVER/UNDER.
             # Skip this file so we don't mistakenly suppress model-eval fallback.
             continue
-
-        action_col = next(
-            (c for c in df_log.columns if str(c).lower() in {'action', 'bet_type', 'market'}),
-            None
-        )
-        action_norm = (
-            df_log[action_col].astype(str).str.strip().str.upper()
-            if action_col else pd.Series('', index=df_log.index)
-        )
-        ml_side_norm = df_log['_side_norm'].fillna('').astype(str)
-        ml_mask = (
-            action_norm.str.contains('ML')
-            | ml_side_norm.str.contains('ML')
-            | ml_side_norm.isin({'HOME', 'AWAY', 'HML', 'AML'})
-        )
 
         # Prefer graded results when present, but do not require them:
         # many users log picks immediately and grade later, and we still want the
@@ -9197,7 +9180,7 @@ def compute_bet_performance_summary(
                 yday_total = yday_wins + yday_losses
                 if yday_total > 0:
                     yday_pct = (yday_wins / yday_total) * 100.0
-                    summary['yesterday_str'] = f"Totals Yesterday: {yday_wins}-{yday_losses} ({yday_pct:.1f}%)"
+                    summary['yesterday_str'] = f"Yesterday: {yday_wins}-{yday_losses} ({yday_pct:.1f}%)"
                     summary['yesterday_wins'] = yday_wins
                     summary['yesterday_losses'] = yday_losses
                     summary['yesterday_total'] = yday_total
@@ -9208,21 +9191,7 @@ def compute_bet_performance_summary(
                     except Exception:
                         yday_picks = 0
                     if yday_picks > 0:
-                        summary['yesterday_str'] = f"Totals Yesterday: {yday_picks} pick(s) (ungraded)"
-
-                ml_yday_wins = int((win_mask & ml_mask & yesterday_mask).sum())
-                ml_yday_losses = int((loss_mask & ml_mask & yesterday_mask).sum())
-                ml_yday_total = ml_yday_wins + ml_yday_losses
-                if ml_yday_total > 0:
-                    ml_pct = (ml_yday_wins / ml_yday_total) * 100.0
-                    summary['yesterday_ml_str'] = f"ML Yesterday: {ml_yday_wins}-{ml_yday_losses} ({ml_pct:.1f}%)"
-                else:
-                    try:
-                        ml_yday_picks = int((ml_mask & yesterday_mask).sum())
-                    except Exception:
-                        ml_yday_picks = 0
-                    if ml_yday_picks > 0:
-                        summary['yesterday_ml_str'] = f"ML Yesterday: {ml_yday_picks} pick(s) (ungraded)"
+                        summary['yesterday_str'] = f"Yesterday: {yday_picks} pick(s) (ungraded)"
 
                 cutoff_local = now_local - pd.Timedelta(days=7)
                 last_week_mask = dates_local >= cutoff_local
@@ -9245,33 +9214,23 @@ def compute_bet_performance_summary(
             ytd_win_mask = win_mask & direction_mask & season_mask
             ytd_loss_mask = loss_mask & direction_mask & season_mask
             ytd_pick_mask = direction_mask & season_mask
-            ytd_ml_win_mask = win_mask & ml_mask & season_mask
-            ytd_ml_loss_mask = loss_mask & ml_mask & season_mask
-            ytd_ml_pick_mask = ml_mask & season_mask
         else:
             ytd_win_mask = win_mask & direction_mask
             ytd_loss_mask = loss_mask & direction_mask
             ytd_pick_mask = direction_mask
-            ytd_ml_win_mask = win_mask & ml_mask
-            ytd_ml_loss_mask = loss_mask & ml_mask
-            ytd_ml_pick_mask = ml_mask
 
         total_scored = int(ytd_win_mask.sum() + ytd_loss_mask.sum())
         if total_scored > 0:
             total_wins = int(ytd_win_mask.sum())
             total_losses = int(ytd_loss_mask.sum())
             accuracy_pct = (total_wins / total_scored) * 100.0
-            summary['ytd_str'] = f"Totals YTD: {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
+            if season_start_eastern is not None:
+                summary['ytd_str'] = f"YTD (since {season_start_eastern.date().isoformat()}): {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
+            else:
+                summary['ytd_str'] = f"YTD: {accuracy_pct:.1f}% ({total_wins}/{total_scored})"
             summary['wins'] = total_wins
             summary['losses'] = total_losses
             summary['total'] = total_scored
-        ml_scored = int(ytd_ml_win_mask.sum() + ytd_ml_loss_mask.sum())
-        if ml_scored > 0:
-            ml_wins = int(ytd_ml_win_mask.sum())
-            ml_losses = int(ytd_ml_loss_mask.sum())
-            ml_pct = (ml_wins / ml_scored) * 100.0
-            summary['ytd_ml_str'] = f"ML YTD: {ml_pct:.1f}% ({ml_wins}/{ml_scored})"
-        if total_scored > 0:
             return summary
 
         # If we found a log and it contains picks but none are graded yet, do NOT fall back
@@ -9281,19 +9240,19 @@ def compute_bet_performance_summary(
         except Exception:
             total_picks = 0
         if total_picks > 0:
-            summary['ytd_str'] = f"Totals YTD: — ({total_picks} pick(s) logged, 0 graded)"
+            if season_start_eastern is not None:
+                summary['ytd_str'] = (
+                    f"YTD (since {season_start_eastern.date().isoformat()}): — "
+                    f"({total_picks} pick(s) logged, 0 graded)"
+                )
+            else:
+                summary['ytd_str'] = f"YTD: — ({total_picks} pick(s) logged, 0 graded)"
             # Preserve wins/losses/total as None so the dashboard can still show
             # "No graded bets" while the social line confirms the log is being read.
             summary['wins'] = None
             summary['losses'] = None
             summary['total'] = None
-        try:
-            ml_picks = int(ytd_ml_pick_mask.sum())
-        except Exception:
-            ml_picks = 0
-        if ml_picks > 0 and summary.get('ytd_ml_str', '').startswith('ML YTD: —'):
-            summary['ytd_ml_str'] = f"ML YTD: — ({ml_picks} pick(s) logged, 0 graded)"
-        return summary
+            return summary
 
     if training_results:
         try:
@@ -9440,53 +9399,6 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             'closing_source': closing_source,
             'clv_vs_closing': clv
         })
-        # Log moneyline picks separately for grading.
-        ml_side = str(getattr(p, 'moneyline_recommendation_side', '') or '').strip().lower()
-        ml_text = str(getattr(p, 'moneyline_recommendation', '') or '').strip().upper()
-        if not ml_side:
-            if 'HOME' in ml_text:
-                ml_side = 'home'
-            elif 'AWAY' in ml_text:
-                ml_side = 'away'
-        if ml_side in {'home', 'away'}:
-            ml_action = 'ML_BET' if float(getattr(p, 'moneyline_bet_size', 0.0) or 0.0) > 0 else 'ML_PICK'
-            ml_side_label = 'HOME ML' if ml_side == 'home' else 'AWAY ML'
-            ml_price = p.home_moneyline_odds if ml_side == 'home' else p.away_moneyline_odds
-            ml_prob = p.home_win_probability if ml_side == 'home' else p.away_win_probability
-            ml_edge = p.home_moneyline_edge if ml_side == 'home' else p.away_moneyline_edge
-            ml_ev = p.home_moneyline_ev if ml_side == 'home' else p.away_moneyline_ev
-            ml_book = p.best_home_moneyline_book if ml_side == 'home' else p.best_away_moneyline_book
-            rows.append({
-                'date': now_local.strftime('%Y-%m-%d %H:%M:%S'),
-                'game_id': gid,
-                'matchup': matchup,
-                'result': '',
-                'action': ml_action,
-                'side': ml_side_label,
-                'line': np.nan,
-                'price': ml_price,
-                'pred_total': p.predicted_total,
-                'edge': ml_edge,
-                'confidence': ml_prob,
-                'kelly_pct': float(getattr(p, 'moneyline_bet_size', 0.0) or 0.0) if ml_action == 'ML_BET' else 0.0,
-                'model_prob': ml_prob,
-                'market_prob': np.nan,
-                'fair_prob': np.nan,
-                'ev_novig': ml_ev,
-                'consensus_total': p.consensus_total,
-                'line_diff_vs_consensus': p.line_diff,
-                'best_book': ml_book,
-                'bet_month': getattr(p, 'bet_month', None),
-                'calibration_multiplier': getattr(p, 'calibration_multiplier', None),
-                'market_velocity': getattr(p, 'market_velocity', None),
-                'referee_info': p.referee_info,
-                'referee_avg_goals': p.referee_avg_goals,
-                'referee_home_bias': p.referee_home_bias,
-                'closing_total': None,
-                'closing_price': None,
-                'closing_source': None,
-                'clv_vs_closing': None
-            })
 
     df = pd.DataFrame(rows)
     for col in BET_LOG_COLUMNS:
@@ -9537,7 +9449,7 @@ def grade_bets_log(
     force_refresh: bool = False,
     historical_frame: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
-    """Grade/settle ungraded OVER/UNDER and moneyline picks in a bets log.
+    """Grade/settle ungraded OVER/UNDER picks in a bets log.
 
     This updates *only* the existing ``result`` column (WIN/LOSS/PUSH) to avoid
     breaking the fixed bets log schema (``BET_LOG_COLUMNS``), which is appended
@@ -9730,12 +9642,8 @@ def grade_bets_log(
     ungraded_tokens = {'', 'NAN', 'NONE', 'NULL', 'UNGRADED', '—', '-', 'NA'}
     ungraded_mask = result_raw.isna() | result_norm.isin(ungraded_tokens)
     actionable_mask = side.isin({'OVER', 'UNDER'}) & line.notna()
-    action_norm = df_log.get('action', pd.Series('', index=df_log.index)).astype(str).str.strip().str.upper()
-    ml_actionable_mask = action_norm.str.contains('ML') | side.str.contains('ML') | side.isin({'HOME', 'AWAY', 'HML', 'AML'})
     candidate_mask = ungraded_mask & actionable_mask
-    candidate_mask_ml = ungraded_mask & ml_actionable_mask
     summary['ungraded_before'] = int(candidate_mask.sum())
-    summary['ml_ungraded_before'] = int(candidate_mask_ml.sum())
 
     # Parse bet dates and matchup strings now (used for both matching and picking a sufficient history window).
     bet_date_only = None
@@ -9832,25 +9740,6 @@ def grade_bets_log(
         if key[0] and key[1] is not None:
             matchup_date_to_total[key] = float(row['total_goals'])
 
-    gid_to_scores: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-    matchup_date_to_scores: Dict[Tuple[str, Any], Tuple[Optional[float], Optional[float]]] = {}
-    if 'home_goals' in hist.columns and 'away_goals' in hist.columns:
-        for _, row in hist.dropna(subset=['game_id', 'home_goals', 'away_goals']).iterrows():
-            key = _norm_game_id(row.get('game_id'))
-            if not key:
-                continue
-            try:
-                gid_to_scores[key] = (float(row['home_goals']), float(row['away_goals']))
-            except Exception:
-                continue
-        for _, row in hist.dropna(subset=['matchup', 'date_only', 'home_goals', 'away_goals']).iterrows():
-            key = (_norm_matchup(row['matchup']), row['date_only'])
-            if key[0] and key[1] is not None:
-                try:
-                    matchup_date_to_scores[key] = (float(row['home_goals']), float(row['away_goals']))
-                except Exception:
-                    continue
-
     date_only = bet_date_only
     if 'game_id' in df_log.columns:
         game_id_series = df_log['game_id'].apply(_norm_game_id)
@@ -9866,7 +9755,6 @@ def grade_bets_log(
     # historical ETL skipped a Final due to missing advanced stats, and when bet date is NaT).
     fetcher = None
     fetched_totals: Dict[str, float] = {}
-    fetched_scores: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     fetched_states: Dict[str, str] = {}
     for idx in df_log.index[candidate_mask]:
         gid = str(game_id_series.loc[idx] or '').strip()
@@ -9910,7 +9798,6 @@ def grade_bets_log(
                     if hs_i is not None and as_i is not None and state in {'FINAL', 'OFF', 'FINALOT', 'FINALSO'}:
                         total = float(hs_i + as_i)
                         fetched_totals[gid] = total
-                        fetched_scores[gid] = (float(hs_i), float(as_i))
                     else:
                         fetched_totals[gid] = None  # cache miss (not final or missing)
                 except Exception:
@@ -9956,97 +9843,13 @@ def grade_bets_log(
                 continue
         graded += 1
 
-    ml_graded = 0
-    ml_skipped = 0
-    for idx in df_log.index[candidate_mask_ml]:
-        gid = str(game_id_series.loc[idx] or '').strip()
-        scores = None
-        if gid and gid in gid_to_scores:
-            scores = gid_to_scores.get(gid)
-        if scores is None and date_only is not None:
-            m = str(matchup_series.loc[idx] or '').strip().upper()
-            d = date_only.loc[idx] if hasattr(date_only, 'loc') else None
-            if m and d is not None:
-                scores = matchup_date_to_scores.get((m, d))
-        if scores is None and gid:
-            if gid in fetched_scores:
-                scores = fetched_scores.get(gid)
-            else:
-                try:
-                    if fetcher is None:
-                        fetcher = NHLDataFetcher()
-                    gid_int = int(float(gid))
-                    payload = fetcher.get_game_stats(gid_int)
-                    state_raw = payload.get('gameState') or payload.get('gameScheduleState') or ''
-                    state = str(state_raw or '').strip().upper()
-                    home = payload.get('homeTeam') or {}
-                    away = payload.get('awayTeam') or {}
-                    hs = home.get('score')
-                    as_ = away.get('score')
-                    try:
-                        hs_i = int(hs) if hs is not None else None
-                    except Exception:
-                        hs_i = None
-                    try:
-                        as_i = int(as_) if as_ is not None else None
-                    except Exception:
-                        as_i = None
-                    if hs_i is not None and as_i is not None and state in {'FINAL', 'OFF', 'FINALOT', 'FINALSO'}:
-                        fetched_scores[gid] = (float(hs_i), float(as_i))
-                        scores = fetched_scores[gid]
-                    else:
-                        fetched_scores[gid] = None
-                except Exception:
-                    fetched_scores[gid] = None
-        if scores is None:
-            ml_skipped += 1
-            continue
-        try:
-            home_goals, away_goals = scores
-        except Exception:
-            ml_skipped += 1
-            continue
-        if home_goals is None or away_goals is None:
-            ml_skipped += 1
-            continue
-        side_val = str(side.loc[idx] or '').strip().upper()
-        pick = None
-        if 'HOME' in side_val:
-            pick = 'HOME'
-        elif 'AWAY' in side_val:
-            pick = 'AWAY'
-        if pick is None:
-            ml_skipped += 1
-            continue
-        if home_goals > away_goals:
-            outcome = 'HOME'
-        elif home_goals < away_goals:
-            outcome = 'AWAY'
-        else:
-            outcome = 'PUSH'
-        if outcome == 'PUSH':
-            grade_val = 'PUSH'
-        elif outcome == pick:
-            grade_val = 'WIN'
-        else:
-            grade_val = 'LOSS'
-        for col in result_cols:
-            try:
-                df_log.at[idx, col] = grade_val
-            except Exception:
-                continue
-        ml_graded += 1
-
     summary['graded'] = graded
     summary['skipped'] = skipped
-    summary['ml_graded'] = ml_graded
-    summary['ml_skipped'] = ml_skipped
 
     # Recompute after-mask
     result_norm_after = df_log[result_col].astype(str).str.strip().str.upper()
     ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log[result_col].isna()
     summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
-    summary['ml_ungraded_after'] = int((ungraded_after & ml_actionable_mask).sum())
 
     try:
         print(
@@ -10337,19 +10140,9 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    ytd_str = "Totals YTD: 0.0% (0/0)"
-    yesterday_str = "Totals Yesterday: — (no bets)"
-    ytd_ml_str = "ML YTD: — (no bets)"
-    yesterday_ml_str = "ML Yesterday: — (no bets)"
-    try:
-        summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
-        if isinstance(summary_stats, dict):
-            ytd_str = summary_stats.get('ytd_str', ytd_str)
-            yesterday_str = summary_stats.get('yesterday_str', yesterday_str)
-            ytd_ml_str = summary_stats.get('ytd_ml_str', ytd_ml_str)
-            yesterday_ml_str = summary_stats.get('yesterday_ml_str', yesterday_ml_str)
-    except Exception as exc:
-        print(f"⚠️  Failed to compute bet performance summary: {exc}")
+    summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
+    ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
+    yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
 
     def _strip_since(text: str) -> str:
         if not text:
@@ -10514,7 +10307,7 @@ def save_predictions_image(
 
     n_table_rows = max(1, len(df) + 1)
     row_height_in = 0.32
-    title_height_in = 1.15
+    title_height_in = 0.9
     bottom_pad_in = 0.25
     fig_height = max(1.0, (n_table_rows * row_height_in) + title_height_in + bottom_pad_in)
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
@@ -10523,12 +10316,9 @@ def save_predictions_image(
 
     perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
     perf_line = " | ".join(perf_line_segments)
-    ml_line_segments = [segment for segment in [ytd_ml_str, yesterday_ml_str] if segment]
-    ml_line = " | ".join(ml_line_segments)
     title_text = (
         f"NHL Predictions\n"
         f"{perf_line}\n"
-        f"{ml_line}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds from FanDuel."
     )
@@ -10636,8 +10426,8 @@ def create_dashboard_html(
         ytd_record_display = f"{wins_val}-{losses_val}"
     elif isinstance(wins_val, (int, np.integer)) and isinstance(total_val, (int, np.integer)):
         ytd_record_display = f"{wins_val}-{max(0, int(total_val) - int(wins_val))}"
-    ytd_record_note = performance_summary.get('ytd_str', "Totals YTD: 0.0% (0/0)")
-    yesterday_note = performance_summary.get('yesterday_str', "Totals Yesterday: — (no bets)")
+    ytd_record_note = performance_summary.get('ytd_str', "YTD: 0.0% (0/0)")
+    yesterday_note = performance_summary.get('yesterday_str', "Yesterday: — (no bets)")
     yday_wins = performance_summary.get('yesterday_wins')
     yday_losses = performance_summary.get('yesterday_losses')
     yday_total = performance_summary.get('yesterday_total')
