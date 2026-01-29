@@ -10314,6 +10314,10 @@ def save_predictions_image(
     fig.patch.set_facecolor('white')
     ax.axis('off')
 
+    ytd_str = locals().get('ytd_str', "Totals YTD: 0.0% (0/0)")
+    yesterday_str = locals().get('yesterday_str', "Totals Yesterday: — (no bets)")
+    ytd_ml_str = locals().get('ytd_ml_str', "ML YTD: — (no bets)")
+    yesterday_ml_str = locals().get('yesterday_ml_str', "ML Yesterday: — (no bets)")
     perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
     perf_line = " | ".join(perf_line_segments)
     title_text = (
