@@ -10140,8 +10140,8 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    ytd_str = "Totals YTD: 0.0% (0/0)"
-    yesterday_str = "Totals Yesterday: — (no bets)"
+    ytd_str = "Season O/U: 0.0% (0/0)"
+    yesterday_str = "Yesterday O/U: — (no bets)"
     ytd_ml_str = "ML YTD: — (no bets)"
     yesterday_ml_str = "ML Yesterday: — (no bets)"
     try:
@@ -10171,8 +10171,8 @@ def save_predictions_image(
         if not text:
             return text
         try:
-            updated = re.sub(r"^Totals YTD\b", "Totals YTD (O/U)", text)
-            updated = re.sub(r"^Totals Yesterday\b", "Totals Yesterday (O/U)", updated)
+            updated = re.sub(r"^Totals YTD\b", "Season O/U", text)
+            updated = re.sub(r"^Totals Yesterday\b", "Yesterday O/U", updated)
             return updated
         except Exception:
             return text
