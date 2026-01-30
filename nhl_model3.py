@@ -10181,6 +10181,9 @@ def save_predictions_image(
 
     ytd_str = _label_totals(ytd_str)
     yesterday_str = _label_totals(yesterday_str)
+    summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
+    ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
+    yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
 
     rows: List[Dict[str, str]] = []
     for pred in predictions:
