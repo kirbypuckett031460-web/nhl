@@ -10172,7 +10172,9 @@ def save_predictions_image(
             return text
         try:
             updated = re.sub(r"^Totals YTD\b", "Season O/U", text)
+            updated = re.sub(r"^YTD\b", "Season O/U", updated)
             updated = re.sub(r"^Totals Yesterday\b", "Yesterday O/U", updated)
+            updated = re.sub(r"^Yesterday\b", "Yesterday O/U", updated)
             return updated
         except Exception:
             return text
