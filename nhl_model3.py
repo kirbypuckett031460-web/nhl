@@ -10317,7 +10317,7 @@ def save_predictions_image(
 
     n_table_rows = max(1, len(df) + 1)
     row_height_in = 0.32
-    title_height_in = 1.15
+    title_height_in = 0.9
     bottom_pad_in = 0.25
     fig_height = max(1.0, (n_table_rows * row_height_in) + title_height_in + bottom_pad_in)
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
@@ -10326,12 +10326,9 @@ def save_predictions_image(
 
     perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
     perf_line = " | ".join(perf_line_segments)
-    ml_line_segments = [segment for segment in [ytd_ml_str, yesterday_ml_str] if segment]
-    ml_line = " | ".join(ml_line_segments)
     title_text = (
         f"NHL Predictions\n"
         f"{perf_line}\n"
-        f"{ml_line}\n"
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds from FanDuel."
     )
