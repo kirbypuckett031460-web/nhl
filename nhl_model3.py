@@ -10140,45 +10140,9 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    ytd_str = "Season O/U: 0.0% (0/0)"
-    yesterday_str = "Yesterday O/U: — (no bets)"
-    ytd_ml_str = "ML YTD: — (no bets)"
-    yesterday_ml_str = "ML Yesterday: — (no bets)"
-    try:
-        summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
-        if isinstance(summary_stats, dict):
-            ytd_str = summary_stats.get('ytd_str', ytd_str)
-            yesterday_str = summary_stats.get('yesterday_str', yesterday_str)
-            ytd_ml_str = summary_stats.get('ytd_ml_str', ytd_ml_str)
-            yesterday_ml_str = summary_stats.get('yesterday_ml_str', yesterday_ml_str)
-    except Exception as exc:
-        print(f"⚠️  Failed to compute bet performance summary: {exc}")
-
-    def _strip_since(text: str) -> str:
-        if not text:
-            return text
-        try:
-            cleaned = re.sub(r"\s*\(since [^)]+\)", "", str(text), flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s+since\s+\d{4}-\d{2}-\d{2}", "", cleaned, flags=re.IGNORECASE)
-            return cleaned.strip()
-        except Exception:
-            return text
-
-    ytd_str = _strip_since(ytd_str)
-    ytd_ml_str = _strip_since(ytd_ml_str)
-
-    def _label_totals(text: str) -> str:
-        if not text:
-            return text
-        try:
-            updated = re.sub(r"^Totals YTD\b", "Season O/U", text)
-            updated = re.sub(r"^Totals Yesterday\b", "Yesterday O/U", updated)
-            return updated
-        except Exception:
-            return text
-
-    ytd_str = _label_totals(ytd_str)
-    yesterday_str = _label_totals(yesterday_str)
+    summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
+    ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
+    yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
 
     rows: List[Dict[str, str]] = []
     for pred in predictions:
