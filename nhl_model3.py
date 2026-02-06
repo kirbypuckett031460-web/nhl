@@ -9642,7 +9642,13 @@ def grade_bets_log(
     ungraded_tokens = {'', 'NAN', 'NONE', 'NULL', 'UNGRADED', '—', '-', 'NA'}
     ungraded_mask = result_raw.isna() | result_norm.isin(ungraded_tokens)
     actionable_mask = side.isin({'OVER', 'UNDER'}) & line.notna()
-    candidate_mask = ungraded_mask & actionable_mask
+    action_norm = df_log.get('action', pd.Series('', index=df_log.index)).astype(str).str.strip().str.upper()
+    ml_row_mask = (
+        action_norm.str.contains('ML')
+        | side.str.contains('ML')
+        | side.isin({'HOME', 'AWAY', 'HML', 'AML'})
+    )
+    candidate_mask = ungraded_mask & actionable_mask & ~ml_row_mask
     summary['ungraded_before'] = int(candidate_mask.sum())
 
     # Parse bet dates and matchup strings now (used for both matching and picking a sufficient history window).
