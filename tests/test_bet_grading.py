@@ -15,7 +15,7 @@ class BetGradingTests(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(tmp.name) and os.remove(tmp.name))
         return tmp.name
 
-    def test_grade_bets_log_excludes_pick_rows_when_actions_present(self):
+    def test_grade_bets_log_grades_bet_and_pick_rows_when_directional(self):
         log_path = self._write_log(
             [
                 {
@@ -53,13 +53,12 @@ class BetGradingTests(unittest.TestCase):
         summary = grade_bets_log(log_path=log_path, historical_days=7, historical_frame=historical)
         graded = pd.read_csv(log_path)
 
-        self.assertEqual(summary.get("graded"), 1)
-        self.assertEqual(summary.get("excluded_picks"), 1)
+        self.assertEqual(summary.get("graded"), 2)
 
         bet_row = graded[graded["action"].astype(str).str.upper() == "BET"].iloc[0]
         pick_row = graded[graded["action"].astype(str).str.upper() == "PICK"].iloc[0]
         self.assertEqual(str(bet_row["result"]).upper(), "WIN")
-        self.assertTrue(pd.isna(pick_row["result"]) or str(pick_row["result"]).strip() == "")
+        self.assertEqual(str(pick_row["result"]).upper(), "LOSS")
 
     def test_grade_bets_log_keeps_legacy_blank_action_rows_gradable(self):
         log_path = self._write_log(
@@ -91,10 +90,9 @@ class BetGradingTests(unittest.TestCase):
         graded = pd.read_csv(log_path)
 
         self.assertEqual(summary.get("graded"), 1)
-        self.assertEqual(summary.get("excluded_picks"), 0)
         self.assertEqual(str(graded.iloc[0]["result"]).upper(), "LOSS")
 
-    def test_performance_summary_counts_only_bets_not_picks(self):
+    def test_performance_summary_counts_directional_picks_and_bets(self):
         log_path = self._write_log(
             [
                 {
@@ -119,10 +117,10 @@ class BetGradingTests(unittest.TestCase):
         )
 
         summary = compute_bet_performance_summary(log_path=log_path)
-        self.assertEqual(summary.get("wins"), 0)
+        self.assertEqual(summary.get("wins"), 1)
         self.assertEqual(summary.get("losses"), 1)
-        self.assertEqual(summary.get("total"), 1)
-        self.assertIn("(0/1)", str(summary.get("ytd_str", "")))
+        self.assertEqual(summary.get("total"), 2)
+        self.assertIn("(1/2)", str(summary.get("ytd_str", "")))
 
 
 if __name__ == "__main__":

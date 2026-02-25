@@ -9077,25 +9077,6 @@ def compute_bet_performance_summary(
             # Skip this file so we don't mistakenly suppress model-eval fallback.
             continue
 
-        # Treat explicit action=PICK rows as model lean-only rows, not real wagers.
-        # Keep backward compatibility for legacy logs where action is blank/unset.
-        action_col = next((c for c in df_log.columns if str(c).lower() in {'action'}), None)
-        if action_col:
-            action_norm = (
-                df_log[action_col]
-                .astype(str)
-                .str.strip()
-                .str.upper()
-            )
-            is_pick_action = action_norm.eq('PICK')
-            is_bet_action = action_norm.eq('BET')
-            try:
-                has_explicit_action_labels = bool((is_pick_action | is_bet_action).any())
-            except Exception:
-                has_explicit_action_labels = False
-            if has_explicit_action_labels:
-                direction_mask = direction_mask & ~is_pick_action
-
         # Prefer graded results when present, but do not require them:
         # many users log picks immediately and grade later, and we still want the
         # dashboard image to reflect that the log was found.
@@ -9204,13 +9185,13 @@ def compute_bet_performance_summary(
                     summary['yesterday_losses'] = yday_losses
                     summary['yesterday_total'] = yday_total
                 else:
-                    # If nothing is graded yet, still show that bets existed yesterday.
+                    # If nothing is graded yet, still show that picks existed yesterday.
                     try:
                         yday_picks = int((direction_mask & yesterday_mask).sum())
                     except Exception:
                         yday_picks = 0
                     if yday_picks > 0:
-                        summary['yesterday_str'] = f"Yesterday: {yday_picks} bet(s) (ungraded)"
+                        summary['yesterday_str'] = f"Yesterday: {yday_picks} pick(s) (ungraded)"
 
                 cutoff_local = now_local - pd.Timedelta(days=7)
                 last_week_mask = dates_local >= cutoff_local
@@ -9226,9 +9207,9 @@ def compute_bet_performance_summary(
                     except Exception:
                         lw_picks = 0
                     if lw_picks > 0:
-                        summary['last_week_str'] = f"Last Week: {lw_picks} bet(s) (ungraded)"
+                        summary['last_week_str'] = f"Last Week: {lw_picks} pick(s) (ungraded)"
 
-        # Compute YTD (season-to-date) from the bets log, filtered from season start if possible.
+        # Compute YTD (season-to-date) from the picks log, filtered from season start if possible.
         if season_mask is not None:
             ytd_win_mask = win_mask & direction_mask & season_mask
             ytd_loss_mask = loss_mask & direction_mask & season_mask
@@ -9252,7 +9233,7 @@ def compute_bet_performance_summary(
             summary['total'] = total_scored
             return summary
 
-        # If we found a log and it contains bets but none are graded yet, do NOT fall back
+        # If we found a log and it contains picks but none are graded yet, do NOT fall back
         # to model evaluation (which is misleading and often shows the last test split size).
         try:
             total_picks = int(ytd_pick_mask.sum())
@@ -9262,10 +9243,10 @@ def compute_bet_performance_summary(
             if season_start_eastern is not None:
                 summary['ytd_str'] = (
                     f"YTD (since {season_start_eastern.date().isoformat()}): — "
-                    f"({total_picks} bet(s) logged, 0 graded)"
+                    f"({total_picks} pick(s) logged, 0 graded)"
                 )
             else:
-                summary['ytd_str'] = f"YTD: — ({total_picks} bet(s) logged, 0 graded)"
+                summary['ytd_str'] = f"YTD: — ({total_picks} pick(s) logged, 0 graded)"
             # Preserve wins/losses/total as None so the dashboard can still show
             # "No graded bets" while the social line confirms the log is being read.
             summary['wins'] = None
@@ -9316,8 +9297,8 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
     for p in predictions:
         gid = p.game_id
         matchup = f"{p.away_team}@{p.home_team}"
-        # Always log a directional lean (OVER/UNDER) for model auditability,
-        # even when the model would otherwise recommend "No Bet".
+        # Always log a directional pick (OVER/UNDER) so grading/YTD can track
+        # model direction even when the model would otherwise recommend "No Bet".
         rec_side = (p.recommendation or '').strip().upper()
         action = 'BET'
         if rec_side not in {'OVER', 'UNDER'}:
@@ -9339,6 +9320,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
                     rec_side = 'OVER' if float(getattr(p, 'predicted_total', 0.0)) >= float(getattr(p, 'betting_line', 0.0)) else 'UNDER'
                 except Exception:
                     rec_side = 'OVER'
+        # Safety: keep log schema directional for downstream grading/reporting.
+        if rec_side not in {'OVER', 'UNDER'}:
+            rec_side = 'OVER'
 
         my_line = p.betting_line
         close_total = None
@@ -9468,7 +9452,7 @@ def grade_bets_log(
     force_refresh: bool = False,
     historical_frame: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
-    """Grade/settle ungraded OVER/UNDER bets in a bets log.
+    """Grade/settle ungraded OVER/UNDER picks in a bets log.
 
     This updates *only* the existing ``result`` column (WIN/LOSS/PUSH) to avoid
     breaking the fixed bets log schema (``BET_LOG_COLUMNS``), which is appended
@@ -9479,7 +9463,6 @@ def grade_bets_log(
         'log_path': log_path,
         'graded': 0,
         'skipped': 0,
-        'excluded_picks': 0,
         'ungraded_before': 0,
         'ungraded_after': 0,
         'written_path': None,
@@ -9663,27 +9646,12 @@ def grade_bets_log(
     ungraded_mask = result_raw.isna() | result_norm.isin(ungraded_tokens)
     actionable_mask = side.isin({'OVER', 'UNDER'}) & line.notna()
     action_norm = df_log.get('action', pd.Series('', index=df_log.index)).astype(str).str.strip().str.upper()
-    is_pick_action = action_norm.eq('PICK')
-    is_bet_action = action_norm.eq('BET')
-    try:
-        has_explicit_action_labels = bool((is_pick_action | is_bet_action).any())
-    except Exception:
-        has_explicit_action_labels = False
-    # Backward compatibility:
-    # - If logs have explicit BET/PICK labels, grade only real bets (exclude PICK rows).
-    # - If logs are legacy/unlabeled, keep grading directional rows.
-    if has_explicit_action_labels:
-        bet_action_mask = ~is_pick_action
-    else:
-        bet_action_mask = pd.Series(True, index=df_log.index)
     ml_row_mask = (
         action_norm.str.contains('ML')
         | side.str.contains('ML')
         | side.isin({'HOME', 'AWAY', 'HML', 'AML'})
     )
-    grade_scope_mask = actionable_mask & bet_action_mask & ~ml_row_mask
-    candidate_mask = ungraded_mask & grade_scope_mask
-    summary['excluded_picks'] = int((ungraded_mask & actionable_mask & is_pick_action).sum())
+    candidate_mask = ungraded_mask & actionable_mask & ~ml_row_mask
     summary['ungraded_before'] = int(candidate_mask.sum())
 
     # Parse bet dates and matchup strings now (used for both matching and picking a sufficient history window).
@@ -9890,14 +9858,13 @@ def grade_bets_log(
     # Recompute after-mask
     result_norm_after = df_log[result_col].astype(str).str.strip().str.upper()
     ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log[result_col].isna()
-    summary['ungraded_after'] = int((ungraded_after & grade_scope_mask).sum())
+    summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
 
     try:
         print(
             f"ℹ️  Grade summary: candidates={summary['ungraded_before']} graded={graded} "
             f"matched_by_game_id={matched_by_gid} matched_by_matchup_date={matched_by_matchup_date} "
-            f"excluded_picks={summary['excluded_picks']} skipped_unmatched={skipped} "
-            f"history_days_back={days_back_required}"
+            f"skipped_unmatched={skipped} history_days_back={days_back_required}"
         )
         if examples_unmatched:
             print("ℹ️  Example unmatched rows (up to 6):")
@@ -9912,7 +9879,7 @@ def grade_bets_log(
         df_log.to_csv(target_path, index=False)
         wrote = True
         summary['written_path'] = target_path
-        print(f"✅ Graded {graded} bet(s) (skipped {skipped}). Updated log: {target_path}")
+        print(f"✅ Graded {graded} pick(s) (skipped {skipped}). Updated log: {target_path}")
     except Exception as e:
         print(f"⚠️  Failed to write updated bets log to {target_path}: {e}")
 
