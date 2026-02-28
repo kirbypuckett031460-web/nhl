@@ -9639,6 +9639,54 @@ def grade_bets_log(
         print("⚠️  Bets log has no side/pick column — cannot grade.")
         return summary
 
+    def _repair_recent_pick_sides(df: pd.DataFrame, days: int = 3) -> int:
+        """Align recent PICK sides with decision-side logic (O/U only)."""
+        if days <= 0 or 'date' not in df.columns:
+            return 0
+        date_only = _parse_date_only(df['date'])
+        if date_only is None:
+            return 0
+        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+        try:
+            cutoff_date = (pd.Timestamp.now(tz=schedule_tz) - pd.Timedelta(days=days)).date()
+        except Exception:
+            cutoff_date = (datetime.now() - timedelta(days=days)).date()
+        date_series = pd.Series(date_only, index=df.index)
+        recent_mask = date_series.notna() & (date_series >= cutoff_date)
+        action_norm = df.get('action', pd.Series('', index=df.index)).astype(str).str.strip().str.upper()
+        ml_row_mask = (
+            action_norm.str.contains('ML')
+            | df[side_col].astype(str).str.upper().str.contains('ML')
+            | df[side_col].astype(str).str.upper().isin({'HOME', 'AWAY', 'HML', 'AML'})
+        )
+        non_bet_mask = action_norm != 'BET'
+        line_vals = pd.to_numeric(df.get('line'), errors='coerce')
+        edge_vals = pd.to_numeric(df.get('edge'), errors='coerce')
+        if 'pred_total' in df.columns:
+            pred_vals = pd.to_numeric(df.get('pred_total'), errors='coerce')
+            edge_vals = edge_vals.fillna(pred_vals - line_vals)
+        tol = 1e-4
+        try:
+            tol = float(os.getenv('LINE_DECISION_TOLERANCE', tol))
+        except Exception:
+            pass
+        new_side = np.where(edge_vals > tol, 'OVER', np.where(edge_vals < -tol, 'UNDER', 'OVER'))
+        update_mask = recent_mask & non_bet_mask & ~ml_row_mask & edge_vals.notna()
+        if update_mask.any():
+            try:
+                df.loc[update_mask, side_col] = new_side[update_mask]
+            except Exception:
+                return 0
+        return int(update_mask.sum())
+
+    try:
+        repair_days = int(os.getenv('REPAIR_RECENT_PICK_DAYS', '3'))
+    except Exception:
+        repair_days = 3
+    repaired = _repair_recent_pick_sides(df_log, days=repair_days)
+    if repaired:
+        print(f"ℹ️  Repaired {repaired} recent pick side(s) using decision-side logic.")
+
     side = df_log[side_col].astype(str).str.strip().str.upper()
     line = pd.to_numeric(df_log.get('line'), errors='coerce')
     result_raw = df_log[result_col]
