@@ -9070,7 +9070,7 @@ def compute_bet_performance_summary(
                 .str.strip()
                 .str.upper()
             )
-            # Count only actual directional picks, never "NO BET"/blank/etc.
+            # Count only actual directional selections, never "NO BET"/blank/etc.
             direction_mask = df_log['_side_norm'].isin({'OVER', 'UNDER'})
         else:
             # Without a side/pick column we cannot attribute picks to OVER/UNDER.
@@ -9297,8 +9297,8 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
     for p in predictions:
         gid = p.game_id
         matchup = f"{p.away_team}@{p.home_team}"
-        # Always log a directional pick (OVER/UNDER) so YTD/weekly records can be updated
-        # even when the model would otherwise recommend "No Bet".
+        # Always log a directional pick (OVER/UNDER) so grading/YTD can track
+        # model direction even when the model would otherwise recommend "No Bet".
         rec_side = (p.recommendation or '').strip().upper()
         action = 'BET'
         if rec_side not in {'OVER', 'UNDER'}:
@@ -9317,14 +9317,10 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
                 try:
                     under_prob_f = float(under_prob) if under_prob is not None else None
                 except Exception:
-                    under_prob_f = None
-                if isinstance(over_prob_f, (int, float)) and isinstance(under_prob_f, (int, float)):
-                    rec_side = 'OVER' if over_prob_f >= under_prob_f else 'UNDER'
-                else:
-                    try:
-                        rec_side = 'OVER' if float(getattr(p, 'predicted_total', 0.0)) >= float(getattr(p, 'betting_line', 0.0)) else 'UNDER'
-                    except Exception:
-                        rec_side = 'OVER'
+                    rec_side = 'OVER'
+        # Safety: keep log schema directional for downstream grading/reporting.
+        if rec_side not in {'OVER', 'UNDER'}:
+            rec_side = 'OVER'
 
         my_line = p.betting_line
         close_total = None
@@ -9929,7 +9925,7 @@ def grade_bets_log(
         df_log.to_csv(target_path, index=False)
         wrote = True
         summary['written_path'] = target_path
-        print(f"✅ Graded {graded} bet(s) (skipped {skipped}). Updated log: {target_path}")
+        print(f"✅ Graded {graded} pick(s) (skipped {skipped}). Updated log: {target_path}")
     except Exception as e:
         print(f"⚠️  Failed to write updated bets log to {target_path}: {e}")
 
