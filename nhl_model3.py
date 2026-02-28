@@ -9303,23 +9303,28 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         action = 'BET'
         if rec_side not in {'OVER', 'UNDER'}:
             action = 'PICK'
-            over_prob = getattr(p, 'over_probability', None)
-            under_prob = getattr(p, 'under_probability', None)
-            try:
-                over_prob_f = float(over_prob) if over_prob is not None else None
-            except Exception:
-                over_prob_f = None
-            try:
-                under_prob_f = float(under_prob) if under_prob is not None else None
-            except Exception:
-                under_prob_f = None
-            if isinstance(over_prob_f, (int, float)) and isinstance(under_prob_f, (int, float)):
-                rec_side = 'OVER' if over_prob_f >= under_prob_f else 'UNDER'
+            # Match the display logic used in predictions.png (decision_side first).
+            decision_side = str(getattr(p, 'decision_side', '') or '').strip().upper()
+            if decision_side in {'OVER', 'UNDER'}:
+                rec_side = decision_side
             else:
+                over_prob = getattr(p, 'over_probability', None)
+                under_prob = getattr(p, 'under_probability', None)
                 try:
-                    rec_side = 'OVER' if float(getattr(p, 'predicted_total', 0.0)) >= float(getattr(p, 'betting_line', 0.0)) else 'UNDER'
+                    over_prob_f = float(over_prob) if over_prob is not None else None
                 except Exception:
-                    rec_side = 'OVER'
+                    over_prob_f = None
+                try:
+                    under_prob_f = float(under_prob) if under_prob is not None else None
+                except Exception:
+                    under_prob_f = None
+                if isinstance(over_prob_f, (int, float)) and isinstance(under_prob_f, (int, float)):
+                    rec_side = 'OVER' if over_prob_f >= under_prob_f else 'UNDER'
+                else:
+                    try:
+                        rec_side = 'OVER' if float(getattr(p, 'predicted_total', 0.0)) >= float(getattr(p, 'betting_line', 0.0)) else 'UNDER'
+                    except Exception:
+                        rec_side = 'OVER'
 
         my_line = p.betting_line
         close_total = None
