@@ -5113,6 +5113,17 @@ class RealDataNHLModel:
                 return float(np.mean((probs - actual) ** 2))
             except Exception:
                 return float(np.mean((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) ** 2))
+        def _edge_log_loss(y_true, y_pred, scale: float) -> float:
+            try:
+                y_t = np.asarray(y_true, dtype=float)
+                y_p = np.asarray(y_pred, dtype=float)
+                s = max(0.2, float(scale))
+                probs = 1.0 / (1.0 + np.exp(-y_p / s))
+                actual = (y_t > 0).astype(int)
+                probs = np.clip(probs, 1e-6, 1.0 - 1e-6)
+                return float(log_loss(actual, probs))
+            except Exception:
+                return float(np.mean((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) ** 2))
         scoring_metric: Any = 'neg_mean_squared_error'
         if is_edge_mode:
             try:
@@ -5121,7 +5132,13 @@ class RealDataNHLModel:
                     edge_scale = 1.5
             except Exception:
                 edge_scale = 1.5
-            scoring_metric = make_scorer(_edge_brier_loss, greater_is_better=False, scale=edge_scale)
+            loss_pref = str(os.getenv('EDGE_TUNING_LOSS', 'log')).strip().lower()
+            if loss_pref not in ('log', 'brier'):
+                loss_pref = 'log'
+            if loss_pref == 'brier':
+                scoring_metric = make_scorer(_edge_brier_loss, greater_is_better=False, scale=edge_scale)
+            else:
+                scoring_metric = make_scorer(_edge_log_loss, greater_is_better=False, scale=edge_scale)
         else:
             try:
                 y_train_numeric = pd.to_numeric(y_train, errors='coerce').to_numpy(dtype=float)
