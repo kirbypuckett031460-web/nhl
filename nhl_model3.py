@@ -592,6 +592,7 @@ class RealDataNHLModel:
     def __init__(self):
         self.data_fetcher = NHLDataFetcher()
         self.total_model = None
+        self.edge_model: Optional[Dict[str, Any]] = None
         self.locked_feature_pipeline: Optional[Pipeline] = None
         self.goal_scaler = StandardScaler()
         self.feature_names = []
@@ -711,6 +712,7 @@ class RealDataNHLModel:
             'train_speed_profile': self.train_speed_profile,
             'feature_names': list(self.feature_names or []),
             'total_model': self.total_model,
+            'edge_model': self.edge_model,
             'goal_scaler': self.goal_scaler,
             'market_calibration_snapshot': self.market_calibration_snapshot,
             'risk_feedback_snapshot': self.risk_feedback_snapshot,
@@ -775,6 +777,13 @@ class RealDataNHLModel:
             print(f"⚠️  Saved model at {resolved} is invalid.")
             return False
         self.total_model = total_model
+        edge_model = payload.get('edge_model') if isinstance(payload, dict) else None
+        if not isinstance(edge_model, dict) and isinstance(total_model, dict):
+            edge_model = total_model.get('edge_model')
+        if isinstance(edge_model, dict):
+            self.edge_model = edge_model
+        else:
+            self.edge_model = None
         loaded_feature_names = payload.get('feature_names') if isinstance(payload, dict) else None
         if not loaded_feature_names and isinstance(total_model.get('feature_names'), list):
             loaded_feature_names = total_model.get('feature_names')
@@ -3427,6 +3436,279 @@ class RealDataNHLModel:
         except Exception:
             return features_df
 
+    def expand_with_odds_snapshots(
+        self,
+        enhanced_df: pd.DataFrame,
+        odds_history_path: Optional[str] = None,
+        snapshot_offsets: Optional[List[float]] = None
+    ) -> pd.DataFrame:
+        """Expand training rows to multiple odds-history snapshots per game."""
+        if enhanced_df is None or not isinstance(enhanced_df, pd.DataFrame) or enhanced_df.empty:
+            return enhanced_df
+
+        if snapshot_offsets is None:
+            raw_offsets = str(os.getenv('ODDS_SNAPSHOT_OFFSETS_HOURS', '')).strip()
+            if raw_offsets:
+                snapshot_offsets = []
+                for tok in raw_offsets.split(','):
+                    try:
+                        snapshot_offsets.append(float(tok.strip()))
+                    except Exception:
+                        continue
+            else:
+                snapshot_offsets = [12.0, 6.0, 2.0, 0.5]
+
+        snapshot_offsets = [float(o) for o in snapshot_offsets if isinstance(o, (int, float)) and float(o) >= 0]
+        if not snapshot_offsets:
+            return enhanced_df
+
+        hist_path = resolve_local_read_path(odds_history_path) if odds_history_path else None
+        if not hist_path:
+            hist_path = 'odds_history.csv'
+        if not hist_path or not os.path.exists(hist_path):
+            return enhanced_df
+
+        try:
+            oh = pd.read_csv(hist_path)
+        except Exception:
+            return enhanced_df
+
+        if not isinstance(oh, pd.DataFrame) or oh.empty or not {'timestamp', 'game_id', 'book_total'}.issubset(set(oh.columns)):
+            return enhanced_df
+
+        df = enhanced_df.copy()
+        if 'game_id' in df.columns:
+            df['game_id'] = df['game_id'].astype(str)
+        try:
+            game_dt_lookup = dict(
+                zip(
+                    df.get('game_id', pd.Series('', index=df.index)).astype(str),
+                    pd.to_datetime(df.get('date'), errors='coerce', utc=True).dt.tz_convert(None)
+                )
+            )
+        except Exception:
+            game_dt_lookup = {}
+
+        oh = oh.copy()
+        oh['game_id'] = oh['game_id'].astype(str)
+        oh['ts'] = pd.to_datetime(oh['timestamp'], errors='coerce')
+        oh['book_total'] = pd.to_numeric(oh['book_total'], errors='coerce')
+        oh['book_over'] = pd.to_numeric(oh.get('book_over'), errors='coerce')
+        oh['book_under'] = pd.to_numeric(oh.get('book_under'), errors='coerce')
+        game_dt_col = None
+        for candidate in ('game_date', 'game_time', 'commence_time'):
+            if candidate in oh.columns:
+                game_dt_col = candidate
+                break
+        if game_dt_col:
+            oh['game_dt'] = pd.to_datetime(oh[game_dt_col], errors='coerce', utc=True).dt.tz_convert(None)
+        else:
+            oh['game_dt'] = pd.NaT
+
+        sharp_books = {
+            token.strip().upper()
+            for token in str(os.getenv('SHARP_BOOKS', 'PINN,CRIS,BOOKMAKER,BM,BO')).split(',')
+            if token.strip()
+        }
+        square_books = {
+            token.strip().upper()
+            for token in str(os.getenv('SQUARE_BOOKS', 'DK,FD,BETMGM,CAESARS')).split(',')
+            if token.strip()
+        }
+
+        def _implied_prob(a: Any) -> Optional[float]:
+            try:
+                if a is None or not np.isfinite(float(a)):
+                    return None
+                return float(odds_decimal_to_implied_prob(odds_american_to_decimal(float(a))))
+            except Exception:
+                return None
+
+        snapshot_rows: List[Dict[str, Any]] = []
+        snapshot_game_ids: Set[str] = set()
+
+        for gid, grp in oh.dropna(subset=['ts']).groupby('game_id'):
+            g = grp.sort_values('ts')
+            g_agg = g.groupby('ts', as_index=False).agg({
+                'book_total': 'median',
+                'book_over': 'median',
+                'book_under': 'median'
+            }).sort_values('ts')
+            if g_agg.empty:
+                continue
+            try:
+                gdt = g['game_dt'].dropna().iloc[-1] if g['game_dt'].notna().any() else None
+            except Exception:
+                gdt = None
+            if gdt is None:
+                gdt = game_dt_lookup.get(str(gid))
+            if gdt is None or not isinstance(gdt, pd.Timestamp) or pd.isna(gdt):
+                continue
+
+            open_row = g_agg.iloc[0]
+
+            for offset in snapshot_offsets:
+                try:
+                    target_dt = gdt - pd.Timedelta(hours=float(offset))
+                except Exception:
+                    target_dt = gdt
+                pre_asof = g_agg[g_agg['ts'] <= target_dt]
+                asof_pick = pre_asof.iloc[-1] if not pre_asof.empty else g_agg.iloc[0]
+                asof_ts = asof_pick.get('ts')
+                minutes_to_game = None
+                try:
+                    if isinstance(asof_ts, pd.Timestamp):
+                        minutes_to_game = max(0.0, (gdt - asof_ts).total_seconds() / 60.0)
+                except Exception:
+                    minutes_to_game = None
+
+                def _lookup_total(delta_h: float) -> Optional[float]:
+                    if not isinstance(asof_ts, pd.Timestamp):
+                        return None
+                    cutoff = asof_ts - pd.Timedelta(hours=delta_h)
+                    pre = g_agg[g_agg['ts'] <= cutoff]
+                    if pre.empty:
+                        return None
+                    return float(pre.iloc[-1].get('book_total'))
+
+                def _lookup_over(delta_h: float) -> Optional[float]:
+                    if not isinstance(asof_ts, pd.Timestamp):
+                        return None
+                    cutoff = asof_ts - pd.Timedelta(hours=delta_h)
+                    pre = g_agg[g_agg['ts'] <= cutoff]
+                    if pre.empty:
+                        return None
+                    return float(pre.iloc[-1].get('book_over'))
+
+                total_1h = _lookup_total(1.0)
+                total_2h = _lookup_total(2.0)
+                total_4h = _lookup_total(4.0)
+                total_6h = _lookup_total(6.0)
+                asof_total_val = asof_pick.get('book_total')
+                line_move_1h = float(asof_total_val) - total_1h if total_1h is not None else np.nan
+                line_move_2h = float(asof_total_val) - total_2h if total_2h is not None else np.nan
+                line_move_4h = float(asof_total_val) - total_4h if total_4h is not None else np.nan
+                line_acceleration_1h = (
+                    line_move_1h - (line_move_4h / 4.0)
+                    if np.isfinite(line_move_1h) and np.isfinite(line_move_4h)
+                    else np.nan
+                )
+                line_velocity_6h = (float(asof_total_val) - total_6h) / 6.0 if total_6h is not None else np.nan
+                try:
+                    if isinstance(asof_ts, pd.Timestamp):
+                        window = g_agg[(g_agg['ts'] >= (asof_ts - pd.Timedelta(hours=4))) & (g_agg['ts'] <= asof_ts)]
+                        line_volatility_4h = float(window['book_total'].std()) if len(window) >= 2 else np.nan
+                    else:
+                        line_volatility_4h = np.nan
+                except Exception:
+                    line_volatility_4h = np.nan
+                implied_over_asof = _implied_prob(asof_pick.get('book_over'))
+                implied_over_4h = _implied_prob(_lookup_over(4.0))
+                implied_prob_move_4h = (
+                    float(implied_over_asof - implied_over_4h)
+                    if implied_over_asof is not None and implied_over_4h is not None
+                    else np.nan
+                )
+                implied_under_asof = _implied_prob(asof_pick.get('book_under'))
+                price_skew_asof = (
+                    float(implied_over_asof - implied_under_asof)
+                    if implied_over_asof is not None and implied_under_asof is not None
+                    else np.nan
+                )
+
+                sharp_total = np.nan
+                sharp_price_skew = np.nan
+                square_total = np.nan
+                square_price_skew = np.nan
+                line_dispersion_asof = np.nan
+                try:
+                    if isinstance(asof_ts, pd.Timestamp):
+                        disp_rows = g[g['ts'] == asof_ts].copy()
+                        line_dispersion_asof = float(np.std(pd.to_numeric(disp_rows['book_total'], errors='coerce'))) if len(disp_rows) >= 2 else np.nan
+                        book_col = None
+                        if 'book' in disp_rows.columns:
+                            book_col = 'book'
+                        elif 'book_key' in disp_rows.columns:
+                            book_col = 'book_key'
+                        if book_col:
+                            disp_rows['book_norm'] = disp_rows[book_col].astype(str).str.upper().str.strip()
+                            sharp_rows = disp_rows[disp_rows['book_norm'].isin(sharp_books)] if sharp_books else disp_rows.iloc[0:0]
+                            if square_books:
+                                square_rows = disp_rows[disp_rows['book_norm'].isin(square_books)]
+                            else:
+                                square_rows = disp_rows[~disp_rows['book_norm'].isin(sharp_books)]
+                            if not sharp_rows.empty:
+                                sharp_total = float(pd.to_numeric(sharp_rows['book_total'], errors='coerce').median())
+                                sharp_over = float(pd.to_numeric(sharp_rows['book_over'], errors='coerce').median())
+                                sharp_under = float(pd.to_numeric(sharp_rows['book_under'], errors='coerce').median())
+                                sharp_over_imp = _implied_prob(sharp_over)
+                                sharp_under_imp = _implied_prob(sharp_under)
+                                if sharp_over_imp is not None and sharp_under_imp is not None:
+                                    sharp_price_skew = float(sharp_over_imp - sharp_under_imp)
+                            if not square_rows.empty:
+                                square_total = float(pd.to_numeric(square_rows['book_total'], errors='coerce').median())
+                                square_over = float(pd.to_numeric(square_rows['book_over'], errors='coerce').median())
+                                square_under = float(pd.to_numeric(square_rows['book_under'], errors='coerce').median())
+                                square_over_imp = _implied_prob(square_over)
+                                square_under_imp = _implied_prob(square_under)
+                                if square_over_imp is not None and square_under_imp is not None:
+                                    square_price_skew = float(square_over_imp - square_under_imp)
+                except Exception:
+                    line_dispersion_asof = np.nan
+
+                line_age_minutes = None
+                try:
+                    if open_row is not None and isinstance(asof_ts, pd.Timestamp):
+                        open_ts = open_row.get('ts')
+                        if isinstance(open_ts, pd.Timestamp) and pd.notna(open_ts):
+                            line_age_minutes = max(0.0, (asof_ts - open_ts).total_seconds() / 60.0)
+                except Exception:
+                    line_age_minutes = None
+
+                base_rows = df[df.get('game_id', pd.Series('', index=df.index)) == str(gid)]
+                if base_rows.empty:
+                    continue
+                for _, base_row in base_rows.iterrows():
+                    row = dict(base_row)
+                    row['asof_total'] = asof_total_val
+                    row['asof_over_price'] = asof_pick.get('book_over')
+                    row['asof_under_price'] = asof_pick.get('book_under')
+                    row['asof_timestamp'] = asof_ts
+                    row['asof_source'] = str(asof_pick.get('book') or asof_pick.get('book_key') or 'odds_history.csv')
+                    row['minutes_to_game'] = minutes_to_game
+                    row['minutes_to_puck_drop'] = minutes_to_game
+                    row['line_age_minutes'] = line_age_minutes
+                    row['line_move_1h'] = line_move_1h
+                    row['line_move_2h'] = line_move_2h
+                    row['line_move_4h'] = line_move_4h
+                    row['line_acceleration_1h'] = line_acceleration_1h
+                    row['line_volatility_4h'] = line_volatility_4h
+                    row['implied_prob_move_4h'] = implied_prob_move_4h
+                    row['line_velocity_6h'] = line_velocity_6h
+                    row['line_dispersion_asof'] = line_dispersion_asof
+                    row['price_skew_asof'] = price_skew_asof
+                    row['sharp_total_asof'] = sharp_total
+                    row['sharp_line_diff_asof'] = sharp_total - float(asof_total_val) if np.isfinite(sharp_total) and asof_total_val is not None else np.nan
+                    row['sharp_price_skew_asof'] = sharp_price_skew
+                    row['square_total_asof'] = square_total
+                    row['square_line_diff_asof'] = square_total - float(asof_total_val) if np.isfinite(square_total) and asof_total_val is not None else np.nan
+                    row['square_price_skew_asof'] = square_price_skew
+                    row['snapshot_offset_hours'] = float(offset)
+                    snapshot_rows.append(row)
+                    snapshot_game_ids.add(str(gid))
+
+        if not snapshot_rows:
+            return enhanced_df
+
+        base_keep = df[~df['game_id'].astype(str).isin(snapshot_game_ids)] if 'game_id' in df.columns else df
+        expanded = pd.DataFrame(snapshot_rows)
+        combined = pd.concat([base_keep, expanded], ignore_index=True, sort=False)
+        try:
+            print(f"📈 Snapshot training: expanded {len(snapshot_game_ids)} games to {len(expanded)} rows.")
+        except Exception:
+            pass
+        return combined
+
     @staticmethod
     def build_closing_lines_from_odds_history(
         odds_history_path: str = 'odds_history.csv',
@@ -5967,6 +6249,52 @@ class RealDataNHLModel:
 
         return training_summary
     
+    def _predict_ensemble_from_state(
+        self,
+        model_state: Optional[Dict[str, Any]],
+        feature_row: np.ndarray
+    ) -> Tuple[Optional[float], float, float]:
+        """Compute ensemble prediction from a stored model state."""
+        if model_state is None or not isinstance(model_state, dict):
+            return None, 0.0, 0.0
+        feature_pipeline = model_state.get('feature_pipeline')
+        if feature_pipeline is not None:
+            try:
+                feature_row = feature_pipeline.transform(feature_row)
+            except Exception:
+                pass
+        models = model_state.get('models', {})
+        weights = np.array(model_state.get('weights', []), dtype=float)
+        model_order = model_state.get('model_order', list(models.keys()))
+        preds: List[float] = []
+        for name in model_order:
+            estimator = models.get(name)
+            if estimator is None:
+                continue
+            try:
+                preds.append(float(estimator.predict(feature_row)[0]))
+            except Exception:
+                preds.append(0.0)
+        if not preds:
+            return None, 0.0, 0.0
+        preds_arr = np.array(preds, dtype=float)
+        if len(weights) != len(preds_arr):
+            if len(weights) == 0:
+                weights = np.ones(len(preds_arr), dtype=float)
+            elif len(weights) > len(preds_arr):
+                weights = weights[:len(preds_arr)]
+            else:
+                pad_len = len(preds_arr) - len(weights)
+                pad_values = np.full(pad_len, weights.mean() if weights.size else 1.0)
+                weights = np.concatenate([weights, pad_values])
+        if not np.isfinite(weights).all() or weights.sum() <= 0:
+            weights = np.ones(len(preds_arr), dtype=float)
+        weights = weights / weights.sum()
+        ensemble_pred = float(np.dot(weights, preds_arr))
+        consensus_std_val = float(np.std(preds_arr)) if len(preds_arr) > 1 else 0.0
+        consensus_range_val = float(np.max(preds_arr) - np.min(preds_arr)) if len(preds_arr) else 0.0
+        return ensemble_pred, consensus_std_val, consensus_range_val
+
     def predict_game(
         self,
         game_features: np.ndarray,
@@ -5978,7 +6306,8 @@ class RealDataNHLModel:
         home_moneyline_odds: Optional[int] = None,
         away_moneyline_odds: Optional[int] = None,
         consensus_home_moneyline: Optional[int] = None,
-        consensus_away_moneyline: Optional[int] = None
+        consensus_away_moneyline: Optional[int] = None,
+        edge_features: Optional[np.ndarray] = None
     ) -> OverUnderPrediction:
         """Predict over/under for a single game"""
         
@@ -6200,6 +6529,22 @@ class RealDataNHLModel:
                     blend_recent = 0.15
                 blend_recent = max(0.0, min(0.5, blend_recent))
                 predicted_total = float((1.0 - blend_recent) * predicted_total + blend_recent * recent_total)
+
+        # Optional edge residual blend (market-line anchored).
+        if self.edge_model is not None and edge_features is not None:
+            try:
+                edge_row = edge_features.reshape(1, -1)
+                edge_pred, _, _ = self._predict_ensemble_from_state(self.edge_model, edge_row)
+            except Exception:
+                edge_pred = None
+            if edge_pred is not None and np.isfinite(edge_pred):
+                edge_total = float(betting_line) + float(edge_pred)
+                try:
+                    edge_blend = float((self.total_model or {}).get('edge_blend_weight', os.getenv('EDGE_BLEND_WEIGHT', '0.6')))
+                except Exception:
+                    edge_blend = 0.6
+                edge_blend = max(0.0, min(1.0, edge_blend))
+                predicted_total = float((1.0 - edge_blend) * predicted_total + edge_blend * edge_total)
         
         if ref_goal_value is not None:
             baseline_val = getattr(self, 'ref_goal_baseline', None)
@@ -6218,6 +6563,24 @@ class RealDataNHLModel:
                 predicted_total = float(predicted_total + ref_goal_adjustment)
         else:
             ref_goal_adjustment = 0.0
+
+        # Optional edge residual model blend (market-adjusted).
+        edge_total = None
+        if self.edge_model is not None and edge_features is not None:
+            try:
+                edge_row = np.asarray(edge_features, dtype=float).reshape(1, -1)
+                edge_pred, _, _ = self._predict_ensemble_from_state(self.edge_model, edge_row)
+                if edge_pred is not None and np.isfinite(edge_pred):
+                    edge_total = float(betting_line) + float(edge_pred)
+            except Exception:
+                edge_total = None
+        if edge_total is not None:
+            try:
+                edge_weight = float((self.total_model or {}).get('edge_blend_weight', os.getenv('EDGE_BLEND_WEIGHT', '0.6')))
+            except Exception:
+                edge_weight = 0.6
+            edge_weight = max(0.0, min(1.0, edge_weight))
+            predicted_total = float((1.0 - edge_weight) * predicted_total + edge_weight * edge_total)
 
         predicted_total = float(max(0.0, predicted_total))
         
@@ -11404,16 +11767,26 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             enhanced_data = model.attach_status_history(enhanced_data, status_hist_path)
         except Exception as e:
             print(f"⚠️  Status history attach failed: {e}")
+        # Optional: expand training rows using multiple odds-history snapshots.
+        try:
+            snapshot_enabled = str(os.getenv('TRAIN_SNAPSHOT_LEVEL', '')).strip().lower() in TRUTHY_FLAGS
+        except Exception:
+            snapshot_enabled = False
+        if snapshot_enabled:
+            try:
+                odds_hist_path = getattr(cli_args, 'odds_history_path', None) if cli_args else os.getenv('ODDS_HISTORY_PATH', 'odds_history.csv')
+            except Exception:
+                odds_hist_path = os.getenv('ODDS_HISTORY_PATH', 'odds_history.csv')
+            try:
+                enhanced_data = model.expand_with_odds_snapshots(enhanced_data, odds_history_path=str(odds_hist_path))
+            except Exception as e:
+                print(f"⚠️  Snapshot expansion skipped: {e}")
         # Configure training target mode (auto|total|edge). Auto uses edge when enough market lines exist.
         try:
             if cli_args and getattr(cli_args, 'train_target', None):
                 model.train_target_mode = getattr(cli_args, 'train_target', None)
         except Exception:
             pass
-        X, y, dates = model.prepare_model_data(enhanced_data)
-        
-        print(f"✅ Created {len(model.feature_names)} features from {len(X)} games")
-        
         print("\n🎯 Step 3: Train or load prediction model...")
         training_results: Dict[str, Any] = {}
         model_loaded_from_disk = False
@@ -11425,7 +11798,63 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             else:
                 print("⚠️  --use-saved-model requested but no --model-path was provided.")
         if not model_loaded_from_disk:
-            training_results = model.train_model(X, y, dates)
+            edge_blend_enabled = str(os.getenv('EDGE_RESIDUAL_BLEND', '1')).strip().lower() in TRUTHY_FLAGS
+            if edge_blend_enabled:
+                original_target = model.train_target_mode
+                # Base totals model (no market features).
+                model.train_target_mode = 'total'
+                X_total, y_total, dates_total = model.prepare_model_data(enhanced_data)
+                print(f"✅ Created {len(model.feature_names)} features from {len(X_total)} games")
+                base_results = model.train_model(X_total, y_total, dates_total)
+                base_state = model.total_model
+                base_feature_names = list(model.feature_names)
+                base_feature_baselines = dict(getattr(model, 'feature_baselines', {}) or {})
+                base_market_lines = model.market_lines
+                base_market_over_prices = model.market_over_prices
+                base_market_under_prices = model.market_under_prices
+                base_target_mode = model.target_mode
+                base_training_frame = getattr(model, '_training_frame', None)
+
+                # Edge residual model (total - market line, with market features).
+                model.train_target_mode = 'edge'
+                X_edge, y_edge, dates_edge = model.prepare_model_data(enhanced_data)
+                edge_results: Dict[str, Any] = {}
+                edge_state: Optional[Dict[str, Any]] = None
+                if str(getattr(model, 'target_mode', 'total')).strip().lower() == 'edge':
+                    edge_results = model.train_model(X_edge, y_edge, dates_edge)
+                    edge_state = model.total_model
+                else:
+                    print("⚠️  Edge residual training skipped (insufficient market line coverage).")
+
+                # Restore base model state
+                model.total_model = base_state
+                model.feature_names = base_feature_names
+                model.feature_baselines = base_feature_baselines
+                model.market_lines = base_market_lines
+                model.market_over_prices = base_market_over_prices
+                model.market_under_prices = base_market_under_prices
+                model.target_mode = base_target_mode
+                model._training_frame = base_training_frame
+                model.train_target_mode = original_target
+
+                model.edge_model = edge_state
+                if isinstance(model.total_model, dict):
+                    model.total_model['edge_model'] = edge_state
+                    try:
+                        model.total_model['edge_blend_weight'] = float(os.getenv('EDGE_BLEND_WEIGHT', '0.6'))
+                    except Exception:
+                        model.total_model['edge_blend_weight'] = 0.6
+
+                training_results = base_results or {}
+                if edge_state is not None:
+                    training_results = dict(training_results)
+                    training_results['edge_training_results'] = edge_results
+                    training_results['edge_model_trained'] = True
+            else:
+                X, y, dates = model.prepare_model_data(enhanced_data)
+                print(f"✅ Created {len(model.feature_names)} features from {len(X)} games")
+                training_results = model.train_model(X, y, dates)
+                model.edge_model = None
             # Train goal models for bivariate Poisson MC (optional for fastest preset)
             if getattr(model, 'skip_goal_model_training', False):
                 print("⏭️  Skipping goal flow training for turbo preset")
@@ -12597,6 +13026,27 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             feature_values.append(float(baseline_feature_map[feature_name]))
                         else:
                             feature_values.append(static_feature_defaults.get(feature_name, 0.0))
+                    edge_feature_values = None
+                    edge_feature_names: List[str] = []
+                    try:
+                        if isinstance(getattr(model, 'edge_model', None), dict):
+                            edge_feature_names = model.edge_model.get('feature_names') or []
+                    except Exception:
+                        edge_feature_names = []
+                    if edge_feature_names:
+                        if edge_feature_names == model.feature_names:
+                            edge_feature_values = feature_values
+                        else:
+                            edge_feature_values = []
+                            for feature_name in edge_feature_names:
+                                if feature_name in game.index and pd.notna(game[feature_name]):
+                                    edge_feature_values.append(float(game[feature_name]))
+                                elif feature_name in market_feature_defaults:
+                                    edge_feature_values.append(float(market_feature_defaults[feature_name]))
+                                elif feature_name in baseline_feature_map:
+                                    edge_feature_values.append(float(baseline_feature_map[feature_name]))
+                                else:
+                                    edge_feature_values.append(static_feature_defaults.get(feature_name, 0.0))
                     best_over_book = odds_rec.get('best_over_book')
                     best_under_book = odds_rec.get('best_under_book')
                     home_moneyline_price = odds_rec.get('home_moneyline')
@@ -12659,7 +13109,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         home_moneyline_odds=home_moneyline_price,
                         away_moneyline_odds=away_moneyline_price,
                         consensus_home_moneyline=consensus_home_moneyline,
-                        consensus_away_moneyline=consensus_away_moneyline
+                        consensus_away_moneyline=consensus_away_moneyline,
+                        edge_features=(np.array(edge_feature_values) if edge_feature_values is not None else None)
                     )
                     pred.game_id = game_id
                     pred.home_team = game.get('home_team', 'HOME')
