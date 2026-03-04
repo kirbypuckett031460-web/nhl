@@ -2136,6 +2136,51 @@ class RealDataNHLModel:
             )
         except Exception:
             features['expected_pace_shrunk'] = features.get('expected_pace', 6.2)
+        # Early-season prior: shrink toward league scoring environment based on games played.
+        try:
+            def _team_games_played(team_col: str) -> pd.Series:
+                team_dates = features[[team_col, date_key_col]].copy()
+                team_dates['games'] = 1
+                daily_counts = (
+                    team_dates
+                    .groupby([team_col, date_key_col], dropna=False)['games']
+                    .sum()
+                    .reset_index()
+                )
+                daily_counts['games_before'] = daily_counts.groupby(team_col)['games'].cumsum().shift(1).fillna(0)
+                merged = features[[team_col, date_key_col]].merge(
+                    daily_counts[[team_col, date_key_col, 'games_before']],
+                    on=[team_col, date_key_col],
+                    how='left'
+                )
+                return pd.to_numeric(merged['games_before'], errors='coerce')
+
+            features['home_games_played'] = _team_games_played('home_team').fillna(0.0)
+            features['away_games_played'] = _team_games_played('away_team').fillna(0.0)
+            features['avg_games_played'] = (
+                pd.to_numeric(features['home_games_played'], errors='coerce').fillna(0.0)
+                + pd.to_numeric(features['away_games_played'], errors='coerce').fillna(0.0)
+            ) / 2.0
+            try:
+                half_life = float(os.getenv('EARLY_SEASON_PRIOR_HALFLIFE_GAMES', '8'))
+            except Exception:
+                half_life = 8.0
+            half_life = max(1.0, half_life)
+            prior_weight = np.exp(-pd.to_numeric(features['avg_games_played'], errors='coerce').fillna(0.0) / half_life)
+            try:
+                min_weight = float(os.getenv('EARLY_SEASON_PRIOR_MIN', '0.05'))
+            except Exception:
+                min_weight = 0.05
+            prior_weight = np.clip(prior_weight, min_weight, 1.0)
+            features['league_prior_weight'] = prior_weight
+            league_base = pd.to_numeric(features['league_total_ewm'], errors='coerce').fillna(6.2)
+            pace_base = pd.to_numeric(features['expected_pace'], errors='coerce').fillna(6.2)
+            features['expected_pace_shrunk'] = (
+                (1.0 - prior_weight) * pace_base + prior_weight * league_base
+            )
+            features['expected_pace_prior'] = features['expected_pace_shrunk']
+        except Exception:
+            pass
         try:
             if 'injury_penalty_adj' in features.columns:
                 inj_adj = pd.to_numeric(features['injury_penalty_adj'], errors='coerce').fillna(0.0)
@@ -4589,8 +4634,9 @@ class RealDataNHLModel:
         feature_cols = [
             'home_gpg_l3', 'away_gpg_l3', 'home_gpg_l5', 'away_gpg_l5', 'home_gpg_l10', 'away_gpg_l10',
             'home_gag_l3', 'away_gag_l3', 'home_gag_l5', 'away_gag_l5', 'home_gag_l10', 'away_gag_l10',
-            'combined_gpg', 'combined_gag', 'expected_pace', 'expected_pace_shrunk', 'expected_pace_injury_adj', 'pace_variance', 'pace_zscore',
-            'league_total_ewm',
+            'combined_gpg', 'combined_gag', 'expected_pace', 'expected_pace_shrunk', 'expected_pace_prior',
+            'expected_pace_injury_adj', 'pace_variance', 'pace_zscore', 'league_total_ewm',
+            'home_games_played', 'away_games_played', 'avg_games_played', 'league_prior_weight',
             'venue_total_avg', 'altitude_bonus', 'rivalry_boost', 'b2b_penalty',
             'home_b2b', 'away_b2b', 'season_progress', 'late_season', 'season_year', 'rest_diff', 'schedule_density_diff',
             'base_total_prediction', 'total_adjustments', 'final_prediction_base', 'travel_fatigue_index',
@@ -12887,6 +12933,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'special_teams_diff': 0.0,
                 'injury_penalty_adj': 0.0,
                 'expected_pace_injury_adj': baseline_total,
+                'expected_pace_prior': baseline_total,
                 'line_movement': 0.0,
                 'line_diff_vs_consensus': 0.0,
                 'over_price_move': 0.0,
@@ -12914,6 +12961,10 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'square_total_asof': baseline_total,
                 'square_line_diff_asof': 0.0,
                 'square_price_skew_asof': 0.0,
+                'home_games_played': 30.0,
+                'away_games_played': 30.0,
+                'avg_games_played': 30.0,
+                'league_prior_weight': 0.1,
                 'home_goalie_schedule_density': 0.0,
                 'away_goalie_schedule_density': 0.0,
                 'goalie_schedule_density_diff': 0.0,
