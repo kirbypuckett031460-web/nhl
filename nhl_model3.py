@@ -10621,10 +10621,11 @@ def save_predictions_image(
         print("ℹ️  No predictions available to render.")
         return None
 
-    ytd_str = "Season O/U: 0.0% (0/0)"
+    ytd_str = "Season O/U: 0-0 (0.0%)"
     yesterday_str = "Yesterday O/U: — (no bets)"
     ytd_ml_str = "ML YTD: — (no bets)"
     yesterday_ml_str = "ML Yesterday: — (no bets)"
+    summary_stats: Dict[str, Any] = {}
     try:
         summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
         if isinstance(summary_stats, dict):
@@ -10662,9 +10663,23 @@ def save_predictions_image(
 
     ytd_str = _label_totals(ytd_str)
     yesterday_str = _label_totals(yesterday_str)
-    summary_stats = compute_bet_performance_summary(training_results, log_path=log_path)
-    ytd_str = summary_stats.get('ytd_str', "YTD: 0.0% (0/0)")
-    yesterday_str = summary_stats.get('yesterday_str', "Yesterday: — (no bets)")
+
+    # Display YTD in win-loss format (like Yesterday), while preserving fallback text.
+    wins_val = summary_stats.get('wins')
+    losses_val = summary_stats.get('losses')
+    total_val = summary_stats.get('total')
+    ytd_wins = None
+    ytd_losses = None
+    if isinstance(wins_val, (int, np.integer)) and isinstance(losses_val, (int, np.integer)):
+        ytd_wins = int(wins_val)
+        ytd_losses = int(losses_val)
+    elif isinstance(wins_val, (int, np.integer)) and isinstance(total_val, (int, np.integer)):
+        ytd_wins = int(wins_val)
+        ytd_losses = max(0, int(total_val) - int(wins_val))
+    if ytd_wins is not None and ytd_losses is not None:
+        ytd_total_scored = ytd_wins + ytd_losses
+        ytd_pct = (ytd_wins / ytd_total_scored) * 100.0 if ytd_total_scored > 0 else 0.0
+        ytd_str = f"Season O/U: {ytd_wins}-{ytd_losses} ({ytd_pct:.1f}%)"
 
     rows: List[Dict[str, str]] = []
     for pred in predictions:
