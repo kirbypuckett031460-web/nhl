@@ -6131,22 +6131,53 @@ class RealDataNHLModel:
             line_for_sanity = float(betting_line)
         except Exception:
             line_for_sanity = np.nan
-        try:
-            min_pred_total_abs = float(os.getenv('MIN_PLAUSIBLE_PRED_TOTAL', '2.0'))
-        except Exception:
-            min_pred_total_abs = 2.0
-        try:
-            max_pred_total_abs = float(os.getenv('MAX_PLAUSIBLE_PRED_TOTAL', '12.5'))
-        except Exception:
-            max_pred_total_abs = 12.5
-        try:
-            max_component_delta = float(os.getenv('MAX_COMPONENT_TOTAL_DELTA', '5.0'))
-        except Exception:
-            max_component_delta = 5.0
-        if not np.isfinite(min_pred_total_abs):
-            min_pred_total_abs = 2.0
-        if not np.isfinite(max_pred_total_abs):
-            max_pred_total_abs = 12.5
+        hard_min_total = 2.0
+        hard_max_total = 12.5
+
+        def _guardrailed_env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+            """Read float env var but clamp to safe bounds to prevent runaway predictions."""
+            raw: Optional[float]
+            try:
+                raw = float(os.getenv(name, str(default)))
+            except Exception:
+                raw = None
+            val = default if raw is None or not np.isfinite(raw) else float(raw)
+            if lo is not None and val < lo:
+                val = float(lo)
+            if hi is not None and val > hi:
+                val = float(hi)
+            if raw is not None and np.isfinite(raw) and abs(val - float(raw)) > 1e-9:
+                warned = getattr(self, '_prediction_guardrail_env_warned', set())
+                if name not in warned:
+                    try:
+                        print(
+                            f"⚠️  Guardrail clamped {name} from {float(raw):.2f} to {val:.2f} "
+                            f"for stable totals predictions."
+                        )
+                    except Exception:
+                        pass
+                    warned.add(name)
+                    self._prediction_guardrail_env_warned = warned
+            return float(val)
+
+        min_pred_total_abs = _guardrailed_env_float(
+            'MIN_PLAUSIBLE_PRED_TOTAL',
+            hard_min_total,
+            hard_min_total,
+            hard_max_total - 0.5
+        )
+        max_pred_total_abs = _guardrailed_env_float(
+            'MAX_PLAUSIBLE_PRED_TOTAL',
+            hard_max_total,
+            hard_min_total + 2.0,
+            hard_max_total
+        )
+        max_component_delta = _guardrailed_env_float(
+            'MAX_COMPONENT_TOTAL_DELTA',
+            3.5,
+            1.0,
+            4.0
+        )
         if min_pred_total_abs > max_pred_total_abs:
             min_pred_total_abs, max_pred_total_abs = max_pred_total_abs, min_pred_total_abs
 
@@ -6285,13 +6316,21 @@ class RealDataNHLModel:
         else:
             ref_goal_adjustment = 0.0
 
+        # Absolute guardrail before anchoring/capping in case env overrides were too permissive.
+        if predicted_total < min_pred_total_abs or predicted_total > max_pred_total_abs:
+            fallback_total = line_for_sanity if np.isfinite(line_for_sanity) else float(max(min_pred_total_abs, min(max_pred_total_abs, predicted_total)))
+            try:
+                print(
+                    f"⚠️  Re-centering predicted total from {predicted_total:.2f} to {fallback_total:.2f} "
+                    f"(abs guardrail {min_pred_total_abs:.2f}-{max_pred_total_abs:.2f})."
+                )
+            except Exception:
+                pass
+            predicted_total = float(fallback_total)
+
         # Anchor to market line to avoid persistent over/under drift from noisy components.
         # 0.0 = no anchor, 1.0 = fully market line.
-        try:
-            market_anchor = float(os.getenv('PRED_MARKET_ANCHOR', '0.65'))
-        except Exception:
-            market_anchor = 0.65
-        market_anchor = max(0.0, min(0.95, market_anchor))
+        market_anchor = _guardrailed_env_float('PRED_MARKET_ANCHOR', 0.70, 0.45, 0.95)
         try:
             line_for_anchor = float(betting_line)
         except Exception:
@@ -6302,10 +6341,7 @@ class RealDataNHLModel:
         predicted_total = float(max(0.0, predicted_total))
         # Safety cap to avoid runaway totals relative to market line when upstream inputs
         # (e.g., alternate ladder lines or malformed features) are abnormal.
-        try:
-            max_pred_delta = float(os.getenv('MAX_PRED_TOTAL_DELTA', '2.0'))
-        except Exception:
-            max_pred_delta = 2.0
+        max_pred_delta = _guardrailed_env_float('MAX_PRED_TOTAL_DELTA', 1.75, 0.75, 2.0)
         try:
             line_for_cap = float(betting_line)
         except Exception:
