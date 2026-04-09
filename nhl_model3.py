@@ -6220,6 +6220,29 @@ class RealDataNHLModel:
             ref_goal_adjustment = 0.0
 
         predicted_total = float(max(0.0, predicted_total))
+        # Safety cap to avoid runaway totals relative to market line when upstream inputs
+        # (e.g., alternate ladder lines or malformed features) are abnormal.
+        try:
+            max_pred_delta = float(os.getenv('MAX_PRED_TOTAL_DELTA', '3.0'))
+        except Exception:
+            max_pred_delta = 3.0
+        try:
+            line_for_cap = float(betting_line)
+        except Exception:
+            line_for_cap = np.nan
+        if np.isfinite(max_pred_delta) and max_pred_delta > 0 and np.isfinite(line_for_cap):
+            cap_lo = line_for_cap - max_pred_delta
+            cap_hi = line_for_cap + max_pred_delta
+            if predicted_total < cap_lo or predicted_total > cap_hi:
+                capped_total = float(max(cap_lo, min(cap_hi, predicted_total)))
+                try:
+                    print(
+                        f"⚠️  Capping predicted total from {predicted_total:.2f} to {capped_total:.2f} "
+                        f"around line {line_for_cap:.2f} (max delta {max_pred_delta:.2f})."
+                    )
+                except Exception:
+                    pass
+                predicted_total = capped_total
         
         # Calculate probabilities with calibrated uncertainty and push handling
         edge = predicted_total - betting_line
@@ -6886,7 +6909,24 @@ class RealDataNHLModel:
                         })
                     except Exception:
                         pass
-                plausible_totals = [t for t in totals if isinstance(t, (int, float)) and np.isfinite(t) and 4.0 <= float(t) <= 8.5]
+                try:
+                    min_main_total = float(os.getenv('MIN_MAIN_TOTAL_LINE', '5.0'))
+                except Exception:
+                    min_main_total = 5.0
+                try:
+                    max_main_total = float(os.getenv('MAX_MAIN_TOTAL_LINE', '7.5'))
+                except Exception:
+                    max_main_total = 7.5
+                if not np.isfinite(min_main_total):
+                    min_main_total = 5.0
+                if not np.isfinite(max_main_total):
+                    max_main_total = 7.5
+                if min_main_total > max_main_total:
+                    min_main_total, max_main_total = max_main_total, min_main_total
+                plausible_totals = [
+                    t for t in totals
+                    if isinstance(t, (int, float)) and np.isfinite(t) and min_main_total <= float(t) <= max_main_total
+                ]
                 totals_for_consensus = plausible_totals if plausible_totals else totals
                 consensus_total = float(np.median(totals_for_consensus)) if totals_for_consensus else 6.5
                 rec['consensus_total'] = consensus_total
@@ -7079,6 +7119,20 @@ class RealDataNHLModel:
                 default_total = float(os.getenv('DEFAULT_MARKET_TOTAL', '6.0'))
             except Exception:
                 default_total = 6.0
+            try:
+                min_main_total = float(os.getenv('MIN_MAIN_TOTAL_LINE', '5.0'))
+            except Exception:
+                min_main_total = 5.0
+            try:
+                max_main_total = float(os.getenv('MAX_MAIN_TOTAL_LINE', '7.5'))
+            except Exception:
+                max_main_total = 7.5
+            if not np.isfinite(min_main_total):
+                min_main_total = 5.0
+            if not np.isfinite(max_main_total):
+                max_main_total = 7.5
+            if min_main_total > max_main_total:
+                min_main_total, max_main_total = max_main_total, min_main_total
             for point, prices in lines_by_point.items():
                 if 'over' not in prices or 'under' not in prices:
                     continue
@@ -7091,14 +7145,14 @@ class RealDataNHLModel:
                     continue
                 hold = abs((over_imp + under_imp) - 1.0)
                 skew = abs(over_imp - under_imp)
-                plausible = (4.0 <= float(point) <= 8.5)
+                plausible = (min_main_total <= float(point) <= max_main_total)
                 candidates.append((float(point), int(over_price), int(under_price), skew, hold, plausible))
             if not candidates:
                 return None
             plausible_candidates = [c for c in candidates if c[5]]
             pool = plausible_candidates if plausible_candidates else candidates
-            # Prefer balanced pricing, then lower hold, then point near default NHL total.
-            best = min(pool, key=lambda c: (c[3], c[4], abs(c[0] - default_total)))
+            # Prefer balanced pricing, then point near expected NHL center, then lower hold.
+            best = min(pool, key=lambda c: (c[3], abs(c[0] - default_total), c[4]))
             return (best[0], best[1], best[2])
 
         # FanDuel-only odds for each matchup
@@ -7222,7 +7276,24 @@ class RealDataNHLModel:
             unders = [t['under'] for t in arr if t.get('under') is not None]
             # consensus median
             try:
-                plausible_totals = [t for t in totals if isinstance(t, (int, float)) and np.isfinite(t) and 4.0 <= float(t) <= 8.5]
+                try:
+                    min_main_total = float(os.getenv('MIN_MAIN_TOTAL_LINE', '5.0'))
+                except Exception:
+                    min_main_total = 5.0
+                try:
+                    max_main_total = float(os.getenv('MAX_MAIN_TOTAL_LINE', '7.5'))
+                except Exception:
+                    max_main_total = 7.5
+                if not np.isfinite(min_main_total):
+                    min_main_total = 5.0
+                if not np.isfinite(max_main_total):
+                    max_main_total = 7.5
+                if min_main_total > max_main_total:
+                    min_main_total, max_main_total = max_main_total, min_main_total
+                plausible_totals = [
+                    t for t in totals
+                    if isinstance(t, (int, float)) and np.isfinite(t) and min_main_total <= float(t) <= max_main_total
+                ]
                 totals_for_cons = plausible_totals if plausible_totals else totals
                 cons = float(np.median(totals_for_cons))
             except Exception:
@@ -12508,17 +12579,40 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                             odds_source = str(src_val)
                     consensus_total = float(odds_rec.get('consensus_total', betting_line))
                     # Guard against alternate-ladder or malformed totals lines.
-                    # NHL main totals are typically in the 4.0-8.5 range.
+                    # NHL main totals are typically in the 5.0-7.5 range.
                     try:
                         default_market_total = float(os.getenv('DEFAULT_MARKET_TOTAL', '6.0'))
                     except Exception:
                         default_market_total = 6.0
+                    try:
+                        min_main_total = float(os.getenv('MIN_MAIN_TOTAL_LINE', '5.0'))
+                    except Exception:
+                        min_main_total = 5.0
+                    try:
+                        max_main_total = float(os.getenv('MAX_MAIN_TOTAL_LINE', '7.5'))
+                    except Exception:
+                        max_main_total = 7.5
+                    if not np.isfinite(min_main_total):
+                        min_main_total = 5.0
+                    if not np.isfinite(max_main_total):
+                        max_main_total = 7.5
+                    if min_main_total > max_main_total:
+                        min_main_total, max_main_total = max_main_total, min_main_total
                     if not np.isfinite(betting_line):
                         betting_line = default_market_total
                     if not np.isfinite(consensus_total):
                         consensus_total = betting_line
-                    if betting_line < 4.0 or betting_line > 8.5:
+                    if betting_line < min_main_total or betting_line > max_main_total:
                         line_candidates: List[float] = []
+                        books = odds_rec.get('books') if isinstance(odds_rec, dict) else None
+                        if isinstance(books, list):
+                            for b in books:
+                                try:
+                                    tv = float(b.get('total')) if isinstance(b, dict) and b.get('total') is not None else np.nan
+                                except Exception:
+                                    tv = np.nan
+                                if np.isfinite(tv):
+                                    line_candidates.append(tv)
                         for key in ('consensus_total', 'asof_total', 'open_total', 'closing_total', 'total'):
                             try:
                                 raw_val = odds_rec.get(key) if isinstance(odds_rec, dict) else None
@@ -12527,17 +12621,17 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                                 val = np.nan
                             if np.isfinite(val):
                                 line_candidates.append(val)
-                        plausible_lines = [v for v in line_candidates if 4.0 <= v <= 8.5]
+                        plausible_lines = [v for v in line_candidates if min_main_total <= v <= max_main_total]
                         if plausible_lines:
-                            adjusted_line = float(np.median(plausible_lines))
+                            adjusted_line = float(min(plausible_lines, key=lambda v: abs(v - default_market_total)))
                         else:
-                            adjusted_line = float(max(4.0, min(8.5, consensus_total if np.isfinite(consensus_total) else default_market_total)))
+                            adjusted_line = float(max(min_main_total, min(max_main_total, consensus_total if np.isfinite(consensus_total) else default_market_total)))
                         print(
                             f"⚠️  Abnormal totals line {betting_line:.2f} for {game_id}; "
                             f"using adjusted line {adjusted_line:.2f}."
                         )
                         betting_line = adjusted_line
-                        if not np.isfinite(consensus_total) or consensus_total < 4.0 or consensus_total > 8.5:
+                        if not np.isfinite(consensus_total) or consensus_total < min_main_total or consensus_total > max_main_total:
                             consensus_total = adjusted_line
                     # Market-derived feature defaults (open/as-of + price movement)
                     snap = odds_snapshot_map.get(game_id, {}) if isinstance(odds_snapshot_map, dict) else {}
