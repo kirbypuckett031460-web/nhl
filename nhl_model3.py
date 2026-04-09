@@ -6519,11 +6519,63 @@ class RealDataNHLModel:
 
         target_mode = str(self.total_model.get('target_mode') or 'total').strip().lower()
         is_edge_mode = target_mode == 'edge'
+        try:
+            line_for_sanity = float(betting_line)
+        except Exception:
+            line_for_sanity = np.nan
+        try:
+            min_pred_total_abs = float(os.getenv('MIN_PLAUSIBLE_PRED_TOTAL', '2.0'))
+        except Exception:
+            min_pred_total_abs = 2.0
+        try:
+            max_pred_total_abs = float(os.getenv('MAX_PLAUSIBLE_PRED_TOTAL', '12.5'))
+        except Exception:
+            max_pred_total_abs = 12.5
+        try:
+            max_component_delta = float(os.getenv('MAX_COMPONENT_TOTAL_DELTA', '5.0'))
+        except Exception:
+            max_component_delta = 5.0
+        if not np.isfinite(min_pred_total_abs):
+            min_pred_total_abs = 2.0
+        if not np.isfinite(max_pred_total_abs):
+            max_pred_total_abs = 12.5
+        if min_pred_total_abs > max_pred_total_abs:
+            min_pred_total_abs, max_pred_total_abs = max_pred_total_abs, min_pred_total_abs
+
+        def _sanitize_total_component(name: str, value: Optional[float]) -> Optional[float]:
+            """Drop implausible total projections from component heads/blending."""
+            if value is None:
+                return None
+            try:
+                v = float(value)
+            except Exception:
+                return None
+            if not np.isfinite(v):
+                return None
+            abs_ok = (min_pred_total_abs <= v <= max_pred_total_abs)
+            rel_ok = True
+            if np.isfinite(line_for_sanity) and np.isfinite(max_component_delta) and max_component_delta > 0:
+                rel_ok = ((line_for_sanity - max_component_delta) <= v <= (line_for_sanity + max_component_delta))
+            if abs_ok and rel_ok:
+                return v
+            try:
+                print(
+                    f"⚠️  Ignoring implausible {name}={v:.2f} "
+                    f"(line={line_for_sanity:.2f}, abs_range={min_pred_total_abs:.2f}-{max_pred_total_abs:.2f})."
+                )
+            except Exception:
+                pass
+            return None
         # If training target is edge, convert to a total by adding the market line.
         if is_edge_mode:
             predicted_total = float(betting_line) + float(ensemble_pred)
         else:
             predicted_total = float(ensemble_pred)
+        predicted_total_sane = _sanitize_total_component('ensemble_total', predicted_total)
+        if predicted_total_sane is not None:
+            predicted_total = predicted_total_sane
+        elif np.isfinite(line_for_sanity):
+            predicted_total = float(line_for_sanity)
 
         # Poisson expected total
         poisson_model = self.total_model.get('poisson_model')
@@ -6533,6 +6585,7 @@ class RealDataNHLModel:
                 poisson_mu = float(poisson_model.predict(poisson_features)[0])
             except Exception:
                 poisson_mu = None
+        poisson_mu = _sanitize_total_component('poisson_total', poisson_mu)
 
         # Home/away Poisson totals for blend/probability
         home_mu_model = (self.total_model or {}).get('home_goal_mu_model')
@@ -6549,7 +6602,9 @@ class RealDataNHLModel:
                 hm_lr = None
                 am_lr = None
         goal_total_lr = (hm_lr + am_lr) if hm_lr is not None and am_lr is not None else None
+        goal_total_lr = _sanitize_total_component('goal_total', goal_total_lr)
         flow_total = (hm_flow + am_flow) if hm_flow is not None and am_flow is not None else None
+        flow_total = _sanitize_total_component('flow_total', flow_total)
         # Recent-season model (drift-aware) prediction
         recent_total = None
         recent_model = (self.total_model or {}).get('season_recent_model')
@@ -6562,6 +6617,7 @@ class RealDataNHLModel:
                     recent_total = float(recent_pred)
             except Exception:
                 recent_total = None
+        recent_total = _sanitize_total_component('recent_total', recent_total)
 
         # Blend predictions using learned weights when available
         blend_weights = (self.total_model or {}).get('blend_weights')
@@ -6573,7 +6629,17 @@ class RealDataNHLModel:
                 'flow': flow_total,
                 'recent': recent_total
             }
-            weights_use = {k: float(v) for k, v in blend_weights.items() if k in candidates and candidates[k] is not None}
+            weights_use: Dict[str, float] = {}
+            for k, v in blend_weights.items():
+                if k not in candidates or candidates[k] is None:
+                    continue
+                try:
+                    w = float(v)
+                except Exception:
+                    continue
+                if not np.isfinite(w) or w <= 0:
+                    continue
+                weights_use[k] = w
             if weights_use:
                 total_w = float(sum(weights_use.values()))
                 if total_w > 0:
