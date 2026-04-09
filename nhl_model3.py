@@ -6285,13 +6285,27 @@ class RealDataNHLModel:
         else:
             ref_goal_adjustment = 0.0
 
+        # Anchor to market line to avoid persistent over/under drift from noisy components.
+        # 0.0 = no anchor, 1.0 = fully market line.
+        try:
+            market_anchor = float(os.getenv('PRED_MARKET_ANCHOR', '0.65'))
+        except Exception:
+            market_anchor = 0.65
+        market_anchor = max(0.0, min(0.95, market_anchor))
+        try:
+            line_for_anchor = float(betting_line)
+        except Exception:
+            line_for_anchor = np.nan
+        if np.isfinite(line_for_anchor) and market_anchor > 0:
+            predicted_total = float((1.0 - market_anchor) * predicted_total + market_anchor * line_for_anchor)
+
         predicted_total = float(max(0.0, predicted_total))
         # Safety cap to avoid runaway totals relative to market line when upstream inputs
         # (e.g., alternate ladder lines or malformed features) are abnormal.
         try:
-            max_pred_delta = float(os.getenv('MAX_PRED_TOTAL_DELTA', '3.0'))
+            max_pred_delta = float(os.getenv('MAX_PRED_TOTAL_DELTA', '2.0'))
         except Exception:
-            max_pred_delta = 3.0
+            max_pred_delta = 2.0
         try:
             line_for_cap = float(betting_line)
         except Exception:
