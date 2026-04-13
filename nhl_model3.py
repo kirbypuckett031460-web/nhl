@@ -1515,9 +1515,7 @@ class RealDataNHLModel:
         if min_total > max_total:
             min_total, max_total = max_total, min_total
         max_delta = _bounded_env_float('MAX_PRED_TOTAL_DELTA', 1.90, 0.90, 2.25)
-        soft_anchor = _bounded_env_float('PRED_MARKET_ANCHOR', 0.20, 0.0, 0.70)
-        outlier_anchor = _bounded_env_float('PRED_OUTLIER_ANCHOR', 0.65, 0.30, 0.95)
-        anchor_trigger = _bounded_env_float('PRED_ANCHOR_TRIGGER_DELTA', 1.10, 0.40, 2.50)
+        outlier_anchor = _bounded_env_float('PRED_OUTLIER_ANCHOR', 0.25, 0.0, 0.60)
 
         original_total = float(pred_total)
         was_outlier = False
@@ -1528,16 +1526,7 @@ class RealDataNHLModel:
         if abs(delta) > max_delta:
             pred_total = float(line_val + (max_delta if delta > 0 else -max_delta))
             was_outlier = True
-        abs_delta = abs(float(pred_total - line_val))
-        if was_outlier:
-            anchor = outlier_anchor
-        elif abs_delta >= anchor_trigger:
-            # Increase anchoring gradually once deviation exceeds trigger.
-            span = max(0.25, max_delta - anchor_trigger)
-            ramp = min(1.0, max(0.0, (abs_delta - anchor_trigger) / span))
-            anchor = float(soft_anchor + (outlier_anchor - soft_anchor) * ramp)
-        else:
-            anchor = 0.0
+        anchor = outlier_anchor if was_outlier else 0.0
         if anchor > 0:
             pred_total = float((1.0 - anchor) * pred_total + anchor * line_val)
         pred_total = float(max(line_val - max_delta, min(line_val + max_delta, pred_total)))
@@ -6775,22 +6764,6 @@ class RealDataNHLModel:
                 blend_recent = max(0.0, min(0.5, blend_recent))
                 predicted_total = float((1.0 - blend_recent) * predicted_total + blend_recent * recent_total)
 
-        # Optional edge residual blend (market-line anchored).
-        if self.edge_model is not None and edge_features is not None:
-            try:
-                edge_row = edge_features.reshape(1, -1)
-                edge_pred, _, _ = self._predict_ensemble_from_state(self.edge_model, edge_row)
-            except Exception:
-                edge_pred = None
-            if edge_pred is not None and np.isfinite(edge_pred):
-                edge_total = float(betting_line) + float(edge_pred)
-                try:
-                    edge_blend = float((self.total_model or {}).get('edge_blend_weight', os.getenv('EDGE_BLEND_WEIGHT', '0.6')))
-                except Exception:
-                    edge_blend = 0.6
-                edge_blend = max(0.0, min(1.0, edge_blend))
-                predicted_total = float((1.0 - edge_blend) * predicted_total + edge_blend * edge_total)
-        
         if ref_goal_value is not None:
             baseline_val = getattr(self, 'ref_goal_baseline', None)
             if baseline_val is None or not np.isfinite(baseline_val):
@@ -6819,12 +6792,13 @@ class RealDataNHLModel:
                     edge_total = float(betting_line) + float(edge_pred)
             except Exception:
                 edge_total = None
+        edge_total = _sanitize_total_component('edge_total', edge_total)
         if edge_total is not None:
             try:
                 edge_weight = float((self.total_model or {}).get('edge_blend_weight', os.getenv('EDGE_BLEND_WEIGHT', '0.6')))
             except Exception:
                 edge_weight = 0.6
-            edge_weight = max(0.0, min(1.0, edge_weight))
+            edge_weight = max(0.0, min(0.45, edge_weight))
             predicted_total = float((1.0 - edge_weight) * predicted_total + edge_weight * edge_total)
 
         predicted_total = float(max(0.0, predicted_total))
