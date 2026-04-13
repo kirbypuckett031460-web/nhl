@@ -1482,6 +1482,73 @@ class RealDataNHLModel:
         if isinstance(prediction.confidence, (int, float)):
             prediction.confidence = float(min(0.97, max(0.05, prediction.confidence + (mult - 1.0) * 0.08)))
 
+    def apply_prediction_total_guardrail(self, prediction: OverUnderPrediction, context: Optional[str] = None) -> None:
+        """Force prediction totals into plausible NHL ranges right before output/logging."""
+        if prediction is None:
+            return
+
+        def _bounded_env_float(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                raw = float(os.getenv(name, str(default)))
+            except Exception:
+                raw = default
+            if not np.isfinite(raw):
+                raw = default
+            return float(max(lo, min(hi, raw)))
+
+        try:
+            line_val = float(getattr(prediction, 'betting_line', np.nan))
+        except Exception:
+            line_val = np.nan
+        if not np.isfinite(line_val):
+            line_val = 6.0
+
+        try:
+            pred_total = float(getattr(prediction, 'predicted_total', line_val))
+        except Exception:
+            pred_total = line_val
+        if not np.isfinite(pred_total):
+            pred_total = line_val
+
+        min_total = _bounded_env_float('MIN_PLAUSIBLE_PRED_TOTAL', 2.0, 1.5, 5.0)
+        max_total = _bounded_env_float('MAX_PLAUSIBLE_PRED_TOTAL', 12.5, 8.0, 12.5)
+        if min_total > max_total:
+            min_total, max_total = max_total, min_total
+        max_delta = _bounded_env_float('MAX_PRED_TOTAL_DELTA', 1.75, 0.75, 2.0)
+        anchor = _bounded_env_float('PRED_MARKET_ANCHOR', 0.75, 0.50, 0.95)
+
+        original_total = float(pred_total)
+        if pred_total < min_total or pred_total > max_total:
+            pred_total = float(line_val)
+
+        pred_total = float((1.0 - anchor) * pred_total + anchor * line_val)
+        pred_total = float(max(line_val - max_delta, min(line_val + max_delta, pred_total)))
+        pred_total = float(max(min_total, min(max_total, pred_total)))
+
+        if abs(pred_total - original_total) > 0.01:
+            tag = f" ({context})" if context else ""
+            try:
+                print(
+                    f"⚠️  Output guardrail adjusted total{tag} from {original_total:.2f} to {pred_total:.2f} "
+                    f"around line {line_val:.2f}."
+                )
+            except Exception:
+                pass
+            if abs(original_total - line_val) > 8.0:
+                prediction.kelly_bet_size = 0.0
+                if isinstance(getattr(prediction, 'confidence', None), (int, float)):
+                    prediction.confidence = float(min(0.60, max(0.05, float(prediction.confidence))))
+
+        prediction.predicted_total = float(pred_total)
+        prediction.edge = float(prediction.predicted_total - line_val)
+        if str(getattr(prediction, 'recommendation', '')).upper() in ('OVER', 'UNDER'):
+            if prediction.edge > 0:
+                prediction.recommendation = 'OVER'
+            elif prediction.edge < 0:
+                prediction.recommendation = 'UNDER'
+            else:
+                prediction.recommendation = 'No Bet'
+
     def _apply_kelly_controls(self, kelly_fraction: float, extra_scale: float = 1.0) -> float:
         """Apply shared Kelly multipliers/caps and return stake in % of bankroll."""
         try:
@@ -13753,6 +13820,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     except Exception:
                         pass
 
+                    # Final per-game hard guardrail to ensure displayed/exported totals stay plausible.
+                    try:
+                        model.apply_prediction_total_guardrail(pred, context=f"game {game_id}")
+                    except Exception as guard_err:
+                        print(f"⚠️  Prediction output guardrail skipped for {game_id}: {guard_err}")
+
                     predictions.append(pred)
 
                 except Exception as e:
@@ -13763,6 +13836,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 model.apply_risk_budget(predictions)
             except Exception as e:
                 print(f"⚠️  Risk budget enforcement skipped: {e}")
+            # Re-apply output guardrails after any risk/calibration mutations.
+            for pred in predictions:
+                try:
+                    model.apply_prediction_total_guardrail(pred, context=f"post-risk {getattr(pred, 'game_id', '')}")
+                except Exception:
+                    continue
 
             print(f"✅ Generated {len(predictions)} predictions")
 
