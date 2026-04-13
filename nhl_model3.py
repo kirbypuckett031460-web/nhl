@@ -1514,14 +1514,32 @@ class RealDataNHLModel:
         max_total = _bounded_env_float('MAX_PLAUSIBLE_PRED_TOTAL', 12.5, 8.0, 12.5)
         if min_total > max_total:
             min_total, max_total = max_total, min_total
-        max_delta = _bounded_env_float('MAX_PRED_TOTAL_DELTA', 1.75, 0.75, 2.0)
-        anchor = _bounded_env_float('PRED_MARKET_ANCHOR', 0.75, 0.50, 0.95)
+        max_delta = _bounded_env_float('MAX_PRED_TOTAL_DELTA', 1.90, 0.90, 2.25)
+        soft_anchor = _bounded_env_float('PRED_MARKET_ANCHOR', 0.20, 0.0, 0.70)
+        outlier_anchor = _bounded_env_float('PRED_OUTLIER_ANCHOR', 0.65, 0.30, 0.95)
+        anchor_trigger = _bounded_env_float('PRED_ANCHOR_TRIGGER_DELTA', 1.10, 0.40, 2.50)
 
         original_total = float(pred_total)
+        was_outlier = False
         if pred_total < min_total or pred_total > max_total:
             pred_total = float(line_val)
-
-        pred_total = float((1.0 - anchor) * pred_total + anchor * line_val)
+            was_outlier = True
+        delta = float(pred_total - line_val)
+        if abs(delta) > max_delta:
+            pred_total = float(line_val + (max_delta if delta > 0 else -max_delta))
+            was_outlier = True
+        abs_delta = abs(float(pred_total - line_val))
+        if was_outlier:
+            anchor = outlier_anchor
+        elif abs_delta >= anchor_trigger:
+            # Increase anchoring gradually once deviation exceeds trigger.
+            span = max(0.25, max_delta - anchor_trigger)
+            ramp = min(1.0, max(0.0, (abs_delta - anchor_trigger) / span))
+            anchor = float(soft_anchor + (outlier_anchor - soft_anchor) * ramp)
+        else:
+            anchor = 0.0
+        if anchor > 0:
+            pred_total = float((1.0 - anchor) * pred_total + anchor * line_val)
         pred_total = float(max(line_val - max_delta, min(line_val + max_delta, pred_total)))
         pred_total = float(max(min_total, min(max_total, pred_total)))
 
@@ -13836,12 +13854,6 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 model.apply_risk_budget(predictions)
             except Exception as e:
                 print(f"⚠️  Risk budget enforcement skipped: {e}")
-            # Re-apply output guardrails after any risk/calibration mutations.
-            for pred in predictions:
-                try:
-                    model.apply_prediction_total_guardrail(pred, context=f"post-risk {getattr(pred, 'game_id', '')}")
-                except Exception:
-                    continue
 
             print(f"✅ Generated {len(predictions)} predictions")
 
