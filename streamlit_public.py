@@ -5,6 +5,10 @@ from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover - fallback only
+    pd = None
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -159,7 +163,21 @@ def render_public_app() -> None:
         c2.metric("OVER picks", over_count)
         c3.metric("UNDER picks", under_count)
         c4.metric("BET rows", bet_count, delta=f"PICK rows: {pick_count}")
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        if pd is not None:
+            frame = pd.DataFrame(table_rows)
+
+            def _pick_style(val: object) -> str:
+                txt = str(val or "").strip().upper()
+                if txt == "OVER":
+                    return "color: #1f8b4c; font-weight: 700;"
+                if txt == "UNDER":
+                    return "color: #c0392b; font-weight: 700;"
+                return ""
+
+            styled = frame.style.applymap(_pick_style, subset=["Pick"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(table_rows, use_container_width=True, hide_index=True)
     else:
         st.info("No prediction rows found in bets_log yet. Run the admin app to generate a slate.")
 
