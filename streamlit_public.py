@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-import streamlit.components.v1 as components
 try:
     import pandas as pd
 except Exception:  # pragma: no cover - fallback only
@@ -97,13 +96,11 @@ def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
 def render_public_app() -> None:
     st.set_page_config(page_title="NHL Over/Under Picks", layout="wide")
     st.title("NHL Over/Under Predictions")
-    st.caption("Live public board from the latest model run.")
 
     if st.button("Refresh", type="secondary"):
         st.rerun()
 
     predictions_image = APP_ROOT / "predictions.png"
-    dashboard_html = APP_ROOT / "nhl_real_data_dashboard.html"
     log_path = APP_ROOT / "bets_log.csv"
     run_rows, run_dt = _latest_run_rows(log_path)
     record = _latest_record(log_path)
@@ -186,15 +183,6 @@ def render_public_app() -> None:
             mtime = datetime.fromtimestamp(predictions_image.stat().st_mtime)
             st.caption(f"Updated: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
             st.image(str(predictions_image), caption="Latest predictions image", use_container_width=True)
-    else:
-        st.caption("Predictions image snapshot not available.")
-
-    if dashboard_html.exists():
-        dashboard_text = dashboard_html.read_text(encoding="utf-8", errors="ignore")
-        with st.expander("Legacy HTML dashboard", expanded=False):
-            components.html(dashboard_text, height=1200, scrolling=True)
-    else:
-        st.info("Dashboard HTML is not available yet.")
 
 
 if __name__ == "__main__":
