@@ -13,6 +13,18 @@ APP_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = APP_ROOT / "data" / "runtime"
 
 
+def _read_streamlit_secret(name: str) -> str:
+    """Safely read a Streamlit secret value without raising on missing keys."""
+    try:
+        val = st.secrets.get(name, "")
+        return str(val).strip() if val is not None else ""
+    except Exception:
+        try:
+            return str(st.secrets[name]).strip()
+        except Exception:
+            return ""
+
+
 def _save_uploaded_file(uploaded_file, target_name: str) -> Optional[Path]:
     if uploaded_file is None:
         return None
@@ -96,6 +108,10 @@ st.set_page_config(page_title="NHL O/U Model Runner", layout="wide")
 st.title("NHL Over/Under Model Web App")
 st.caption("Run nhl_model3.py from a browser and view generated outputs.")
 
+secret_odds_api_key = _read_streamlit_secret("ODDS_API_KEY")
+env_odds_api_key = str(os.getenv("ODDS_API_KEY", "")).strip()
+default_odds_api_key = secret_odds_api_key or env_odds_api_key
+
 with st.sidebar:
     st.header("Run Settings")
     run_date = st.date_input("Prediction date", value=date.today())
@@ -111,7 +127,11 @@ with st.sidebar:
     realtime_odds = st.checkbox("Use realtime odds API", value=False)
     odds_path_input = st.text_input("Odds JSON path", value="odds.json")
     odds_regions = st.text_input("Odds regions", value="us")
-    odds_api_key = st.text_input("ODDS_API_KEY (optional)", value="", type="password")
+    odds_api_key_override = st.text_input("ODDS_API_KEY override (optional)", value="", type="password")
+    if default_odds_api_key:
+        st.caption("Default ODDS_API_KEY loaded from Streamlit secrets/env. Leave override blank to use it.")
+    else:
+        st.caption("No default ODDS_API_KEY found in secrets/env. Provide override to use realtime odds.")
     odds_upload = st.file_uploader("Upload odds JSON (optional)", type=["json"])
 
     today_games_upload = st.file_uploader("Upload today_games JSON (optional)", type=["json"])
@@ -166,8 +186,11 @@ if run_clicked:
         command.extend(["--environment-path", str(uploaded_environment_path)])
 
     env_overrides: Dict[str, str] = {}
-    if odds_api_key.strip():
-        env_overrides["ODDS_API_KEY"] = odds_api_key.strip()
+    effective_odds_api_key = odds_api_key_override.strip() or default_odds_api_key
+    if effective_odds_api_key:
+        env_overrides["ODDS_API_KEY"] = effective_odds_api_key
+    if realtime_odds and not effective_odds_api_key:
+        st.warning("Realtime odds enabled but no ODDS_API_KEY is configured (secrets/env/override).")
 
     st.subheader("Live Run Output")
     with st.spinner("Running model... this may take a while depending on training mode."):
