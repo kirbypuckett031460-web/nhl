@@ -22,29 +22,36 @@ Run the model (predict-only, no posting/logging):
 python nhl_model3.py
 ```
 
-Web app (Streamlit)
--------------------
+Web apps (Streamlit)
+--------------------
 
-Run the model from a browser instead of local CLI:
+This repo now provides two Streamlit entry points:
+
+- **Public app** (`streamlit_app.py` or `streamlit_public.py`)
+  - Read-only public-facing view for `predictions.png` + dashboard output.
+- **Admin app** (`streamlit_admin.py`)
+  - Full controls to run `nhl_model3.py`, upload input JSON files, and download artifacts.
+  - Requires passphrase login.
+
+Run locally:
 
 ```bash
+# Public
 streamlit run streamlit_app.py
+
+# Admin
+streamlit run streamlit_admin.py
 ```
-
-What the app does:
-
-- Executes `nhl_model3.py` with selectable run options (date, train speed, target mode, odds mode).
-- Shows live logs while the run is in progress.
-- Displays and lets you download generated artifacts (`predictions.png`, dashboard HTML, bets CSV).
-- Supports optional odds/today-games/environment JSON uploads per run.
-- Automatically reads `ODDS_API_KEY` from Streamlit secrets (or environment), with an optional UI override.
 
 For Streamlit Cloud deployment:
 
 1. Push this repo to GitHub.
-2. In Streamlit Cloud, create an app using `streamlit_app.py` as the entry point.
-3. Set `ODDS_API_KEY` in Streamlit app secrets/environment if using realtime odds.
-4. The repo includes `runtime.txt` (`python-3.12`) to keep Cloud dependency installs stable.
+2. Create one app with `streamlit_app.py` (public).
+3. Create a second app with `streamlit_admin.py` (admin).
+4. Set secrets:
+   - `ODDS_API_KEY = "your_key"` (optional, for realtime odds)
+   - `ADMIN_PASSPHRASE = "your_admin_passphrase"` (required for admin app)
+5. The repo includes `runtime.txt` (`python-3.12`) to keep Cloud dependency installs stable.
 
 Command-line options
 --------------------
