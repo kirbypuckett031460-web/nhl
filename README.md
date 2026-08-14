@@ -10,6 +10,12 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+Optional social posting dependencies (Twitter/Discord):
+
+```bash
+pip install -r requirements-social.txt
+```
+
 Run the model (predict-only, no posting/logging):
 
 ```bash
@@ -38,6 +44,7 @@ For Streamlit Cloud deployment:
 1. Push this repo to GitHub.
 2. In Streamlit Cloud, create an app using `streamlit_app.py` as the entry point.
 3. Set `ODDS_API_KEY` in Streamlit app secrets/environment if using realtime odds.
+4. The repo includes `runtime.txt` (`python-3.12`) to keep Cloud dependency installs stable.
 
 Command-line options
 --------------------
