@@ -89,3 +89,7 @@ def render_public_app() -> None:
     else:
         st.info("Dashboard HTML is not available yet.")
 
+
+if __name__ == "__main__":
+    render_public_app()
+
