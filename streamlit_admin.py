@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import subprocess
+import sys
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -159,7 +160,7 @@ def render_admin_app() -> None:
     uploaded_environment_path = _save_uploaded_file(environment_upload, "environment_uploaded.json")
 
     command = [
-        "python3",
+        sys.executable,
         "-u",
         "nhl_model3.py",
         "--no-open-browser",
