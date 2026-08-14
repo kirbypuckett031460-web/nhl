@@ -16,6 +16,28 @@ Run the model (predict-only, no posting/logging):
 python nhl_model3.py
 ```
 
+Web app (Streamlit)
+-------------------
+
+Run the model from a browser instead of local CLI:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+What the app does:
+
+- Executes `nhl_model3.py` with selectable run options (date, train speed, target mode, odds mode).
+- Shows live logs while the run is in progress.
+- Displays and lets you download generated artifacts (`predictions.png`, dashboard HTML, bets CSV).
+- Supports optional odds/today-games/environment JSON uploads per run.
+
+For Streamlit Cloud deployment:
+
+1. Push this repo to GitHub.
+2. In Streamlit Cloud, create an app using `streamlit_app.py` as the entry point.
+3. Set `ODDS_API_KEY` in Streamlit app secrets/environment if using realtime odds.
+
 Command-line options
 --------------------
 
