@@ -31,6 +31,7 @@ What the app does:
 - Shows live logs while the run is in progress.
 - Displays and lets you download generated artifacts (`predictions.png`, dashboard HTML, bets CSV).
 - Supports optional odds/today-games/environment JSON uploads per run.
+- Automatically reads `ODDS_API_KEY` from Streamlit secrets (or environment), with an optional UI override.
 
 For Streamlit Cloud deployment:
 
