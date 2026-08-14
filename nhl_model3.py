@@ -13952,13 +13952,24 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         else:
             social_results = {'twitter': False, 'discord': False}
         
-        try:
-            full_path = os.path.abspath(dashboard_file)
-            webbrowser.open(f'file://{full_path}')
-            print(f"🌐 Dashboard opened: {full_path}")
-        except Exception as e:
-            print(f"⚠️  Could not auto-open browser: {e}")
-            print(f"📂 Please manually open: {dashboard_file}")
+        open_browser = True
+        if cli_args is not None:
+            # Default behavior remains unchanged for CLI users unless --no-open-browser is set.
+            open_browser = bool(getattr(cli_args, 'open_browser', True))
+        if open_browser:
+            try:
+                full_path = os.path.abspath(dashboard_file)
+                webbrowser.open(f'file://{full_path}')
+                print(f"🌐 Dashboard opened: {full_path}")
+            except Exception as e:
+                print(f"⚠️  Could not auto-open browser: {e}")
+                print(f"📂 Please manually open: {dashboard_file}")
+        else:
+            try:
+                full_path = os.path.abspath(dashboard_file)
+            except Exception:
+                full_path = dashboard_file
+            print(f"📂 Dashboard ready (browser auto-open disabled): {full_path}")
         
         print(f"\n🎉 SUCCESS!")
         if training_results:
@@ -13995,6 +14006,8 @@ if __name__ == "__main__":
     parser.add_argument('--log-path', type=str, default='bets_log.csv', help='Path to bets log CSV')
     parser.add_argument('--grade-bets', action='store_true', help='Grade/settle ungraded picks in --log-path using historical finals, then exit')
     parser.add_argument('--post-social', action='store_true', help='Enable social media posting')
+    parser.add_argument('--no-open-browser', dest='open_browser', action='store_false', help='Disable automatic dashboard opening in a local browser')
+    parser.set_defaults(open_browser=True)
     parser.add_argument('--date', type=str, default=None, help='ISO date YYYY-MM-DD for which to fetch/predict games (default: today)')
     parser.add_argument('--today-games-path', type=str, default=None, help='Path to offline today games JSON to bypass API')
     # 90 days is usually too little for stable totals modeling; default to one season-ish.
