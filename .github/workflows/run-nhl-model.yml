@@ -1,0 +1,132 @@
+name: Run NHL Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: "Optional YYYY-MM-DD date override"
+        required: false
+        default: ""
+      train_speed:
+        description: "Training speed preset"
+        required: false
+        default: "balanced"
+      train_target:
+        description: "Training target mode"
+        required: false
+        default: "auto"
+  schedule:
+    # Daily run at 14:00 UTC (adjust to your preferred time).
+    - cron: "0 14 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: run-nhl-model-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      NHL_SEASON_START: ${{ vars.NHL_SEASON_START }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore model/cache artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/cache
+            data/history/historical_games.csv
+          key: nhl-model-cache-v1
+
+      - name: Run NHL prediction pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/cache data/history
+
+          TRAIN_SPEED_ARG="${{ github.event.inputs.train_speed }}"
+          TRAIN_TARGET_ARG="${{ github.event.inputs.train_target }}"
+          if [[ -z "${TRAIN_SPEED_ARG}" ]]; then TRAIN_SPEED_ARG="balanced"; fi
+          if [[ -z "${TRAIN_TARGET_ARG}" ]]; then TRAIN_TARGET_ARG="auto"; fi
+          if [[ -z "${NHL_SEASON_START:-}" ]]; then NHL_SEASON_START="2025-10-07"; fi
+
+          DATE_ARG=()
+          if [[ -n "${{ github.event.inputs.run_date }}" ]]; then
+            DATE_ARG=(--date "${{ github.event.inputs.run_date }}")
+          fi
+
+          CMD=(
+            python -u nhl_model3.py
+            --no-open-browser
+            --log-bets
+            --log-path bets_log.csv
+            --save-trained-model
+            --use-saved-model
+            --model-path data/cache/trained_model.joblib
+            --historical-cache-path data/history/historical_games.csv
+            --train-speed "${TRAIN_SPEED_ARG}"
+            --train-target "${TRAIN_TARGET_ARG}"
+          )
+          CMD+=("${DATE_ARG[@]}")
+
+          if [[ -n "${ODDS_API_KEY:-}" ]]; then
+            CMD+=(--realtime-odds --log-odds-history --odds-history-path odds_history.csv)
+          else
+            CMD+=(--odds-path odds.json)
+          fi
+
+          echo "Running command:"
+          printf ' %q' "${CMD[@]}"
+          echo
+          "${CMD[@]}"
+
+      - name: Commit updated outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          FILES=(
+            "predictions.png"
+            "nhl_real_data_dashboard.html"
+            "bets_log.csv"
+            "odds_history.csv"
+            "data/cache/trained_model.joblib"
+            "data/history/historical_games.csv"
+          )
+          for file in "${FILES[@]}"; do
+            if [[ -f "${file}" ]]; then
+              git add "${file}"
+            fi
+          done
+
+          if git diff --cached --quiet; then
+            echo "No output changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(ci): refresh NHL model outputs [skip ci]"
+          git push
