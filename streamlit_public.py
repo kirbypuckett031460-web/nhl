@@ -59,6 +59,18 @@ def _safe_float(raw_value: str) -> Optional[float]:
         return None
 
 
+def _split_matchup(matchup: str) -> Tuple[str, str]:
+    raw = str(matchup or "").strip()
+    if "@" in raw:
+        away, home = raw.split("@", 1)
+        return away.strip(), home.strip()
+    if " at " in raw.lower():
+        chunks = raw.split(" at ")
+        if len(chunks) == 2:
+            return chunks[0].strip(), chunks[1].strip()
+    return raw, "—"
+
+
 def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[datetime]]:
     if not log_path.exists():
         return [], None
@@ -145,42 +157,36 @@ def _graded_summary(log_path: Path) -> Dict[str, Optional[float]]:
     return summary
 
 
-def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
-    if not log_path.exists():
-        return None
-    latest_by_game: Dict[str, Dict[str, str]] = {}
-    latest_dt_by_game: Dict[str, datetime] = {}
-    with log_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            gid = str(row.get("game_id") or "").strip()
-            if not gid:
-                continue
-            dt = _parse_logged_datetime(row.get("date", ""))
-            prev_dt = latest_dt_by_game.get(gid)
-            if prev_dt is None or dt >= prev_dt:
-                latest_dt_by_game[gid] = dt
-                latest_by_game[gid] = row
+def _style_pick_cell(val: object) -> str:
+    txt = str(val or "").strip().upper()
+    if txt == "OVER":
+        return "background-color: #166534; color: #dcfce7; font-weight: 700; text-align: center;"
+    if txt == "UNDER":
+        return "background-color: #991b1b; color: #fee2e2; font-weight: 700; text-align: center;"
+    return "text-align: center;"
 
-    wins = losses = pushes = 0
-    for row in latest_by_game.values():
-        result = str(row.get("result") or "").strip().upper()
-        if result == "WIN":
-            wins += 1
-        elif result == "LOSS":
-            losses += 1
-        elif result == "PUSH":
-            pushes += 1
-    decided = wins + losses
-    if decided <= 0:
-        return None
-    return {
-        "games": len(latest_by_game),
-        "wins": wins,
-        "losses": losses,
-        "pushes": pushes,
-        "win_rate": wins / decided,
-    }
+
+def _style_edge_cell(val: object) -> str:
+    try:
+        num = float(val)
+    except Exception:
+        return ""
+    intensity = min(0.75, 0.22 + min(abs(num), 3.0) * 0.16)
+    if num >= 0:
+        return f"background-color: rgba(16, 185, 129, {intensity:.3f}); color: #ecfeff;"
+    return f"background-color: rgba(244, 63, 94, {intensity:.3f}); color: #ffe4e6;"
+
+
+def _style_conf_cell(val: object) -> str:
+    try:
+        num = float(val)
+    except Exception:
+        return ""
+    centered = max(-1.0, min(1.0, (num - 50.0) / 50.0))
+    intensity = 0.2 + abs(centered) * 0.6
+    if centered >= 0:
+        return f"background-color: rgba(20, 184, 166, {intensity:.3f}); color: #ecfeff;"
+    return f"background-color: rgba(236, 72, 153, {intensity:.3f}); color: #fdf2f8;"
 
 
 def render_public_app() -> None:
@@ -202,7 +208,6 @@ def render_public_app() -> None:
         slate_date = today.strftime("%A, %b %d, %Y")
         last_updated = today.isoformat()
     st.write(f"Slate Date: {slate_date}")
-    st.markdown("### Top Plays")
     st.caption(f"Last updated: {last_updated}")
     y_w = int(graded.get("yesterday_wins", 0) or 0)
     y_l = int(graded.get("yesterday_losses", 0) or 0)
@@ -222,57 +227,85 @@ def render_public_app() -> None:
         s_text = f"{s_text}-{s_p}"
     s_delta = f"{(s_wr * 100.0):.1f}% win rate" if isinstance(s_wr, float) else "No graded bets YTD"
 
-    c1, c2 = st.columns(2)
-    c1.metric("Yesterday (graded)", y_text, y_delta)
-    c2.metric("YTD (graded)", s_text, s_delta)
+    st.caption(f"Yesterday (graded): {y_text} ({y_delta})   |   YTD (graded): {s_text} ({s_delta})")
 
     if run_rows:
         table_rows: List[Dict[str, object]] = []
         for row in run_rows:
+            away, home = _split_matchup(row.get("matchup", ""))
             side = str(row.get("side") or "").strip().upper()
             action = str(row.get("action") or "").strip().upper()
             line = _safe_float(row.get("line", ""))
             pred_total = _safe_float(row.get("pred_total", ""))
             edge = _safe_float(row.get("edge", ""))
             confidence = _safe_float(row.get("confidence", ""))
-            price = _safe_float(row.get("price", ""))
+            conf_pct = None
+            if confidence is not None:
+                conf_pct = confidence * 100.0 if confidence <= 1.0 else confidence
             table_rows.append({
-                "Matchup": str(row.get("matchup") or "").strip(),
-                "Pick": side or "—",
+                "Away": away,
+                "Home": home,
                 "Line": round(line, 2) if line is not None else None,
-                "Pred": round(pred_total, 2) if pred_total is not None else None,
+                "Model": round(pred_total, 2) if pred_total is not None else None,
+                "Pick": side or "—",
                 "Edge": round(edge, 2) if edge is not None else None,
-                "Conf%": round(confidence * 100.0, 1) if confidence is not None and confidence <= 1.0 else round(confidence, 1) if confidence is not None else None,
-                "Price": int(price) if price is not None else None,
+                "Confidence": round(conf_pct, 1) if conf_pct is not None else None,
                 "_action": action,
                 "_edge_abs": abs(edge) if edge is not None else -1.0,
             })
-        bet_rows = [r for r in table_rows if str(r.get("_action", "")).upper() == "BET"]
-        if bet_rows:
-            table_rows = bet_rows
-        table_rows.sort(key=lambda r: r.get("_edge_abs", -1.0), reverse=True)
-        for row in table_rows:
-            row.pop("_edge_abs", None)
-            row.pop("_action", None)
+        table_rows.sort(key=lambda r: str(r.get("Away") or ""))
 
         if pd is not None:
-            frame = pd.DataFrame(table_rows)
-
-            def _pick_style(val: object) -> str:
-                txt = str(val or "").strip().upper()
-                if txt == "OVER":
-                    return "background-color: #14532d; color: #dcfce7; font-weight: 700; text-align: center;"
-                if txt == "UNDER":
-                    return "background-color: #7f1d1d; color: #fee2e2; font-weight: 700; text-align: center;"
-                return "text-align: center;"
-
+            full_rows = [{k: v for k, v in row.items() if not k.startswith("_")} for row in table_rows]
+            frame = pd.DataFrame(full_rows)
+            if not frame.empty:
+                for col in ("Line", "Model", "Edge", "Confidence"):
+                    if col in frame.columns:
+                        frame[col] = frame[col].map(lambda x: f"{x:.1f}" if isinstance(x, (int, float)) else x)
+            st.markdown("### Full Slate")
             try:
-                styled = frame.style.map(_pick_style, subset=["Pick"])
+                styled = frame.style.map(_style_pick_cell, subset=["Pick"])
+                styled = styled.map(_style_edge_cell, subset=["Edge"])
+                styled = styled.map(_style_conf_cell, subset=["Confidence"])
             except Exception:
-                styled = frame.style.applymap(_pick_style, subset=["Pick"])
+                styled = frame.style.applymap(_style_pick_cell, subset=["Pick"])
+                styled = styled.applymap(_style_edge_cell, subset=["Edge"])
+                styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
             st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            top_rows = [row for row in table_rows if str(row.get("_action", "")).upper() == "BET"]
+            if not top_rows:
+                top_rows = sorted(table_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)[:5]
+            else:
+                top_rows = sorted(top_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)
+            top_rows_clean = [{k: v for k, v in row.items() if not k.startswith("_")} for row in top_rows]
+            top_frame = pd.DataFrame(top_rows_clean)
+            if not top_frame.empty:
+                for col in ("Line", "Model", "Edge", "Confidence"):
+                    if col in top_frame.columns:
+                        top_frame[col] = top_frame[col].map(lambda x: f"{x:.1f}" if isinstance(x, (int, float)) else x)
+            st.markdown("### Top Plays")
+            try:
+                top_styled = top_frame.style.map(_style_pick_cell, subset=["Pick"])
+                top_styled = top_styled.map(_style_edge_cell, subset=["Edge"])
+                top_styled = top_styled.map(_style_conf_cell, subset=["Confidence"])
+            except Exception:
+                top_styled = top_frame.style.applymap(_style_pick_cell, subset=["Pick"])
+                top_styled = top_styled.applymap(_style_edge_cell, subset=["Edge"])
+                top_styled = top_styled.applymap(_style_conf_cell, subset=["Confidence"])
+            st.dataframe(top_styled, use_container_width=True, hide_index=True)
         else:
-            st.dataframe(table_rows, use_container_width=True, hide_index=True)
+            full_rows = [{k: v for k, v in row.items() if not k.startswith("_")} for row in table_rows]
+            st.markdown("### Full Slate")
+            st.dataframe(full_rows, use_container_width=True, hide_index=True)
+            top_rows = [row for row in table_rows if str(row.get("_action", "")).upper() == "BET"]
+            if not top_rows:
+                top_rows = sorted(table_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)[:5]
+            else:
+                top_rows = sorted(top_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)
+            top_rows_clean = [{k: v for k, v in row.items() if not k.startswith("_")} for row in top_rows]
+            st.markdown("### Top Plays")
+            st.dataframe(top_rows_clean, use_container_width=True, hide_index=True)
     else:
         st.info("No top plays available yet.")
 
