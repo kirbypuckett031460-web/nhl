@@ -53,6 +53,26 @@ For Streamlit Cloud deployment:
    - `ADMIN_PASSPHRASE = "your_admin_passphrase"` (required for admin app)
 5. The repo includes `runtime.txt` (`python-3.12`) to keep Cloud dependency installs stable.
 
+GitHub CI automation (no local runs required)
+--------------------------------------------
+
+This repo includes `.github/workflows/run-nhl-model.yml` so the model can run on GitHub Actions instead of your local machine.
+
+What it does:
+
+- Runs daily on a schedule (and supports manual runs from the Actions tab).
+- Installs dependencies and executes `nhl_model3.py`.
+- Uses live odds when `ODDS_API_KEY` is configured; otherwise it falls back to `odds.json`.
+- Updates and commits generated artifacts (`predictions.png`, `nhl_real_data_dashboard.html`, `bets_log.csv`, etc.) back to the repo.
+
+One-time GitHub setup:
+
+1. Go to **Settings → Secrets and variables → Actions** and add:
+   - `ODDS_API_KEY` (optional but recommended for realtime odds)
+2. Go to **Settings → Actions → General → Workflow permissions** and set:
+   - **Read and write permissions** (required so CI can commit updated outputs)
+3. In GitHub, open **Actions → Run NHL Model** and click **Run workflow** for an initial manual run.
+
 Command-line options
 --------------------
 
