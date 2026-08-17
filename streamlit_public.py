@@ -13,6 +13,25 @@ except Exception:  # pragma: no cover - fallback only
 
 APP_ROOT = Path(__file__).resolve().parent
 
+DARK_MODE_CSS = """
+<style>
+[data-testid="stAppViewContainer"] {
+  background-color: #0b1220;
+}
+
+[data-testid="stHeader"] {
+  background: transparent;
+}
+
+[data-testid="stMetric"] {
+  background-color: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 10px;
+  padding: 0.5rem 0.75rem;
+}
+</style>
+"""
+
 
 def _parse_date_only(raw_value: str) -> Optional[datetime.date]:
     dt = _parse_logged_datetime(raw_value)
@@ -166,6 +185,7 @@ def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
 
 def render_public_app() -> None:
     st.set_page_config(page_title="NHL Over/Under Picks", layout="wide")
+    st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
     st.title("NHL Over/Under Picks")
 
     if st.button("Refresh", type="secondary"):
@@ -241,10 +261,10 @@ def render_public_app() -> None:
             def _pick_style(val: object) -> str:
                 txt = str(val or "").strip().upper()
                 if txt == "OVER":
-                    return "color: #16a34a; font-weight: 700;"
+                    return "background-color: #14532d; color: #dcfce7; font-weight: 700; text-align: center;"
                 if txt == "UNDER":
-                    return "color: #dc2626; font-weight: 700;"
-                return ""
+                    return "background-color: #7f1d1d; color: #fee2e2; font-weight: 700; text-align: center;"
+                return "text-align: center;"
 
             try:
                 styled = frame.style.map(_pick_style, subset=["Pick"])
