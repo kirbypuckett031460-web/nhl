@@ -1,4 +1,5 @@
 import csv
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,6 +12,13 @@ except Exception:  # pragma: no cover - fallback only
 
 
 APP_ROOT = Path(__file__).resolve().parent
+
+
+def _parse_date_only(raw_value: str) -> Optional[datetime.date]:
+    dt = _parse_logged_datetime(raw_value)
+    if dt == datetime.min:
+        return None
+    return dt.date()
 
 
 def _parse_logged_datetime(raw_value: str) -> datetime:
@@ -53,6 +61,69 @@ def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[dat
         return list(by_game.values()), None
     latest_rows = [row for dt, row in rows if dt == latest_dt]
     return latest_rows, latest_dt
+
+
+def _graded_summary(log_path: Path) -> Dict[str, Optional[float]]:
+    summary: Dict[str, Optional[float]] = {
+        "yesterday_wins": 0,
+        "yesterday_losses": 0,
+        "yesterday_pushes": 0,
+        "yesterday_decided": 0,
+        "yesterday_win_rate": None,
+        "ytd_wins": 0,
+        "ytd_losses": 0,
+        "ytd_pushes": 0,
+        "ytd_decided": 0,
+        "ytd_win_rate": None,
+    }
+    if not log_path.exists():
+        return summary
+
+    season_start_raw = str(os.getenv("NHL_SEASON_START", "2025-10-07")).strip() or "2025-10-07"
+    try:
+        season_start_date = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
+    except Exception:
+        season_start_date = datetime(datetime.now().year, 1, 1).date()
+
+    today_date = datetime.now().date()
+    yesterday_date = today_date.fromordinal(today_date.toordinal() - 1)
+
+    with log_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            side = str(row.get("side") or "").strip().upper()
+            if side not in {"OVER", "UNDER"}:
+                continue
+            result = str(row.get("result") or "").strip().upper()
+            if result not in {"WIN", "LOSS", "PUSH"}:
+                continue
+            row_date = _parse_date_only(row.get("date", ""))
+            if row_date is None:
+                continue
+
+            if row_date >= season_start_date:
+                if result == "WIN":
+                    summary["ytd_wins"] += 1
+                elif result == "LOSS":
+                    summary["ytd_losses"] += 1
+                else:
+                    summary["ytd_pushes"] += 1
+
+            if row_date == yesterday_date:
+                if result == "WIN":
+                    summary["yesterday_wins"] += 1
+                elif result == "LOSS":
+                    summary["yesterday_losses"] += 1
+                else:
+                    summary["yesterday_pushes"] += 1
+
+    summary["ytd_decided"] = int(summary["ytd_wins"] + summary["ytd_losses"])
+    summary["yesterday_decided"] = int(summary["yesterday_wins"] + summary["yesterday_losses"])
+    if summary["ytd_decided"] > 0:
+        summary["ytd_win_rate"] = float(summary["ytd_wins"] / summary["ytd_decided"])
+    if summary["yesterday_decided"] > 0:
+        summary["yesterday_win_rate"] = float(summary["yesterday_wins"] / summary["yesterday_decided"])
+    return summary
 
 
 def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
@@ -102,6 +173,7 @@ def render_public_app() -> None:
 
     log_path = APP_ROOT / "bets_log.csv"
     run_rows, run_dt = _latest_run_rows(log_path)
+    graded = _graded_summary(log_path)
     if run_dt is not None:
         slate_date = run_dt.strftime("%A, %b %d, %Y")
         last_updated = run_dt.isoformat()
@@ -112,6 +184,27 @@ def render_public_app() -> None:
     st.write(f"Slate Date: {slate_date}")
     st.markdown("### Top Plays")
     st.caption(f"Last updated: {last_updated}")
+    y_w = int(graded.get("yesterday_wins", 0) or 0)
+    y_l = int(graded.get("yesterday_losses", 0) or 0)
+    y_p = int(graded.get("yesterday_pushes", 0) or 0)
+    y_wr = graded.get("yesterday_win_rate")
+    y_text = f"{y_w}-{y_l}"
+    if y_p > 0:
+        y_text = f"{y_text}-{y_p}"
+    y_delta = f"{(y_wr * 100.0):.1f}% win rate" if isinstance(y_wr, float) else "No graded bets yesterday"
+
+    s_w = int(graded.get("ytd_wins", 0) or 0)
+    s_l = int(graded.get("ytd_losses", 0) or 0)
+    s_p = int(graded.get("ytd_pushes", 0) or 0)
+    s_wr = graded.get("ytd_win_rate")
+    s_text = f"{s_w}-{s_l}"
+    if s_p > 0:
+        s_text = f"{s_text}-{s_p}"
+    s_delta = f"{(s_wr * 100.0):.1f}% win rate" if isinstance(s_wr, float) else "No graded bets YTD"
+
+    c1, c2 = st.columns(2)
+    c1.metric("Yesterday (graded)", y_text, y_delta)
+    c2.metric("YTD (graded)", s_text, s_delta)
 
     if run_rows:
         table_rows: List[Dict[str, object]] = []
