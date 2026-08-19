@@ -78,6 +78,12 @@
             font-weight: bold;
             color: #27ae60;
         }
+        .metric-subtext {
+            font-size: 0.95rem;
+            color: #566573;
+            margin-top: 6px;
+            line-height: 1.3;
+        }
         
         table {
             width: 100%;
@@ -128,6 +134,39 @@
             font-size: 0.8rem;
             font-weight: bold;
         }
+        .ml-rec-home-ml {
+            background: linear-gradient(135deg, #d6eaff, #a8d8ff);
+            color: #1f6feb;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            display: inline-block;
+        }
+        .ml-rec-away-ml {
+            background: linear-gradient(135deg, #ffe0f0, #f5b3d1);
+            color: #c2185b;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            display: inline-block;
+        }
+        .ml-rec-no-bet {
+            background: linear-gradient(135deg, #f2f6fc, #e5ebf5);
+            color: #566573;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            display: inline-block;
+        }
+        .rec-note {
+            font-size: 0.75rem;
+            color: #7f8c8d;
+            margin-top: 4px;
+            line-height: 1.3;
+        }
         
         .status-bar {
             background: linear-gradient(135deg, #e8f5e8, #d5f4e6);
@@ -163,22 +202,34 @@
             <div class="metrics-grid">
                 <div class="metric-card">
                     <h3>📊 Model Performance</h3>
-                    <div class="metric-value">2.545</div>
+                    <div class="metric-value">3.144</div>
                 </div>
                 
                 <div class="metric-card">
                     <h3>🎯 Over/Under Accuracy</h3>
-                    <div class="metric-value">53.5%</div>
+                    <div class="metric-value">66.7%</div>
+                </div>
+                
+                <div class="metric-card">
+                    <h3>📗 YTD Bet Record</h3>
+                    <div class="metric-value">282-261</div>
+                    <div class="metric-subtext">YTD (since 2025-10-07): 51.9% (282/543)</div>
+                </div>
+
+                <div class="metric-card">
+                    <h3>🗓️ Yesterday's Record</h3>
+                    <div class="metric-value">No bets yesterday</div>
+                    <div class="metric-subtext">Yesterday: — (no bets)</div>
                 </div>
                 
                 <div class="metric-card">
                     <h3>💰 Betting Opportunities</h3>
-                    <div class="metric-value">4</div>
+                    <div class="metric-value">0</div>
                 </div>
                 
                 <div class="metric-card">
                     <h3>🔥 Average Confidence</h3>
-                    <div class="metric-value">48%</div>
+                    <div class="metric-value">0%</div>
                 </div>
             </div>
             
@@ -190,11 +241,13 @@
                     <li><b>Line</b>: Market total for the game.</li>
                     <li><b>Prediction</b>: Model total with 90% CI.</li>
                     <li><b>Edge</b>: Predicted total minus line (positive favors OVER).</li>
+                    <li><b>Moneyline</b>: Win probability, best price, and EV for each side.</li>
                     <li><b>Over% / Under%</b>: Probability estimates for each side (Fair shows no‑vig).</li>
                     <li><b>Confidence</b>: Composite score (edge, calibration, dispersion, movement).</li>
                     <li><b>Env</b>: Outdoor flag, local start hour, temperature.</li>
                     <li><b>Lineup</b>: Aggregate lineup strength (Home/Away).</li>
-                    <li><b>Recommendation</b>: OVER/UNDER/No Bet based on thresholds.</li>
+                    <li><b>O/U Rec</b>: Model side (Over/Under/No Bet) plus conflict reason.</li>
+                    <li><b>ML Rec</b>: Moneyline lean, bet size, and reason (if any).</li>
                     <li><b>Kelly%</b>: Suggested stake (scaled for risk/dispersion).</li>
                 </ul>
             </div>
@@ -217,170 +270,228 @@
                         <th>📊 Line</th>
                         <th>🔮 Prediction</th>
                         <th>⚡ Edge</th>
+                        <th>🏆 Moneyline</th>
                         <th>📈 Over %</th>
                         <th>📉 Under %</th>
                         <th>🔥 Confidence</th>
                         <th>🌤️ Env</th>
                         <th>👥 Lineup</th>
-                        <th>💡 Recommendation</th>
+                        <th>💡 O/U Rec</th>
+                        <th>🏅 ML Rec</th>
                         <th>💰 Kelly %</th>
                     </tr>
                 </thead>
                 <tbody>
 
-        <tr data-gid="2025020331" data-rec="OVER" data-matchup="Chicago Blackhawks @ Buffalo Sabres | CHI@BUF"
+        <tr data-gid="demo_0" data-rec="No Bet" data-matchup="Toronto Maple Leafs @ Boston Bruins | TOR@BOS"
+            data-ml-rec="Maple Leafs"
             data-ref-crew=""
             data-ref-avg="5.533"
             data-ref-bias=""
-            data-ref-source="https://scoutingtherefs.com/2025/11/50339/todays-nhl-referees-and-linespersons-11-20-25/"
-            data-ref-adjust="0.000">
-            <td><strong>Chicago Blackhawks @ Buffalo Sabres</strong></td>
-            <td>7.5</td>
-            <td><strong style="color: #2c3e50;">8.34</strong>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 4.4–12.3 </div>
+            data-ref-source="referees.csv"
+            data-ref-adjust="-0.000">
+            <td><strong>Toronto Maple Leafs @ Boston Bruins</strong></td>
+            <td>6.5</td>
+            <td><strong style="color: #2c3e50;">7.02</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 3.4–10.6 </div>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
             </td>
-            <td style="color: #27ae60; font-weight: bold;">+0.84
+            <td style="color: #27ae60; font-weight: bold;">+0.52
                 <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
             </td>
-            <td>45%
+            <td>
+                <div>Home: 8% (-140) </div>
+                <div>Away: 92% (+125) </div>
+                <div style="font-size:0.8rem; color:#7f8c8d;">ML EV: H -0.87 / A +1.08</div>
+            </td>
+            <td>47%
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
                 </div>
             </td>
-            <td>55%
+            <td>53%
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
                 </div>
             </td>
             <td>
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
-                        <div style="width: 51.309637197073556%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                        <div style="width: 45.402317098888645%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
                     </div>
-                    <span>51%</span>
+                    <span>45%</span>
                 </div>
             </td>
             <td>12:00AM 0°F</td>
             <td>H:0.00/A:0.00</td>
             <td>
-                <span class="rec-over">OVER</span>
+                <span class="rec-no-bet">No Bet</span>
+                <div class="rec-note">Reason: low_confidence</div>
+            </td>
+            <td>
+                <span class="ml-rec-maple-leafs">Maple Leafs</span>
+                <div class="rec-note">
+                    2.0% stake
+                    
+                </div>
             </td>
             <td>0.0%</td>
         </tr>
-        <tr data-gid="2025020332" data-rec="UNDER" data-matchup="Minnesota Wild @ Pittsburgh Penguins | MIN@PIT"
+        <tr data-gid="demo_1" data-rec="No Bet" data-matchup="Edmonton Oilers @ Colorado Avalanche | EDM@COL"
+            data-ml-rec="Avalanche"
             data-ref-crew=""
             data-ref-avg="5.533"
             data-ref-bias=""
-            data-ref-source="https://scoutingtherefs.com/2025/11/50339/todays-nhl-referees-and-linespersons-11-20-25/"
-            data-ref-adjust="0.000">
-            <td><strong>Minnesota Wild @ Pittsburgh Penguins</strong></td>
-            <td>7.5</td>
-            <td><strong style="color: #2c3e50;">7.12</strong>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 3.2–11.0 </div>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
-            </td>
-            <td style="color: #e74c3c; font-weight: bold;">-0.38
-                <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
-            </td>
-            <td>41%
-                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
-                </div>
-            </td>
-            <td>59%
-                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
-                </div>
-            </td>
-            <td>
-                <div style="display: flex; align-items: center; gap: 8px;">
-                    <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
-                        <div style="width: 47.830295060963024%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
-                    </div>
-                    <span>48%</span>
-                </div>
-            </td>
-            <td>12:00AM 0°F</td>
-            <td>H:0.00/A:0.00</td>
-            <td>
-                <span class="rec-under">UNDER</span>
-            </td>
-            <td>2.0%</td>
-        </tr>
-        <tr data-gid="2025020333" data-rec="OVER" data-matchup="Carolina Hurricanes @ Winnipeg Jets | CAR@WPG"
-            data-ref-crew=""
-            data-ref-avg="5.533"
-            data-ref-bias=""
-            data-ref-source="https://scoutingtherefs.com/2025/11/50339/todays-nhl-referees-and-linespersons-11-20-25/"
-            data-ref-adjust="0.000">
-            <td><strong>Carolina Hurricanes @ Winnipeg Jets</strong></td>
+            data-ref-source="referees.csv"
+            data-ref-adjust="-0.000">
+            <td><strong>Edmonton Oilers @ Colorado Avalanche</strong></td>
             <td>6.0</td>
-            <td><strong style="color: #2c3e50;">6.80</strong>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 2.9–10.7 </div>
+            <td><strong style="color: #2c3e50;">6.61</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 3.0–10.2 </div>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
             </td>
-            <td style="color: #27ae60; font-weight: bold;">+0.80
+            <td style="color: #27ae60; font-weight: bold;">+0.61
                 <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
             </td>
-            <td>41%
+            <td>
+                <div>Home: 72%  </div>
+                <div>Away: 28%  </div>
+                <div style="font-size:0.8rem; color:#7f8c8d;">ML EV: H  / A </div>
+            </td>
+            <td>47%
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
                 </div>
             </td>
-            <td>43%
+            <td>46%
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
                 </div>
             </td>
             <td>
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
-                        <div style="width: 41.58095170710227%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                        <div style="width: 41.427927135100795%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
                     </div>
-                    <span>42%</span>
+                    <span>41%</span>
                 </div>
             </td>
             <td>12:00AM 0°F</td>
             <td>H:0.00/A:0.00</td>
             <td>
-                <span class="rec-over">OVER</span>
+                <span class="rec-no-bet">No Bet</span>
+                <div class="rec-note">Reason: low_confidence</div>
+            </td>
+            <td>
+                <span class="ml-rec-avalanche">Avalanche</span>
+                <div class="rec-note">
+                    
+                    Reason: odds_missing
+                </div>
             </td>
             <td>0.0%</td>
         </tr>
-        <tr data-gid="2025020334" data-rec="OVER" data-matchup="Boston Bruins @ Los Angeles Kings | BOS@LAK"
+        <tr data-gid="demo_2" data-rec="No Bet" data-matchup="Vegas Golden Knights @ Florida Panthers | VGK@FLA"
+            data-ml-rec="Panthers"
             data-ref-crew=""
             data-ref-avg="5.533"
             data-ref-bias=""
-            data-ref-source="https://scoutingtherefs.com/2025/11/50339/todays-nhl-referees-and-linespersons-11-20-25/"
-            data-ref-adjust="0.000">
-            <td><strong>Boston Bruins @ Los Angeles Kings</strong></td>
-            <td>5.5</td>
-            <td><strong style="color: #2c3e50;">6.32</strong>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 2.4–10.2 </div>
-                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
+            data-ref-source="referees.csv"
+            data-ref-adjust="-0.000">
+            <td><strong>Vegas Golden Knights @ Florida Panthers</strong></td>
+            <td>6.0</td>
+            <td><strong style="color: #2c3e50;">6.82</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 3.2–10.4 </div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110 (DK) / U 100 (PINN) </div>
             </td>
             <td style="color: #27ae60; font-weight: bold;">+0.82
+                <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.02 / U -0.02</div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
+            </td>
+            <td>
+                <div>Home: 92% (-130) [DK]</div>
+                <div>Away: 8% (+120) [PINN]</div>
+                <div style="font-size:0.8rem; color:#7f8c8d;">ML EV: H +0.63 / A -0.82</div>
+            </td>
+            <td>47%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 51%
+                </div>
+            </td>
+            <td>52%
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 49%
+                </div>
+            </td>
+            <td>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
+                        <div style="width: 48.613030489854815%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                    </div>
+                    <span>49%</span>
+                </div>
+            </td>
+            <td>12:00AM 0°F</td>
+            <td>H:0.00/A:0.00</td>
+            <td>
+                <span class="rec-no-bet">No Bet</span>
+                <div class="rec-note">Reason: low_confidence</div>
+            </td>
+            <td>
+                <span class="ml-rec-panthers">Panthers</span>
+                <div class="rec-note">
+                    2.0% stake
+                    
+                </div>
+            </td>
+            <td>0.0%</td>
+        </tr>
+        <tr data-gid="demo_3" data-rec="No Bet" data-matchup="New York Rangers @ Carolina Hurricanes | NYR@CAR"
+            data-ml-rec="Rangers"
+            data-ref-crew=""
+            data-ref-avg="5.533"
+            data-ref-bias=""
+            data-ref-source="referees.csv"
+            data-ref-adjust="-0.000">
+            <td><strong>New York Rangers @ Carolina Hurricanes</strong></td>
+            <td>6.0</td>
+            <td><strong style="color: #2c3e50;">6.52</strong>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">CI90: 2.9–10.1 </div>
+                <div style="font-size: 0.8rem; color:#7f8c8d;">Odds: O -110  / U -110  </div>
+            </td>
+            <td style="color: #27ae60; font-weight: bold;">+0.52
                 <div style="font-size: 0.8rem; color:#7f8c8d;">No-vig EV: O -0.05 / U -0.05</div>
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Line Δ vs consensus: +0.0</div>
             </td>
-            <td>45%
+            <td>
+                <div>Home: 38%  </div>
+                <div>Away: 62%  </div>
+                <div style="font-size:0.8rem; color:#7f8c8d;">ML EV: H  / A </div>
+            </td>
+            <td>47%
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
                 </div>
             </td>
-            <td>55%
+            <td>48%
                 <div style="font-size: 0.8rem; color:#7f8c8d;">Fair: 50%
                 </div>
             </td>
             <td>
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <div style="width: 60px; height: 8px; background: #eee; border-radius: 4px;">
-                        <div style="width: 50.92097651671417%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
+                        <div style="width: 41.03886319929051%; height: 100%; background: #e74c3c; border-radius: 4px;"></div>
                     </div>
-                    <span>51%</span>
+                    <span>41%</span>
                 </div>
             </td>
             <td>12:00AM 0°F</td>
             <td>H:0.00/A:0.00</td>
             <td>
-                <span class="rec-over">OVER</span>
+                <span class="rec-no-bet">No Bet</span>
+                <div class="rec-note">Reason: low_confidence</div>
+            </td>
+            <td>
+                <span class="ml-rec-rangers">Rangers</span>
+                <div class="rec-note">
+                    
+                    Reason: odds_missing
+                </div>
             </td>
             <td>0.0%</td>
         </tr>
@@ -554,8 +665,8 @@
             
             <div class="status-bar">
                 <strong>🟢 Model Status:</strong> ACTIVE |
-                <strong>📊 Training Data:</strong> 211 games |
-                <strong>🕐 Last Updated:</strong> 2025-11-21 01:20:36 PM EST |
+                <strong>📊 Training Data:</strong> 42 games |
+                <strong>🕐 Last Updated:</strong> 2026-08-19 10:42:19 AM EDT |
                 <span id="status-note"></span>
             </div>
         </div>
