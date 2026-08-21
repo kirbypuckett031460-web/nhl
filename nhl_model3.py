@@ -9993,6 +9993,72 @@ def resolve_totals_pick(prediction: OverUnderPrediction) -> str:
     return 'OVER'
 
 
+def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
+    """Return a deterministic moneyline side ('home' or 'away') for every game."""
+    ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
+    if ml_side in {'home', 'away'}:
+        return ml_side
+
+    ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
+    if 'HOME' in ml_raw:
+        return 'home'
+    if 'AWAY' in ml_raw:
+        return 'away'
+
+    home_prob = None
+    away_prob = None
+    try:
+        home_prob = float(getattr(prediction, 'home_win_probability', np.nan))
+        if not np.isfinite(home_prob):
+            home_prob = None
+    except Exception:
+        home_prob = None
+    try:
+        away_prob = float(getattr(prediction, 'away_win_probability', np.nan))
+        if not np.isfinite(away_prob):
+            away_prob = None
+    except Exception:
+        away_prob = None
+    if home_prob is not None or away_prob is not None:
+        home_score = home_prob if home_prob is not None else -1.0
+        away_score = away_prob if away_prob is not None else -1.0
+        return 'home' if home_score >= away_score else 'away'
+
+    home_edge = None
+    away_edge = None
+    try:
+        home_edge = float(getattr(prediction, 'home_moneyline_edge', np.nan))
+        if not np.isfinite(home_edge):
+            home_edge = None
+    except Exception:
+        home_edge = None
+    try:
+        away_edge = float(getattr(prediction, 'away_moneyline_edge', np.nan))
+        if not np.isfinite(away_edge):
+            away_edge = None
+    except Exception:
+        away_edge = None
+    if home_edge is not None or away_edge is not None:
+        home_score = home_edge if home_edge is not None else -1e9
+        away_score = away_edge if away_edge is not None else -1e9
+        return 'home' if home_score >= away_score else 'away'
+
+    # Last fallback: choose side with stronger market implied probability when odds exist.
+    try:
+        h_odds = getattr(prediction, 'home_moneyline_odds', None)
+        a_odds = getattr(prediction, 'away_moneyline_odds', None)
+        h_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
+        a_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
+        if h_prob is not None or a_prob is not None:
+            h_score = float(h_prob) if h_prob is not None else -1.0
+            a_score = float(a_prob) if a_prob is not None else -1.0
+            return 'home' if h_score >= a_score else 'away'
+    except Exception:
+        pass
+
+    return 'home'
+
+
 def save_public_predictions_json(
     predictions: List[OverUnderPrediction],
     out_path: str = 'public_predictions.json',
@@ -10031,15 +10097,7 @@ def save_public_predictions_json(
         if totals_conf is not None and totals_conf <= 1.0:
             totals_conf *= 100.0
 
-        ml_side = str(getattr(pred, 'moneyline_recommendation_side', '') or '').strip().lower()
-        if ml_side not in {'home', 'away'}:
-            ml_raw = str(getattr(pred, 'moneyline_recommendation', '') or '').strip().upper()
-            if 'HOME' in ml_raw:
-                ml_side = 'home'
-            elif 'AWAY' in ml_raw:
-                ml_side = 'away'
-            else:
-                ml_side = ''
+        ml_side = resolve_moneyline_pick(pred)
 
         ml_pick_team = None
         ml_market_odds = None
@@ -10050,11 +10108,19 @@ def save_public_predictions_json(
             ml_market_odds = getattr(pred, 'home_moneyline_odds', None)
             ml_edge = _safe_float(getattr(pred, 'home_moneyline_edge', None))
             ml_prob = _safe_float(getattr(pred, 'home_win_probability', None))
-        elif ml_side == 'away':
+        else:
             ml_pick_team = get_team_abbreviation(getattr(pred, 'away_team', None)) or str(getattr(pred, 'away_team', '') or '').strip()
             ml_market_odds = getattr(pred, 'away_moneyline_odds', None)
             ml_edge = _safe_float(getattr(pred, 'away_moneyline_edge', None))
             ml_prob = _safe_float(getattr(pred, 'away_win_probability', None))
+
+        if ml_edge is None and ml_prob is not None and ml_market_odds is not None:
+            try:
+                implied = float(odds_decimal_to_implied_prob(odds_american_to_decimal(int(float(ml_market_odds)))))
+                if np.isfinite(implied):
+                    ml_edge = float(ml_prob - implied)
+            except Exception:
+                ml_edge = None
 
         rows.append({
             'generated_at': generated_at,
@@ -10077,7 +10143,7 @@ def save_public_predictions_json(
             'moneyline_market_odds': _safe_float(ml_market_odds),
             'moneyline_fair_odds': _prob_to_american(ml_prob),
             'moneyline_edge': ml_edge,
-            'moneyline_confidence_pct': _safe_float((ml_prob * 100.0) if ml_prob is not None else None),
+            'moneyline_confidence_pct': _safe_float((ml_prob * 100.0) if ml_prob is not None else 50.0),
         })
 
     payload = {'generated_at': generated_at, 'games': rows}

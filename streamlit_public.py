@@ -201,7 +201,8 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
 
         ml_pick = str(game.get("moneyline_pick_team") or "").strip().upper()
         if not ml_pick:
-            continue
+            side_hint = str(game.get("moneyline_pick_side") or "").strip().lower()
+            ml_pick = home if side_hint == "home" else away if side_hint == "away" else home
         ml_edge = _safe_float(game.get("moneyline_edge"))
         ml_conf = _safe_float(game.get("moneyline_confidence_pct"))
         moneyline_rows.append({
