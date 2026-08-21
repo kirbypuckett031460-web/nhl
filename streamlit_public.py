@@ -25,6 +25,15 @@ DARK_MODE_CSS = """
 <style>
 [data-testid="stAppViewContainer"] { background-color: #0b1220; }
 [data-testid="stHeader"] { background: transparent; }
+/* Hide Streamlit Cloud header links/actions (Fork + GitHub). */
+#MainMenu,
+[data-testid="stToolbar"],
+[data-testid="stHeaderActionElements"],
+[data-testid="stAppDeployButton"],
+[data-testid="stStatusWidget"],
+[data-testid="stHeader"] a {
+  display: none !important;
+}
 [data-testid="stTabs"] [data-baseweb="tab-list"] {
   gap: 0.25rem;
   border-bottom: 1px solid #27324c;
