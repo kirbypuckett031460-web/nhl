@@ -298,8 +298,9 @@ def _style_conf_cell(val: object) -> str:
     return f"background-color: rgba(236, 72, 153, {intensity:.3f}); color: #fdf2f8;"
 
 
-def _render_table(rows: List[Dict[str, object]], title: str) -> None:
-    st.markdown(f"### {title}")
+def _render_table(rows: List[Dict[str, object]], title: str = "") -> None:
+    if title:
+        st.markdown(f"### {title}")
     if not rows:
         st.info("No rows available.")
         return
@@ -351,19 +352,13 @@ def render_public_app() -> None:
     st.selectbox("Week", options=[week_label], index=0, disabled=True)
     st.caption(f"Slate: {week_label}")
 
-    board_view = st.radio(
-        "Board View",
-        options=["Moneyline Picks", "Over/Under Picks"],
-        index=0,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    if board_view == "Moneyline Picks":
-        _render_table(ml_rows, "Full Slate")
+    tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
+    with tab_ml:
+        _render_table(ml_rows)
         top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ml, "Top Plays")
-    else:
-        _render_table(ou_rows, "Full Slate")
+    with tab_ou:
+        _render_table(ou_rows)
         top_ou = sorted(ou_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ou, "Top Plays")
 
