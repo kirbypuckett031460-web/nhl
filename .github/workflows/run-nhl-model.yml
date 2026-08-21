@@ -112,6 +112,7 @@ jobs:
           FILES=(
             "predictions.png"
             "nhl_real_data_dashboard.html"
+            "public_predictions.json"
             "bets_log.csv"
             "odds_history.csv"
             "data/cache/trained_model.joblib"

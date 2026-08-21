@@ -9954,6 +9954,216 @@ def compute_bet_performance_summary(
     return summary
 
 
+def resolve_totals_pick(prediction: OverUnderPrediction) -> str:
+    """Return a deterministic OVER/UNDER pick for every game."""
+    rec_side = str(getattr(prediction, 'recommendation', '') or '').strip().upper()
+    if rec_side in {'OVER', 'UNDER'}:
+        return rec_side
+
+    decision_side = str(getattr(prediction, 'decision_side', '') or '').strip().upper()
+    if decision_side in {'OVER', 'UNDER'}:
+        return decision_side
+
+    try:
+        edge_val = float(getattr(prediction, 'edge', 0.0))
+        if np.isfinite(edge_val) and abs(edge_val) > 1e-6:
+            return 'OVER' if edge_val > 0 else 'UNDER'
+    except Exception:
+        pass
+
+    over_prob = None
+    under_prob = None
+    try:
+        over_prob = float(getattr(prediction, 'over_probability', np.nan))
+        if not np.isfinite(over_prob):
+            over_prob = None
+    except Exception:
+        over_prob = None
+    try:
+        under_prob = float(getattr(prediction, 'under_probability', np.nan))
+        if not np.isfinite(under_prob):
+            under_prob = None
+    except Exception:
+        under_prob = None
+    if over_prob is not None or under_prob is not None:
+        over_val = over_prob if over_prob is not None else 0.0
+        under_val = under_prob if under_prob is not None else 0.0
+        return 'OVER' if over_val >= under_val else 'UNDER'
+
+    return 'OVER'
+
+
+def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
+    """Return a deterministic moneyline side ('home' or 'away') for every game."""
+    ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
+    if ml_side in {'home', 'away'}:
+        return ml_side
+
+    ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
+    if 'HOME' in ml_raw:
+        return 'home'
+    if 'AWAY' in ml_raw:
+        return 'away'
+
+    home_prob = None
+    away_prob = None
+    try:
+        home_prob = float(getattr(prediction, 'home_win_probability', np.nan))
+        if not np.isfinite(home_prob):
+            home_prob = None
+    except Exception:
+        home_prob = None
+    try:
+        away_prob = float(getattr(prediction, 'away_win_probability', np.nan))
+        if not np.isfinite(away_prob):
+            away_prob = None
+    except Exception:
+        away_prob = None
+    if home_prob is not None or away_prob is not None:
+        home_score = home_prob if home_prob is not None else -1.0
+        away_score = away_prob if away_prob is not None else -1.0
+        return 'home' if home_score >= away_score else 'away'
+
+    home_edge = None
+    away_edge = None
+    try:
+        home_edge = float(getattr(prediction, 'home_moneyline_edge', np.nan))
+        if not np.isfinite(home_edge):
+            home_edge = None
+    except Exception:
+        home_edge = None
+    try:
+        away_edge = float(getattr(prediction, 'away_moneyline_edge', np.nan))
+        if not np.isfinite(away_edge):
+            away_edge = None
+    except Exception:
+        away_edge = None
+    if home_edge is not None or away_edge is not None:
+        home_score = home_edge if home_edge is not None else -1e9
+        away_score = away_edge if away_edge is not None else -1e9
+        return 'home' if home_score >= away_score else 'away'
+
+    # Last fallback: choose side with stronger market implied probability when odds exist.
+    try:
+        h_odds = getattr(prediction, 'home_moneyline_odds', None)
+        a_odds = getattr(prediction, 'away_moneyline_odds', None)
+        h_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
+        a_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
+        if h_prob is not None or a_prob is not None:
+            h_score = float(h_prob) if h_prob is not None else -1.0
+            a_score = float(a_prob) if a_prob is not None else -1.0
+            return 'home' if h_score >= a_score else 'away'
+    except Exception:
+        pass
+
+    return 'home'
+
+
+def save_public_predictions_json(
+    predictions: List[OverUnderPrediction],
+    out_path: str = 'public_predictions.json',
+) -> Optional[str]:
+    """Persist per-game totals/moneyline picks for Streamlit consumption."""
+    if not predictions:
+        return None
+
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+            if np.isfinite(out):
+                return out
+        except Exception:
+            return None
+        return None
+
+    def _prob_to_american(prob: Optional[float]) -> Optional[int]:
+        p = _safe_float(prob)
+        if p is None or p <= 0.0 or p >= 1.0:
+            return None
+        try:
+            if p >= 0.5:
+                return int(round(-100.0 * p / max(1e-9, (1.0 - p))))
+            return int(round(100.0 * (1.0 - p) / max(1e-9, p)))
+        except Exception:
+            return None
+
+    generated_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    rows: List[Dict[str, Any]] = []
+    for pred in predictions:
+        totals_pick = resolve_totals_pick(pred)
+        totals_action = 'BET' if str(getattr(pred, 'recommendation', '') or '').strip().upper() in {'OVER', 'UNDER'} else 'PICK'
+
+        totals_conf = _safe_float(getattr(pred, 'confidence', None))
+        if totals_conf is not None and totals_conf <= 1.0:
+            totals_conf *= 100.0
+
+        ml_side = resolve_moneyline_pick(pred)
+
+        ml_pick_team = None
+        ml_market_odds = None
+        ml_edge = None
+        ml_prob = None
+        if ml_side == 'home':
+            ml_pick_team = get_team_abbreviation(getattr(pred, 'home_team', None)) or str(getattr(pred, 'home_team', '') or '').strip()
+            ml_market_odds = getattr(pred, 'home_moneyline_odds', None)
+            ml_edge = _safe_float(getattr(pred, 'home_moneyline_edge', None))
+            ml_prob = _safe_float(getattr(pred, 'home_win_probability', None))
+        else:
+            ml_pick_team = get_team_abbreviation(getattr(pred, 'away_team', None)) or str(getattr(pred, 'away_team', '') or '').strip()
+            ml_market_odds = getattr(pred, 'away_moneyline_odds', None)
+            ml_edge = _safe_float(getattr(pred, 'away_moneyline_edge', None))
+            ml_prob = _safe_float(getattr(pred, 'away_win_probability', None))
+
+        if ml_edge is None and ml_prob is not None and ml_market_odds is not None:
+            try:
+                implied = float(odds_decimal_to_implied_prob(odds_american_to_decimal(int(float(ml_market_odds)))))
+                if np.isfinite(implied):
+                    ml_edge = float(ml_prob - implied)
+            except Exception:
+                ml_edge = None
+
+        rows.append({
+            'generated_at': generated_at,
+            'game_id': str(getattr(pred, 'game_id', '') or ''),
+            'away_team': str(getattr(pred, 'away_team', '') or ''),
+            'home_team': str(getattr(pred, 'home_team', '') or ''),
+            'away_abbrev': get_team_abbreviation(getattr(pred, 'away_team', None)) or str(getattr(pred, 'away_team', '') or '').strip(),
+            'home_abbrev': get_team_abbreviation(getattr(pred, 'home_team', None)) or str(getattr(pred, 'home_team', '') or '').strip(),
+            'matchup': f"{getattr(pred, 'away_team', '')}@{getattr(pred, 'home_team', '')}",
+            'game_time_et': str(getattr(pred, 'start_time_display', '') or ''),
+            'game_datetime_utc': str(getattr(pred, 'game_datetime_utc', '') or getattr(pred, 'game_datetime', '') or ''),
+            'totals_line': _safe_float(getattr(pred, 'betting_line', None)),
+            'totals_fair': _safe_float(getattr(pred, 'predicted_total', None)),
+            'totals_pick': totals_pick,
+            'totals_edge': _safe_float(getattr(pred, 'edge', None)),
+            'totals_confidence_pct': _safe_float(totals_conf),
+            'totals_action': totals_action,
+            'moneyline_pick_side': ml_side or None,
+            'moneyline_pick_team': ml_pick_team,
+            'moneyline_market_odds': _safe_float(ml_market_odds),
+            'moneyline_fair_odds': _prob_to_american(ml_prob),
+            'moneyline_edge': ml_edge,
+            'moneyline_confidence_pct': _safe_float((ml_prob * 100.0) if ml_prob is not None else 50.0),
+        })
+
+    payload = {'generated_at': generated_at, 'games': rows}
+    target_path = ensure_local_write_path(out_path) or os.path.abspath(out_path)
+    try:
+        parent = os.path.dirname(target_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(target_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"✅ Saved public predictions JSON: {target_path}")
+        return target_path
+    except Exception as exc:
+        print(f"⚠️  Failed to save public predictions JSON {target_path}: {exc}")
+        return None
+
+
 def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.csv', closing_odds_path: Optional[str] = None) -> None:
     """Append recommended bets to a CSV and compute simple CLV if closing totals provided.
 
@@ -9981,28 +10191,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         matchup = f"{p.away_team}@{p.home_team}"
         # Always log a directional pick (OVER/UNDER) so grading/YTD can track
         # model direction even when the model would otherwise recommend "No Bet".
-        rec_side = (p.recommendation or '').strip().upper()
-        action = 'BET'
-        if rec_side not in {'OVER', 'UNDER'}:
-            action = 'PICK'
-            # Match the display logic used in predictions.png (decision_side first).
-            decision_side = str(getattr(p, 'decision_side', '') or '').strip().upper()
-            if decision_side in {'OVER', 'UNDER'}:
-                rec_side = decision_side
-            else:
-                over_prob = getattr(p, 'over_probability', None)
-                under_prob = getattr(p, 'under_probability', None)
-                try:
-                    over_prob_f = float(over_prob) if over_prob is not None else None
-                except Exception:
-                    over_prob_f = None
-                try:
-                    under_prob_f = float(under_prob) if under_prob is not None else None
-                except Exception:
-                    rec_side = 'OVER'
-        # Safety: keep log schema directional for downstream grading/reporting.
-        if rec_side not in {'OVER', 'UNDER'}:
-            rec_side = 'OVER'
+        rec_raw = str(getattr(p, 'recommendation', '') or '').strip().upper()
+        action = 'BET' if rec_raw in {'OVER', 'UNDER'} else 'PICK'
+        rec_side = resolve_totals_pick(p)
 
         my_line = p.betting_line
         close_total = None
@@ -13831,6 +14022,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
 
             print(f"✅ Generated {len(predictions)} predictions")
 
+            public_board_path = getattr(cli_args, 'public_board_path', 'public_predictions.json') if cli_args else 'public_predictions.json'
+            try:
+                save_public_predictions_json(predictions, out_path=public_board_path)
+            except Exception as e:
+                print(f"⚠️  Could not save public predictions JSON: {e}")
+
             betting_preds = [p for p in predictions if p.recommendation != 'No Bet']
             if betting_preds:
                 print(f"\n💰 Recommended bets ({len(betting_preds)}):")
@@ -14004,6 +14201,7 @@ if __name__ == "__main__":
     parser.add_argument('--closing-odds-path', type=str, default=os.getenv('CLOSING_ODDS_JSON', 'closing_odds.json'), help='Path to closing odds JSON for CLV logging')
     parser.add_argument('--log-bets', action='store_true', help='Enable logging bets to CSV')
     parser.add_argument('--log-path', type=str, default='bets_log.csv', help='Path to bets log CSV')
+    parser.add_argument('--public-board-path', type=str, default=os.getenv('PUBLIC_BOARD_PATH', 'public_predictions.json'), help='Path to write per-game public board JSON used by Streamlit')
     parser.add_argument('--grade-bets', action='store_true', help='Grade/settle ungraded picks in --log-path using historical finals, then exit')
     parser.add_argument('--post-social', action='store_true', help='Enable social media posting')
     parser.add_argument('--no-open-browser', dest='open_browser', action='store_false', help='Disable automatic dashboard opening in a local browser')
