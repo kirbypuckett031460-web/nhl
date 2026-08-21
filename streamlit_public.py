@@ -351,47 +351,48 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
         return
     frame = pd.DataFrame(clean_rows)
     width_map = {
-        "Game Time (ET)": "112px",
-        "Away": "208px",
-        "Home": "208px",
-        "Mkt": "62px",
-        "Fair": "62px",
-        "Pick": "188px",
-        "Edge": "82px",
-        "Confidence": "110px",
+        "Game Time (ET)": "110px",
+        "Away": "180px",
+        "Home": "180px",
+        "Mkt": "64px",
+        "Fair": "64px",
+        "Pick": "190px",
+        "Edge": "74px",
+        "Confidence": "90px",
     }
     table_styles = [
         {
-            "selector": "th",
+            "selector": "thead th",
             "props": [
-                ("background-color", "#202a44"),
-                ("color", "#dbeafe"),
+                ("background-color", "#2a334a"),
+                ("color", "#dbe7ff"),
                 ("font-size", "11px"),
                 ("font-weight", "700"),
-                ("padding", "4px 6px"),
+                ("padding", "3px 6px"),
                 ("text-align", "center"),
-                ("border", "1px solid #2f3c5d"),
+                ("border", "1px solid #32415f"),
+                ("white-space", "nowrap"),
             ],
         },
         {
-            "selector": "td",
+            "selector": "tbody td",
             "props": [
-                ("font-size", "11px"),
-                ("padding", "3px 6px"),
-                ("line-height", "1.15"),
+                ("background-color", "#0f1a2e"),
+                ("color", "#f1f5f9"),
+                ("font-size", "10.5px"),
+                ("font-weight", "600"),
+                ("padding", "2px 6px"),
+                ("line-height", "1.12"),
                 ("text-align", "center"),
-                ("border", "1px solid #27324c"),
+                ("border", "1px solid #23314a"),
+                ("white-space", "nowrap"),
             ],
         },
     ]
     for col_idx, col_name in enumerate(frame.columns):
         width = width_map.get(str(col_name), "100px")
         table_styles.append({
-            "selector": f"th.col{col_idx}",
-            "props": [("min-width", width), ("max-width", width), ("width", width)],
-        })
-        table_styles.append({
-            "selector": f"td.col{col_idx}",
+            "selector": f".col{col_idx}",
             "props": [("min-width", width), ("max-width", width), ("width", width)],
         })
 
@@ -404,8 +405,8 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
         styled = styled.applymap(_style_edge_cell, subset=["Edge"])
         styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
     styled = styled.set_table_styles(table_styles)
-    styled = styled.set_properties(**{"font-size": "11px", "text-align": "center"})
-    st.table(styled)
+    styled = styled.set_properties(**{"text-align": "center"})
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 def render_public_app() -> None:
