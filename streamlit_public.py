@@ -1,9 +1,10 @@
 import csv
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -300,9 +301,24 @@ def _style_conf_cell(val: object) -> str:
     return f"background-color: rgba(236, 72, 153, {intensity:.3f}); color: #fdf2f8;"
 
 
-def _render_table(rows: List[Dict[str, object]], title: str = "") -> None:
+def _format_last_updated_et(dt: datetime) -> str:
+    if not isinstance(dt, datetime):
+        return "—"
+    eastern = ZoneInfo("America/New_York")
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_et = dt.astimezone(eastern)
+    except Exception:
+        dt_et = dt
+    return dt_et.strftime("%Y-%m-%d %I:%M:%S %p ET")
+
+
+def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str = "") -> None:
     if title:
         st.markdown(f"### {title}")
+    if subtitle:
+        st.caption(subtitle)
     if not rows:
         st.info("No rows available.")
         return
@@ -388,8 +404,8 @@ def render_public_app() -> None:
         ou_rows = _build_totals_from_log_rows(run_rows)
 
     shown_dt = board_dt or run_dt or datetime.now()
+    last_updated_et = _format_last_updated_et(shown_dt)
     st.write(f"Slate Date: {shown_dt.strftime('%A, %b %d, %Y')}")
-    st.caption(f"Last updated: {shown_dt.isoformat()}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Moneyline Prev Week", metrics["ml_prev"][0], metrics["ml_prev"][1])
@@ -405,11 +421,11 @@ def render_public_app() -> None:
     with tab_ml:
         _render_table(ml_rows)
         top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
-        _render_table(top_ml, "Top Plays")
+        _render_table(top_ml, "Top Plays", f"Last updated: {last_updated_et}")
     with tab_ou:
         _render_table(ou_rows)
         top_ou = sorted(ou_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
-        _render_table(top_ou, "Top Plays")
+        _render_table(top_ou, "Top Plays", f"Last updated: {last_updated_et}")
 
 
 if __name__ == "__main__":
