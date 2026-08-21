@@ -437,10 +437,6 @@ def render_public_app() -> None:
     c3.metric("Totals Prev Week", metrics["tot_prev"][0], metrics["tot_prev"][1])
     c4.metric("Totals YTD", metrics["tot_ytd"][0], metrics["tot_ytd"][1])
 
-    week_label = f"Week {shown_dt.isocalendar()[1]}"
-    st.selectbox("Week", options=[week_label], index=0, disabled=True)
-    st.caption(f"Slate: {week_label}")
-
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
     with tab_ml:
         _render_table(ml_rows)
