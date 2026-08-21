@@ -25,8 +25,27 @@ DARK_MODE_CSS = """
 <style>
 [data-testid="stAppViewContainer"] { background-color: #0b1220; }
 [data-testid="stHeader"] { background: transparent; }
-[data-testid="stTabs"] button { font-size: 0.78rem !important; }
-[data-testid="stTabs"] button p { font-size: 0.78rem !important; }
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+  gap: 0.25rem;
+  border-bottom: 1px solid #27324c;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+  font-size: 0.78rem !important;
+  color: #f8fafc !important;
+  background: transparent !important;
+  border: none !important;
+  border-bottom: 2px solid transparent !important;
+  padding: 0.15rem 0.4rem 0.45rem 0.4rem !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] p {
+  font-size: 0.78rem !important;
+  color: inherit !important;
+  font-weight: 600 !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+  color: #ff4b4b !important;
+  border-bottom-color: #ff4b4b !important;
+}
 [data-testid="stMetric"] {
   background-color: #111827;
   border: 1px solid #1f2937;
