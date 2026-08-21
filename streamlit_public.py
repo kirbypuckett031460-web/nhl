@@ -24,6 +24,8 @@ DARK_MODE_CSS = """
 <style>
 [data-testid="stAppViewContainer"] { background-color: #0b1220; }
 [data-testid="stHeader"] { background: transparent; }
+[data-testid="stTabs"] button { font-size: 0.78rem !important; }
+[data-testid="stTabs"] button p { font-size: 0.78rem !important; }
 [data-testid="stMetric"] {
   background-color: #111827;
   border: 1px solid #1f2937;
@@ -298,8 +300,9 @@ def _style_conf_cell(val: object) -> str:
     return f"background-color: rgba(236, 72, 153, {intensity:.3f}); color: #fdf2f8;"
 
 
-def _render_table(rows: List[Dict[str, object]], title: str) -> None:
-    st.markdown(f"### {title}")
+def _render_table(rows: List[Dict[str, object]], title: str = "") -> None:
+    if title:
+        st.markdown(f"### {title}")
     if not rows:
         st.info("No rows available.")
         return
@@ -308,6 +311,51 @@ def _render_table(rows: List[Dict[str, object]], title: str) -> None:
         st.dataframe(clean_rows, use_container_width=True, hide_index=True)
         return
     frame = pd.DataFrame(clean_rows)
+    width_map = {
+        "Game Time (ET)": "112px",
+        "Away": "208px",
+        "Home": "208px",
+        "Mkt": "62px",
+        "Fair": "62px",
+        "Pick": "188px",
+        "Edge": "82px",
+        "Confidence": "110px",
+    }
+    table_styles = [
+        {
+            "selector": "th",
+            "props": [
+                ("background-color", "#202a44"),
+                ("color", "#dbeafe"),
+                ("font-size", "11px"),
+                ("font-weight", "700"),
+                ("padding", "4px 6px"),
+                ("text-align", "center"),
+                ("border", "1px solid #2f3c5d"),
+            ],
+        },
+        {
+            "selector": "td",
+            "props": [
+                ("font-size", "11px"),
+                ("padding", "3px 6px"),
+                ("line-height", "1.15"),
+                ("text-align", "center"),
+                ("border", "1px solid #27324c"),
+            ],
+        },
+    ]
+    for col_idx, col_name in enumerate(frame.columns):
+        width = width_map.get(str(col_name), "100px")
+        table_styles.append({
+            "selector": f"th.col{col_idx}",
+            "props": [("min-width", width), ("max-width", width), ("width", width)],
+        })
+        table_styles.append({
+            "selector": f"td.col{col_idx}",
+            "props": [("min-width", width), ("max-width", width), ("width", width)],
+        })
+
     try:
         styled = frame.style.map(_style_pick_cell, subset=["Pick"])
         styled = styled.map(_style_edge_cell, subset=["Edge"])
@@ -316,7 +364,9 @@ def _render_table(rows: List[Dict[str, object]], title: str) -> None:
         styled = frame.style.applymap(_style_pick_cell, subset=["Pick"])
         styled = styled.applymap(_style_edge_cell, subset=["Edge"])
         styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    styled = styled.set_table_styles(table_styles)
+    styled = styled.set_properties(**{"font-size": "11px", "text-align": "center"})
+    st.table(styled)
 
 
 def render_public_app() -> None:
@@ -351,19 +401,13 @@ def render_public_app() -> None:
     st.selectbox("Week", options=[week_label], index=0, disabled=True)
     st.caption(f"Slate: {week_label}")
 
-    board_view = st.radio(
-        "Board View",
-        options=["Moneyline Picks", "Over/Under Picks"],
-        index=0,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    if board_view == "Moneyline Picks":
-        _render_table(ml_rows, "Full Slate")
+    tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
+    with tab_ml:
+        _render_table(ml_rows)
         top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ml, "Top Plays")
-    else:
-        _render_table(ou_rows, "Full Slate")
+    with tab_ou:
+        _render_table(ou_rows)
         top_ou = sorted(ou_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ou, "Top Plays")
 
