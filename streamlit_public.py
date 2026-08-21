@@ -1,50 +1,44 @@
 import csv
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
+
 try:
     import pandas as pd
 except Exception:  # pragma: no cover - fallback only
     pd = None
+
+try:
+    from nhl_model.common import get_team_primary_color
+except Exception:  # pragma: no cover - fallback only
+    get_team_primary_color = None
 
 
 APP_ROOT = Path(__file__).resolve().parent
 
 DARK_MODE_CSS = """
 <style>
-[data-testid="stAppViewContainer"] {
-  background-color: #0b1220;
-}
-
-[data-testid="stHeader"] {
-  background: transparent;
-}
-
+[data-testid="stAppViewContainer"] { background-color: #0b1220; }
+[data-testid="stHeader"] { background: transparent; }
 [data-testid="stMetric"] {
   background-color: #111827;
   border: 1px solid #1f2937;
   border-radius: 10px;
-  padding: 0.5rem 0.75rem;
+  padding: 0.45rem 0.75rem;
 }
 </style>
 """
-
-
-def _parse_date_only(raw_value: str) -> Optional[datetime.date]:
-    dt = _parse_logged_datetime(raw_value)
-    if dt == datetime.min:
-        return None
-    return dt.date()
 
 
 def _parse_logged_datetime(raw_value: str) -> datetime:
     raw = str(raw_value or "").strip()
     if not raw:
         return datetime.min
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
         try:
             return datetime.strptime(raw, fmt)
         except Exception:
@@ -52,9 +46,16 @@ def _parse_logged_datetime(raw_value: str) -> datetime:
     return datetime.min
 
 
-def _safe_float(raw_value: str) -> Optional[float]:
+def _safe_float(raw_value: object) -> Optional[float]:
     try:
         return float(raw_value)
+    except Exception:
+        return None
+
+
+def _safe_int(raw_value: object) -> Optional[int]:
+    try:
+        return int(float(raw_value))
     except Exception:
         return None
 
@@ -64,11 +65,26 @@ def _split_matchup(matchup: str) -> Tuple[str, str]:
     if "@" in raw:
         away, home = raw.split("@", 1)
         return away.strip(), home.strip()
-    if " at " in raw.lower():
-        chunks = raw.split(" at ")
-        if len(chunks) == 2:
-            return chunks[0].strip(), chunks[1].strip()
     return raw, "—"
+
+
+def _fmt_signed(value: Optional[float], places: int = 1, pct: bool = False) -> str:
+    if value is None:
+        return "—"
+    suffix = "%" if pct else ""
+    return f"{value:+.{places}f}{suffix}"
+
+
+def _fmt_decimal(value: Optional[float], places: int = 1) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.{places}f}"
+
+
+def _fmt_american(value: Optional[int]) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+d}" if value > 0 else str(value)
 
 
 def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[datetime]]:
@@ -83,78 +99,165 @@ def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[dat
         return [], None
     latest_dt = max(dt for dt, _ in rows)
     if latest_dt == datetime.min:
-        # Fallback: show latest row per game_id when dates are malformed.
-        by_game: Dict[str, Dict[str, str]] = {}
-        for _, row in rows:
-            gid = str(row.get("game_id") or "").strip()
-            if gid:
-                by_game[gid] = row
-        return list(by_game.values()), None
-    latest_rows = [row for dt, row in rows if dt == latest_dt]
-    return latest_rows, latest_dt
+        return [r for _, r in rows], None
+    return [r for dt, r in rows if dt == latest_dt], latest_dt
 
 
-def _graded_summary(log_path: Path) -> Dict[str, Optional[float]]:
-    summary: Dict[str, Optional[float]] = {
-        "yesterday_wins": 0,
-        "yesterday_losses": 0,
-        "yesterday_pushes": 0,
-        "yesterday_decided": 0,
-        "yesterday_win_rate": None,
-        "ytd_wins": 0,
-        "ytd_losses": 0,
-        "ytd_pushes": 0,
-        "ytd_decided": 0,
-        "ytd_win_rate": None,
-    }
-    if not log_path.exists():
-        return summary
+def _read_public_predictions(path: Path) -> Tuple[List[Dict[str, object]], Optional[datetime]]:
+    if not path.exists():
+        return [], None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return [], None
+    games = payload.get("games")
+    if not isinstance(games, list):
+        return [], None
+    generated_raw = str(payload.get("generated_at") or "").strip()
+    generated_dt = _parse_logged_datetime(generated_raw) if generated_raw else None
+    if generated_dt == datetime.min:
+        generated_dt = None
+    return [g for g in games if isinstance(g, dict)], generated_dt
 
+
+def _compute_record_blocks(log_path: Path) -> Dict[str, Tuple[str, str]]:
     season_start_raw = str(os.getenv("NHL_SEASON_START", "2025-10-07")).strip() or "2025-10-07"
     try:
-        season_start_date = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
+        season_start = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
     except Exception:
-        season_start_date = datetime(datetime.now().year, 1, 1).date()
-
-    today_date = datetime.now().date()
-    yesterday_date = today_date.fromordinal(today_date.toordinal() - 1)
-
+        season_start = datetime.now().date().replace(month=1, day=1)
+    today = datetime.now().date()
+    prev_week_start = today - timedelta(days=7)
+    blocks = {
+        "ml_prev": [0, 0],
+        "ml_ytd": [0, 0],
+        "tot_prev": [0, 0],
+        "tot_ytd": [0, 0],
+    }
+    if not log_path.exists():
+        return {
+            "ml_prev": ("0-0", "+0.0%"),
+            "ml_ytd": ("0-0", "+0.0%"),
+            "tot_prev": ("0-0", "+0.0%"),
+            "tot_ytd": ("0-0", "+0.0%"),
+        }
     with log_path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            side = str(row.get("side") or "").strip().upper()
-            if side not in {"OVER", "UNDER"}:
-                continue
             result = str(row.get("result") or "").strip().upper()
-            if result not in {"WIN", "LOSS", "PUSH"}:
+            if result not in {"WIN", "LOSS"}:
                 continue
-            row_date = _parse_date_only(row.get("date", ""))
-            if row_date is None:
+            dt = _parse_logged_datetime(row.get("date", ""))
+            if dt == datetime.min:
                 continue
+            d = dt.date()
+            action = str(row.get("action") or "").strip().upper()
+            side = str(row.get("side") or "").strip().upper()
+            is_ml = ("ML" in action) or ("ML" in side) or (side in {"HOME", "AWAY", "HML", "AML"})
+            bucket = "ml" if is_ml else ("tot" if side in {"OVER", "UNDER"} else "")
+            if not bucket:
+                continue
+            idx = 0 if result == "WIN" else 1
+            if d >= season_start:
+                blocks[f"{bucket}_ytd"][idx] += 1
+            if prev_week_start <= d < today:
+                blocks[f"{bucket}_prev"][idx] += 1
 
-            if row_date >= season_start_date:
-                if result == "WIN":
-                    summary["ytd_wins"] += 1
-                elif result == "LOSS":
-                    summary["ytd_losses"] += 1
-                else:
-                    summary["ytd_pushes"] += 1
+    def _fmt(block: List[int]) -> Tuple[str, str]:
+        wins, losses = int(block[0]), int(block[1])
+        decided = wins + losses
+        pct = (wins / decided * 100.0) if decided > 0 else 0.0
+        return f"{wins}-{losses}", f"{pct:+.1f}%"
 
-            if row_date == yesterday_date:
-                if result == "WIN":
-                    summary["yesterday_wins"] += 1
-                elif result == "LOSS":
-                    summary["yesterday_losses"] += 1
-                else:
-                    summary["yesterday_pushes"] += 1
+    return {
+        "ml_prev": _fmt(blocks["ml_prev"]),
+        "ml_ytd": _fmt(blocks["ml_ytd"]),
+        "tot_prev": _fmt(blocks["tot_prev"]),
+        "tot_ytd": _fmt(blocks["tot_ytd"]),
+    }
 
-    summary["ytd_decided"] = int(summary["ytd_wins"] + summary["ytd_losses"])
-    summary["yesterday_decided"] = int(summary["yesterday_wins"] + summary["yesterday_losses"])
-    if summary["ytd_decided"] > 0:
-        summary["ytd_win_rate"] = float(summary["ytd_wins"] / summary["ytd_decided"])
-    if summary["yesterday_decided"] > 0:
-        summary["yesterday_win_rate"] = float(summary["yesterday_wins"] / summary["yesterday_decided"])
-    return summary
+
+def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    moneyline_rows: List[Dict[str, object]] = []
+    totals_rows: List[Dict[str, object]] = []
+    for game in games:
+        away = str(game.get("away_abbrev") or game.get("away_team") or "").strip() or "—"
+        home = str(game.get("home_abbrev") or game.get("home_team") or "").strip() or "—"
+        game_time = str(game.get("game_time_et") or "").strip() or "—"
+
+        totals_edge = _safe_float(game.get("totals_edge"))
+        totals_conf = _safe_float(game.get("totals_confidence_pct"))
+        totals_rows.append({
+            "Game Time (ET)": game_time,
+            "Away": away,
+            "Home": home,
+            "Mkt": _fmt_decimal(_safe_float(game.get("totals_line")), places=1),
+            "Fair": _fmt_decimal(_safe_float(game.get("totals_fair")), places=1),
+            "Pick": str(game.get("totals_pick") or "—").upper(),
+            "Edge": _fmt_signed(totals_edge, places=2, pct=False),
+            "Confidence": _fmt_signed(totals_conf, places=1, pct=True).replace("+", ""),
+            "_edge_abs": abs(totals_edge) if totals_edge is not None else -1.0,
+        })
+
+        ml_pick = str(game.get("moneyline_pick_team") or "").strip().upper()
+        if not ml_pick:
+            continue
+        ml_edge = _safe_float(game.get("moneyline_edge"))
+        ml_conf = _safe_float(game.get("moneyline_confidence_pct"))
+        moneyline_rows.append({
+            "Game Time (ET)": game_time,
+            "Away": away,
+            "Home": home,
+            "Mkt": _fmt_american(_safe_int(game.get("moneyline_market_odds"))),
+            "Fair": _fmt_american(_safe_int(game.get("moneyline_fair_odds"))),
+            "Pick": ml_pick,
+            "Edge": _fmt_signed(ml_edge * 100.0 if ml_edge is not None else None, places=1, pct=True),
+            "Confidence": _fmt_signed(ml_conf, places=1, pct=True).replace("+", ""),
+            "_edge_abs": abs(ml_edge) if ml_edge is not None else -1.0,
+        })
+
+    totals_rows.sort(key=lambda r: str(r.get("Game Time (ET)") or ""))
+    moneyline_rows.sort(key=lambda r: str(r.get("Game Time (ET)") or ""))
+    return moneyline_rows, totals_rows
+
+
+def _build_totals_from_log_rows(run_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for row in run_rows:
+        away, home = _split_matchup(row.get("matchup", ""))
+        line = _safe_float(row.get("line"))
+        fair = _safe_float(row.get("pred_total"))
+        edge = _safe_float(row.get("edge"))
+        confidence = _safe_float(row.get("confidence"))
+        if confidence is not None and confidence <= 1.0:
+            confidence *= 100.0
+        rows.append({
+            "Game Time (ET)": "—",
+            "Away": away,
+            "Home": home,
+            "Mkt": _fmt_decimal(line, places=1),
+            "Fair": _fmt_decimal(fair, places=1),
+            "Pick": str(row.get("side") or "—").strip().upper() or "—",
+            "Edge": _fmt_signed(edge, places=2, pct=False),
+            "Confidence": _fmt_signed(confidence, places=1, pct=True).replace("+", ""),
+            "_edge_abs": abs(edge) if edge is not None else -1.0,
+        })
+    rows.sort(key=lambda r: str(r.get("Away") or ""))
+    return rows
+
+
+def _contrast_text_color(hex_color: str) -> str:
+    color = str(hex_color or "").strip().lstrip("#")
+    if len(color) != 6:
+        return "#f8fafc"
+    try:
+        r = int(color[0:2], 16)
+        g = int(color[2:4], 16)
+        b = int(color[4:6], 16)
+    except Exception:
+        return "#f8fafc"
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    return "#0b1220" if luminance > 0.55 else "#f8fafc"
 
 
 def _style_pick_cell(val: object) -> str:
@@ -163,23 +266,28 @@ def _style_pick_cell(val: object) -> str:
         return "background-color: #166534; color: #dcfce7; font-weight: 700; text-align: center;"
     if txt == "UNDER":
         return "background-color: #991b1b; color: #fee2e2; font-weight: 700; text-align: center;"
+    if get_team_primary_color is not None and txt not in {"", "—", "NO BET"}:
+        team_color = str(get_team_primary_color(txt) or "#1d4ed8").strip()
+        return f"background-color: {team_color}; color: {_contrast_text_color(team_color)}; font-weight: 700; text-align: center;"
     return "text-align: center;"
 
 
 def _style_edge_cell(val: object) -> str:
+    text = str(val or "").strip().replace("%", "")
     try:
-        num = float(val)
+        num = float(text)
     except Exception:
         return ""
-    intensity = min(0.75, 0.22 + min(abs(num), 3.0) * 0.16)
+    intensity = min(0.8, 0.22 + min(abs(num), 12.0) * 0.05)
     if num >= 0:
         return f"background-color: rgba(16, 185, 129, {intensity:.3f}); color: #ecfeff;"
     return f"background-color: rgba(244, 63, 94, {intensity:.3f}); color: #ffe4e6;"
 
 
 def _style_conf_cell(val: object) -> str:
+    text = str(val or "").strip().replace("%", "")
     try:
-        num = float(val)
+        num = float(text)
     except Exception:
         return ""
     centered = max(-1.0, min(1.0, (num - 50.0) / 50.0))
@@ -189,125 +297,68 @@ def _style_conf_cell(val: object) -> str:
     return f"background-color: rgba(236, 72, 153, {intensity:.3f}); color: #fdf2f8;"
 
 
+def _render_table(rows: List[Dict[str, object]], title: str) -> None:
+    st.markdown(f"### {title}")
+    if not rows:
+        st.info("No rows available.")
+        return
+    clean_rows = [{k: v for k, v in row.items() if not str(k).startswith("_")} for row in rows]
+    if pd is None:
+        st.dataframe(clean_rows, use_container_width=True, hide_index=True)
+        return
+    frame = pd.DataFrame(clean_rows)
+    try:
+        styled = frame.style.map(_style_pick_cell, subset=["Pick"])
+        styled = styled.map(_style_edge_cell, subset=["Edge"])
+        styled = styled.map(_style_conf_cell, subset=["Confidence"])
+    except Exception:
+        styled = frame.style.applymap(_style_pick_cell, subset=["Pick"])
+        styled = styled.applymap(_style_edge_cell, subset=["Edge"])
+        styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
 def render_public_app() -> None:
-    st.set_page_config(page_title="NHL Over/Under Picks", layout="wide")
+    st.set_page_config(page_title="NHL Picks", layout="wide")
     st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
-    st.title("NHL Over/Under Picks")
+    st.title("NHL Picks")
 
     if st.button("Refresh", type="secondary"):
         st.rerun()
 
     log_path = APP_ROOT / "bets_log.csv"
+    board_path = APP_ROOT / "public_predictions.json"
+    board_games, board_dt = _read_public_predictions(board_path)
     run_rows, run_dt = _latest_run_rows(log_path)
-    graded = _graded_summary(log_path)
-    if run_dt is not None:
-        slate_date = run_dt.strftime("%A, %b %d, %Y")
-        last_updated = run_dt.isoformat()
-    else:
-        today = datetime.now()
-        slate_date = today.strftime("%A, %b %d, %Y")
-        last_updated = today.isoformat()
-    st.write(f"Slate Date: {slate_date}")
-    st.caption(f"Last updated: {last_updated}")
-    y_w = int(graded.get("yesterday_wins", 0) or 0)
-    y_l = int(graded.get("yesterday_losses", 0) or 0)
-    y_p = int(graded.get("yesterday_pushes", 0) or 0)
-    y_wr = graded.get("yesterday_win_rate")
-    y_text = f"{y_w}-{y_l}"
-    if y_p > 0:
-        y_text = f"{y_text}-{y_p}"
-    y_delta = f"{(y_wr * 100.0):.1f}% win rate" if isinstance(y_wr, float) else "No graded bets yesterday"
+    metrics = _compute_record_blocks(log_path)
 
-    s_w = int(graded.get("ytd_wins", 0) or 0)
-    s_l = int(graded.get("ytd_losses", 0) or 0)
-    s_p = int(graded.get("ytd_pushes", 0) or 0)
-    s_wr = graded.get("ytd_win_rate")
-    s_text = f"{s_w}-{s_l}"
-    if s_p > 0:
-        s_text = f"{s_text}-{s_p}"
-    s_delta = f"{(s_wr * 100.0):.1f}% win rate" if isinstance(s_wr, float) else "No graded bets YTD"
+    ml_rows, ou_rows = _build_tables_from_public(board_games)
+    if not ou_rows and run_rows:
+        ou_rows = _build_totals_from_log_rows(run_rows)
 
-    st.caption(f"Yesterday (graded): {y_text} ({y_delta})   |   YTD (graded): {s_text} ({s_delta})")
+    shown_dt = board_dt or run_dt or datetime.now()
+    st.write(f"Slate Date: {shown_dt.strftime('%A, %b %d, %Y')}")
+    st.caption(f"Last updated: {shown_dt.isoformat()}")
 
-    if run_rows:
-        table_rows: List[Dict[str, object]] = []
-        for row in run_rows:
-            away, home = _split_matchup(row.get("matchup", ""))
-            side = str(row.get("side") or "").strip().upper()
-            action = str(row.get("action") or "").strip().upper()
-            line = _safe_float(row.get("line", ""))
-            pred_total = _safe_float(row.get("pred_total", ""))
-            edge = _safe_float(row.get("edge", ""))
-            confidence = _safe_float(row.get("confidence", ""))
-            conf_pct = None
-            if confidence is not None:
-                conf_pct = confidence * 100.0 if confidence <= 1.0 else confidence
-            table_rows.append({
-                "Away": away,
-                "Home": home,
-                "Line": round(line, 2) if line is not None else None,
-                "Model": round(pred_total, 2) if pred_total is not None else None,
-                "Pick": side or "—",
-                "Edge": round(edge, 2) if edge is not None else None,
-                "Confidence": round(conf_pct, 1) if conf_pct is not None else None,
-                "_action": action,
-                "_edge_abs": abs(edge) if edge is not None else -1.0,
-            })
-        table_rows.sort(key=lambda r: str(r.get("Away") or ""))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Moneyline Prev Week", metrics["ml_prev"][0], metrics["ml_prev"][1])
+    c2.metric("Moneyline YTD", metrics["ml_ytd"][0], metrics["ml_ytd"][1])
+    c3.metric("Totals Prev Week", metrics["tot_prev"][0], metrics["tot_prev"][1])
+    c4.metric("Totals YTD", metrics["tot_ytd"][0], metrics["tot_ytd"][1])
 
-        if pd is not None:
-            full_rows = [{k: v for k, v in row.items() if not k.startswith("_")} for row in table_rows]
-            frame = pd.DataFrame(full_rows)
-            if not frame.empty:
-                for col in ("Line", "Model", "Edge", "Confidence"):
-                    if col in frame.columns:
-                        frame[col] = frame[col].map(lambda x: f"{x:.1f}" if isinstance(x, (int, float)) else x)
-            st.markdown("### Full Slate")
-            try:
-                styled = frame.style.map(_style_pick_cell, subset=["Pick"])
-                styled = styled.map(_style_edge_cell, subset=["Edge"])
-                styled = styled.map(_style_conf_cell, subset=["Confidence"])
-            except Exception:
-                styled = frame.style.applymap(_style_pick_cell, subset=["Pick"])
-                styled = styled.applymap(_style_edge_cell, subset=["Edge"])
-                styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+    week_label = f"Week {shown_dt.isocalendar()[1]}"
+    st.selectbox("Week", options=[week_label], index=0, disabled=True)
+    st.caption(f"Slate: {week_label}")
 
-            top_rows = [row for row in table_rows if str(row.get("_action", "")).upper() == "BET"]
-            if not top_rows:
-                top_rows = sorted(table_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)[:5]
-            else:
-                top_rows = sorted(top_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)
-            top_rows_clean = [{k: v for k, v in row.items() if not k.startswith("_")} for row in top_rows]
-            top_frame = pd.DataFrame(top_rows_clean)
-            if not top_frame.empty:
-                for col in ("Line", "Model", "Edge", "Confidence"):
-                    if col in top_frame.columns:
-                        top_frame[col] = top_frame[col].map(lambda x: f"{x:.1f}" if isinstance(x, (int, float)) else x)
-            st.markdown("### Top Plays")
-            try:
-                top_styled = top_frame.style.map(_style_pick_cell, subset=["Pick"])
-                top_styled = top_styled.map(_style_edge_cell, subset=["Edge"])
-                top_styled = top_styled.map(_style_conf_cell, subset=["Confidence"])
-            except Exception:
-                top_styled = top_frame.style.applymap(_style_pick_cell, subset=["Pick"])
-                top_styled = top_styled.applymap(_style_edge_cell, subset=["Edge"])
-                top_styled = top_styled.applymap(_style_conf_cell, subset=["Confidence"])
-            st.dataframe(top_styled, use_container_width=True, hide_index=True)
-        else:
-            full_rows = [{k: v for k, v in row.items() if not k.startswith("_")} for row in table_rows]
-            st.markdown("### Full Slate")
-            st.dataframe(full_rows, use_container_width=True, hide_index=True)
-            top_rows = [row for row in table_rows if str(row.get("_action", "")).upper() == "BET"]
-            if not top_rows:
-                top_rows = sorted(table_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)[:5]
-            else:
-                top_rows = sorted(top_rows, key=lambda r: r.get("_edge_abs", -1.0), reverse=True)
-            top_rows_clean = [{k: v for k, v in row.items() if not k.startswith("_")} for row in top_rows]
-            st.markdown("### Top Plays")
-            st.dataframe(top_rows_clean, use_container_width=True, hide_index=True)
-    else:
-        st.info("No top plays available yet.")
+    tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
+    with tab_ml:
+        _render_table(ml_rows, "Full Slate")
+        top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
+        _render_table(top_ml, "Top Plays")
+    with tab_ou:
+        _render_table(ou_rows, "Full Slate")
+        top_ou = sorted(ou_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
+        _render_table(top_ou, "Top Plays")
 
 
 if __name__ == "__main__":
