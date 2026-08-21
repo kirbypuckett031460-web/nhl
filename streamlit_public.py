@@ -29,6 +29,9 @@ DARK_MODE_CSS = """
   gap: 0.25rem;
   border-bottom: 1px solid #27324c;
 }
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+  background-color: #ff4b4b !important;
+}
 [data-testid="stTabs"] [data-baseweb="tab"] {
   font-size: 0.78rem !important;
   color: #f8fafc !important;
@@ -42,7 +45,8 @@ DARK_MODE_CSS = """
   color: inherit !important;
   font-weight: 600 !important;
 }
-[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"],
+[data-testid="stTabs"] button[aria-selected="true"] {
   color: #ff4b4b !important;
   border-bottom-color: #ff4b4b !important;
 }
