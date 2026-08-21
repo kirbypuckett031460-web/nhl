@@ -421,11 +421,13 @@ def render_public_app() -> None:
     with tab_ml:
         _render_table(ml_rows)
         top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
-        _render_table(top_ml, "Top Plays", f"Last updated: {last_updated_et}")
+        _render_table(top_ml, "Top Plays")
     with tab_ou:
         _render_table(ou_rows)
         top_ou = sorted(ou_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
-        _render_table(top_ou, "Top Plays", f"Last updated: {last_updated_et}")
+        _render_table(top_ou, "Top Plays")
+
+    st.caption(f"Last updated: {last_updated_et}")
 
 
 if __name__ == "__main__":
