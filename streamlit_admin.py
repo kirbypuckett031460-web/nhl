@@ -30,6 +30,17 @@ def _read_streamlit_secret(name: str) -> str:
             return ""
 
 
+def _read_first_secret_or_env(keys: List[str]) -> str:
+    for key in keys:
+        val = _read_streamlit_secret(key)
+        if val:
+            return val
+        env_val = str(os.getenv(key, "")).strip()
+        if env_val:
+            return env_val
+    return ""
+
+
 def _secret_plain_passphrase() -> str:
     return _read_streamlit_secret("ADMIN_PASSPHRASE") or str(os.getenv("ADMIN_PASSPHRASE", "")).strip()
 
@@ -284,7 +295,8 @@ def render_admin_app() -> None:
         inferred_repo = _infer_github_repo_from_git_remote()
         default_repo = _read_streamlit_secret("GITHUB_REPO") or str(os.getenv("GITHUB_REPOSITORY", "")).strip() or inferred_repo
         default_branch = _read_streamlit_secret("GITHUB_BRANCH") or str(os.getenv("GITHUB_BRANCH", "main")).strip()
-        default_push_token = _read_streamlit_secret("GITHUB_PUSH_TOKEN") or str(os.getenv("GITHUB_PUSH_TOKEN", "")).strip()
+        token_keys = ["GITHUB_PUSH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        default_push_token = _read_first_secret_or_env(token_keys)
         github_repo = st.text_input("GitHub repo (owner/name)", value=default_repo, help="Example: kirbypuckett031460-web/nhl")
         github_branch = st.text_input("GitHub branch", value=default_branch or "main")
         push_token_override = st.text_input("GitHub push token override (optional)", value="", type="password")
@@ -293,9 +305,9 @@ def render_admin_app() -> None:
             value="chore(admin): refresh public app outputs [skip ci]",
         )
         if default_push_token:
-            st.caption("Default GitHub push token loaded from Streamlit secrets/env.")
+            st.caption("Default GitHub push token detected from secrets/env.")
         else:
-            st.caption("Set `GITHUB_PUSH_TOKEN` in secrets/env (or use override) to enable publishing.")
+            st.caption("Set `GITHUB_PUSH_TOKEN` (or `GITHUB_TOKEN` / `GH_TOKEN`) in secrets/env, or use override, to enable publishing.")
 
     run_clicked = st.button("Run Model", type="primary")
 
