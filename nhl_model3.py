@@ -9233,6 +9233,85 @@ class RealDataNHLModel:
         
         print(f"🏒 Looking for games on {today}...")
 
+        def _odds_api_schedule_fallback(date_str: str) -> List[Dict[str, Any]]:
+            """Build a slate from Odds API events when NHL schedule APIs are unavailable."""
+            api_key = str(os.getenv('ODDS_API_KEY', '') or '').strip()
+            if not api_key:
+                try:
+                    with open('social_config.json', 'r', encoding='utf-8') as fh:
+                        cfg = json.load(fh)
+                    api_key = str((cfg.get('odds') or {}).get('api_key') or '').strip()
+                except Exception:
+                    api_key = ''
+            if not api_key:
+                return []
+
+            try:
+                target_day = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except Exception:
+                return []
+
+            alias_map = self._get_team_alias_map()
+
+            def resolve_abbr(raw_name: Any) -> str:
+                raw = str(raw_name or '').strip()
+                if not raw:
+                    return 'TBD'
+                abbr = alias_map.get(self._normalize_team_key(raw))
+                if abbr:
+                    return abbr
+                return raw.upper()[:3]
+
+            regions = str(os.getenv('ODDS_REGIONS', 'us') or 'us').strip() or 'us'
+            params = {
+                'apiKey': api_key,
+                'regions': regions,
+                'markets': 'h2h',
+                'oddsFormat': 'american',
+                'bookmakers': 'fanduel',
+            }
+            url = 'https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds'
+            try:
+                response = requests.get(url, params=params, timeout=25)
+                response.raise_for_status()
+                events = response.json()
+            except Exception as exc:
+                print(f"⚠️  Odds API schedule fallback failed: {exc}")
+                return []
+
+            rows: List[Dict[str, Any]] = []
+            for idx, event in enumerate(events if isinstance(events, list) else []):
+                try:
+                    commence = pd.to_datetime(event.get('commence_time'), utc=True, errors='coerce')
+                    if pd.isna(commence):
+                        continue
+                    try:
+                        local_ts = commence.tz_convert(schedule_tz)
+                    except Exception:
+                        local_ts = commence
+                    if local_ts.date() != target_day:
+                        continue
+                    home_raw = event.get('home_team')
+                    away_raw = event.get('away_team')
+                    home_abbr = resolve_abbr(home_raw)
+                    away_abbr = resolve_abbr(away_raw)
+                    rows.append({
+                        'game_id': str(event.get('id') or f'odds_{idx}'),
+                        'date': local_ts,
+                        'home_team': home_abbr,
+                        'away_team': away_abbr,
+                        'venue': f"{home_abbr} Arena",
+                        'home_goals': np.nan,
+                        'away_goals': np.nan,
+                        'total_goals': np.nan,
+                    })
+                except Exception:
+                    continue
+
+            if rows:
+                print(f"✅ Built slate from Odds API fallback: {len(rows)} game(s) on {date_str}")
+            return rows
+
         # Offline path first if demanded
         if offline_only and offline_path and os.path.exists(offline_path):
             try:
@@ -9259,8 +9338,9 @@ class RealDataNHLModel:
         
         if not games:
             print("ℹ️  No NHL games found today from API")
+            base_dt = datetime.strptime(today, '%Y-%m-%d')
             for days_ahead in range(1, 4):
-                future_date = (datetime.now() + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
+                future_date = (base_dt + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
                 future_games = self.data_fetcher.get_schedule(future_date, future_date)
                 if future_games:
                     print(f"📅 Found games {days_ahead} days ahead on {future_date}")
@@ -9334,6 +9414,11 @@ class RealDataNHLModel:
                     print(f"✅ Loaded {len(todays_games)} offline games from {offline_path}")
             except Exception as e:
                 print(f"⚠️  Failed to load offline games fallback from {offline_path}: {e}")
+
+        if not todays_games and not offline_only:
+            odds_rows = _odds_api_schedule_fallback(today)
+            if odds_rows:
+                todays_games.extend(odds_rows)
 
         if not todays_games:
             print("📝 No upcoming games found. Creating sample matchups for demonstration...")
