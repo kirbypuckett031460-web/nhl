@@ -51,7 +51,16 @@ For Streamlit Cloud deployment:
 4. Set secrets:
    - `ODDS_API_KEY = "your_key"` (optional, for realtime odds)
    - `ADMIN_PASSPHRASE = "your_admin_passphrase"` (required for admin app)
+   - `GITHUB_REPO = "owner/repo"` (recommended for admin publish, e.g. `kirbypuckett031460-web/nhl`)
+   - `GITHUB_BRANCH = "main"` (recommended for admin publish target)
+   - `GITHUB_PUSH_TOKEN = "github_pat_..."` (required if you want admin runs to publish outputs to GitHub)
 5. The repo includes `runtime.txt` (`python-3.12`) to keep Cloud dependency installs stable.
+
+Admin publish behavior:
+
+- The admin app can now auto-publish run artifacts to GitHub after a successful run.
+- Publish writes `public_predictions.json`, `bets_log.csv`, `predictions.png`, and `nhl_real_data_dashboard.html` by default.
+- This is what lets the public app (which reads repo-backed data) refresh with new results.
 
 GitHub CI automation (no local runs required)
 --------------------------------------------

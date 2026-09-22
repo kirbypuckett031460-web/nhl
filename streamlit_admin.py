@@ -3,9 +3,10 @@ import hmac
 import os
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -97,6 +98,104 @@ def _run_command(command: List[str], env_overrides: Dict[str, str]) -> Tuple[int
     return exit_code, "\n".join(output_lines)
 
 
+def _publish_outputs_to_github(
+    repo: str,
+    branch: str,
+    token: str,
+    files_to_publish: List[str],
+    commit_message: str,
+) -> Tuple[bool, str, Dict[str, object]]:
+    details: Dict[str, object] = {
+        "repo": "",
+        "branch": "",
+        "published_files": [],
+        "commit_sha": "",
+        "commit_url": "",
+        "committed_new_changes": False,
+        "pushed": False,
+    }
+    repo = str(repo or "").strip().strip("/")
+    branch = str(branch or "").strip() or "main"
+    token = str(token or "").strip()
+    details["repo"] = repo
+    details["branch"] = branch
+    if not repo:
+        return False, "GitHub repo is required (example: owner/name).", details
+    if not token:
+        return False, "GitHub push token is required to publish outputs.", details
+
+    rel_files: List[str] = []
+    for item in files_to_publish:
+        rel = str(item or "").strip().lstrip("/")
+        if not rel:
+            continue
+        abs_path = APP_ROOT / rel
+        if abs_path.exists():
+            rel_files.append(rel)
+    details["published_files"] = rel_files
+    if not rel_files:
+        return False, "No output files found to publish.", details
+
+    def _run_git(args: List[str]) -> Tuple[int, str]:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(APP_ROOT),
+            text=True,
+            capture_output=True,
+        )
+        text = "\n".join(part for part in [proc.stdout, proc.stderr] if part).strip()
+        return proc.returncode, text
+
+    rc, out = _run_git(["add", "--", *rel_files])
+    if rc != 0:
+        return False, f"git add failed:\n{out or '(no output)'}", details
+
+    rc, _ = _run_git(["diff", "--cached", "--quiet"])
+    head_rc, head_out = _run_git(["rev-parse", "HEAD"])
+    if head_rc == 0:
+        head_sha = str(head_out).splitlines()[-1].strip()
+        details["commit_sha"] = head_sha
+        if repo and head_sha:
+            details["commit_url"] = f"https://github.com/{repo}/commit/{head_sha}"
+    if rc == 0:
+        return True, "No new output changes to publish.", details
+
+    commit_msg = str(commit_message or "").strip()
+    if not commit_msg:
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        commit_msg = f"chore(admin): refresh public outputs ({now_utc})"
+
+    rc, out = _run_git(["commit", "-m", commit_msg])
+    if rc != 0:
+        return False, f"git commit failed:\n{out or '(no output)'}", details
+    details["committed_new_changes"] = True
+
+    head_rc, head_out = _run_git(["rev-parse", "HEAD"])
+    if head_rc == 0:
+        head_sha = str(head_out).splitlines()[-1].strip()
+        details["commit_sha"] = head_sha
+        if repo and head_sha:
+            details["commit_url"] = f"https://github.com/{repo}/commit/{head_sha}"
+
+    safe_token = quote(token, safe="")
+    remote_url = f"https://x-access-token:{safe_token}@github.com/{repo}.git"
+    push = subprocess.run(
+        ["git", "push", remote_url, f"HEAD:{branch}"],
+        cwd=str(APP_ROOT),
+        text=True,
+        capture_output=True,
+    )
+    push_out = "\n".join(part for part in [push.stdout, push.stderr] if part).strip()
+    if token:
+        push_out = push_out.replace(token, "[REDACTED]")
+    if safe_token:
+        push_out = push_out.replace(safe_token, "[REDACTED]")
+    if push.returncode != 0:
+        return False, f"git push failed:\n{push_out or '(no output)'}", details
+    details["pushed"] = True
+    return True, f"Published {len(rel_files)} file(s) to {repo}@{branch}.", details
+
+
 def render_admin_app() -> None:
     st.set_page_config(page_title="NHL O/U Admin Runner", layout="wide")
     st.title("NHL Over/Under Admin")
@@ -149,6 +248,23 @@ def render_admin_app() -> None:
 
         log_bets = st.checkbox("Log bets", value=True)
         log_path = st.text_input("Bets log path", value="bets_log.csv")
+
+        st.subheader("Publish")
+        publish_to_github = st.checkbox("Publish outputs to GitHub after successful run", value=True)
+        default_repo = _read_streamlit_secret("GITHUB_REPO") or str(os.getenv("GITHUB_REPOSITORY", "")).strip()
+        default_branch = _read_streamlit_secret("GITHUB_BRANCH") or str(os.getenv("GITHUB_BRANCH", "main")).strip()
+        default_push_token = _read_streamlit_secret("GITHUB_PUSH_TOKEN") or str(os.getenv("GITHUB_PUSH_TOKEN", "")).strip()
+        github_repo = st.text_input("GitHub repo (owner/name)", value=default_repo, help="Example: kirbypuckett031460-web/nhl")
+        github_branch = st.text_input("GitHub branch", value=default_branch or "main")
+        push_token_override = st.text_input("GitHub push token override (optional)", value="", type="password")
+        publish_commit_message = st.text_input(
+            "Publish commit message",
+            value="chore(admin): refresh public app outputs [skip ci]",
+        )
+        if default_push_token:
+            st.caption("Default GitHub push token loaded from Streamlit secrets/env.")
+        else:
+            st.caption("Set `GITHUB_PUSH_TOKEN` in secrets/env (or use override) to enable publishing.")
 
     run_clicked = st.button("Run Model", type="primary")
 
@@ -212,6 +328,43 @@ def render_admin_app() -> None:
         st.success("Model run completed successfully.")
     else:
         st.error(f"Model run failed with exit code {rc}.")
+
+    if rc == 0 and publish_to_github:
+        effective_push_token = push_token_override.strip() or default_push_token
+        publish_files = [
+            "public_predictions.json",
+            log_path.strip() or "bets_log.csv",
+            "predictions.png",
+            "nhl_real_data_dashboard.html",
+        ]
+        with st.spinner("Publishing outputs to GitHub..."):
+            ok, msg, publish_details = _publish_outputs_to_github(
+                repo=github_repo,
+                branch=github_branch,
+                token=effective_push_token,
+                files_to_publish=publish_files,
+                commit_message=publish_commit_message,
+            )
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+        repo_used = str(publish_details.get("repo") or github_repo or "").strip()
+        branch_used = str(publish_details.get("branch") or github_branch or "main").strip()
+        commit_sha = str(publish_details.get("commit_sha") or "").strip()
+        commit_url = str(publish_details.get("commit_url") or "").strip()
+        published_files = publish_details.get("published_files") or []
+        if not isinstance(published_files, list):
+            published_files = []
+        st.markdown("#### Publish status")
+        st.caption(f"Target: `{repo_used}@{branch_used}`")
+        if commit_sha:
+            st.code(commit_sha, language="text")
+            if commit_url:
+                st.markdown(f"[View commit on GitHub]({commit_url})")
+        if published_files:
+            st.caption("Files considered for publish:")
+            st.code("\n".join(str(v) for v in published_files), language="text")
 
     st.subheader("Artifacts")
     predictions_image = APP_ROOT / "predictions.png"
