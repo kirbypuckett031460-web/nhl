@@ -40,6 +40,7 @@ DARK_MODE_CSS = """
 }
 [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
   background-color: #ff4b4b !important;
+  height: 2px !important;
 }
 [data-testid="stTabs"] [data-baseweb="tab"] {
   font-size: 0.78rem !important;
@@ -58,6 +59,12 @@ DARK_MODE_CSS = """
 [data-testid="stTabs"] button[aria-selected="true"] {
   color: #ff4b4b !important;
   border-bottom-color: #ff4b4b !important;
+  box-shadow: inset 0 -2px 0 #ff4b4b !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p,
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] span,
+[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] p {
+  color: #ff4b4b !important;
 }
 [data-testid="stMetric"] {
   background-color: #111827;
