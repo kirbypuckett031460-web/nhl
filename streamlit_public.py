@@ -1,9 +1,12 @@
 import csv
+import io
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -86,6 +89,67 @@ DARK_MODE_CSS = """
 """
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
+def _raw_data_url(path_name: str) -> Optional[str]:
+    base_url = str(os.getenv("PUBLIC_DATA_BASE_URL", "")).strip().rstrip("/")
+    if base_url:
+        return f"{base_url}/{path_name.lstrip('/')}"
+    repo = str(os.getenv("PUBLIC_DATA_REPO", "kirbypuckett031460-web/nhl")).strip().strip("/")
+    branch = str(os.getenv("PUBLIC_DATA_BRANCH", "main")).strip() or "main"
+    if not repo:
+        return None
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path_name.lstrip('/')}"
+
+
+def _fetch_remote_text(path_name: str) -> Optional[str]:
+    if not _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True):
+        return None
+    url = _raw_data_url(path_name)
+    if not url:
+        return None
+    nonce = int(time.time())
+    connector = "&" if "?" in url else "?"
+    final_url = f"{url}{connector}cb={nonce}"
+    request = Request(
+        final_url,
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "User-Agent": "nhl-streamlit-public/1.0",
+        },
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = response.read()
+        return payload.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def _read_log_rows(log_path: Path, prefer_remote: bool = False) -> List[Dict[str, str]]:
+    if prefer_remote:
+        remote_text = _fetch_remote_text(log_path.name)
+        if remote_text:
+            try:
+                reader = csv.DictReader(io.StringIO(remote_text))
+                rows = [dict(r) for r in reader]
+                if rows:
+                    return rows
+            except Exception:
+                pass
+    if not log_path.exists():
+        return []
+    with log_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        return [dict(r) for r in reader]
+
+
 def _parse_logged_datetime(raw_value: str) -> datetime:
     raw = str(raw_value or "").strip()
     if not raw:
@@ -139,14 +203,13 @@ def _fmt_american(value: Optional[int]) -> str:
     return f"{value:+d}" if value > 0 else str(value)
 
 
-def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[datetime]]:
-    if not log_path.exists():
+def _latest_run_rows(log_path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, str]], Optional[datetime]]:
+    source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote)
+    if not source_rows:
         return [], None
     rows: List[Tuple[datetime, Dict[str, str]]] = []
-    with log_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            rows.append((_parse_logged_datetime(row.get("date", "")), row))
+    for row in source_rows:
+        rows.append((_parse_logged_datetime(row.get("date", "")), row))
     if not rows:
         return [], None
     latest_dt = max(dt for dt, _ in rows)
@@ -157,22 +220,21 @@ def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[dat
 
 def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
     """Return latest per-game graded record summary for admin metric display."""
-    if not log_path.exists():
+    source_rows = _read_log_rows(log_path, prefer_remote=False)
+    if not source_rows:
         return None
 
     latest_by_game: Dict[str, Dict[str, str]] = {}
     latest_dt_by_game: Dict[str, datetime] = {}
-    with log_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            game_id = str(row.get("game_id") or "").strip()
-            if not game_id:
-                continue
-            dt = _parse_logged_datetime(row.get("date", ""))
-            prev_dt = latest_dt_by_game.get(game_id)
-            if prev_dt is None or dt >= prev_dt:
-                latest_dt_by_game[game_id] = dt
-                latest_by_game[game_id] = row
+    for row in source_rows:
+        game_id = str(row.get("game_id") or "").strip()
+        if not game_id:
+            continue
+        dt = _parse_logged_datetime(row.get("date", ""))
+        prev_dt = latest_dt_by_game.get(game_id)
+        if prev_dt is None or dt >= prev_dt:
+            latest_dt_by_game[game_id] = dt
+            latest_by_game[game_id] = row
 
     wins = losses = pushes = 0
     for row in latest_by_game.values():
@@ -196,11 +258,19 @@ def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
     }
 
 
-def _read_public_predictions(path: Path) -> Tuple[List[Dict[str, object]], Optional[datetime]]:
-    if not path.exists():
-        return [], None
+def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, object]], Optional[datetime]]:
+    payload_text: Optional[str] = None
+    if prefer_remote:
+        payload_text = _fetch_remote_text(path.name)
+    if not payload_text:
+        if not path.exists():
+            return [], None
+        try:
+            payload_text = path.read_text(encoding="utf-8")
+        except Exception:
+            return [], None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(payload_text)
     except Exception:
         return [], None
     games = payload.get("games")
@@ -213,7 +283,7 @@ def _read_public_predictions(path: Path) -> Tuple[List[Dict[str, object]], Optio
     return [g for g in games if isinstance(g, dict)], generated_dt
 
 
-def _compute_record_blocks(log_path: Path) -> Dict[str, Tuple[str, str]]:
+def _compute_record_blocks(log_path: Path, prefer_remote: bool = False) -> Dict[str, Tuple[str, str]]:
     season_start_raw = str(os.getenv("NHL_SEASON_START", "2025-10-07")).strip() or "2025-10-07"
     try:
         season_start = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
@@ -227,34 +297,33 @@ def _compute_record_blocks(log_path: Path) -> Dict[str, Tuple[str, str]]:
         "tot_prev": [0, 0],
         "tot_ytd": [0, 0],
     }
-    if not log_path.exists():
+    source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote)
+    if not source_rows:
         return {
             "ml_prev": ("0-0", "+0.0%"),
             "ml_ytd": ("0-0", "+0.0%"),
             "tot_prev": ("0-0", "+0.0%"),
             "tot_ytd": ("0-0", "+0.0%"),
         }
-    with log_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            result = str(row.get("result") or "").strip().upper()
-            if result not in {"WIN", "LOSS"}:
-                continue
-            dt = _parse_logged_datetime(row.get("date", ""))
-            if dt == datetime.min:
-                continue
-            d = dt.date()
-            action = str(row.get("action") or "").strip().upper()
-            side = str(row.get("side") or "").strip().upper()
-            is_ml = ("ML" in action) or ("ML" in side) or (side in {"HOME", "AWAY", "HML", "AML"})
-            bucket = "ml" if is_ml else ("tot" if side in {"OVER", "UNDER"} else "")
-            if not bucket:
-                continue
-            idx = 0 if result == "WIN" else 1
-            if d >= season_start:
-                blocks[f"{bucket}_ytd"][idx] += 1
-            if prev_week_start <= d < today:
-                blocks[f"{bucket}_prev"][idx] += 1
+    for row in source_rows:
+        result = str(row.get("result") or "").strip().upper()
+        if result not in {"WIN", "LOSS"}:
+            continue
+        dt = _parse_logged_datetime(row.get("date", ""))
+        if dt == datetime.min:
+            continue
+        d = dt.date()
+        action = str(row.get("action") or "").strip().upper()
+        side = str(row.get("side") or "").strip().upper()
+        is_ml = ("ML" in action) or ("ML" in side) or (side in {"HOME", "AWAY", "HML", "AML"})
+        bucket = "ml" if is_ml else ("tot" if side in {"OVER", "UNDER"} else "")
+        if not bucket:
+            continue
+        idx = 0 if result == "WIN" else 1
+        if d >= season_start:
+            blocks[f"{bucket}_ytd"][idx] += 1
+        if prev_week_start <= d < today:
+            blocks[f"{bucket}_prev"][idx] += 1
 
     def _fmt(block: List[int]) -> Tuple[str, str]:
         wins, losses = int(block[0]), int(block[1])
@@ -482,13 +551,18 @@ def render_public_app() -> None:
     st.title("NHL Picks")
 
     if st.button("Refresh", type="secondary"):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
         st.rerun()
 
     log_path = APP_ROOT / "bets_log.csv"
     board_path = APP_ROOT / "public_predictions.json"
-    board_games, board_dt = _read_public_predictions(board_path)
-    run_rows, run_dt = _latest_run_rows(log_path)
-    metrics = _compute_record_blocks(log_path)
+    prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
+    board_games, board_dt = _read_public_predictions(board_path, prefer_remote=prefer_remote)
+    run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote)
+    metrics = _compute_record_blocks(log_path, prefer_remote=prefer_remote)
 
     ml_rows, ou_rows = _build_tables_from_public(board_games)
     if not ou_rows and run_rows:
