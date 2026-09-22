@@ -6,7 +6,7 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -96,6 +96,36 @@ def _run_command(command: List[str], env_overrides: Dict[str, str]) -> Tuple[int
         placeholder.code("\n".join(output_lines), language="bash")
     exit_code = proc.wait()
     return exit_code, "\n".join(output_lines)
+
+
+def _infer_github_repo_from_git_remote() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(APP_ROOT),
+            text=True,
+            capture_output=True,
+        )
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            return ""
+
+        # git@github.com:owner/repo.git
+        if raw.startswith("git@") and ":" in raw:
+            rhs = raw.split(":", 1)[1].strip()
+            rhs = rhs[:-4] if rhs.endswith(".git") else rhs
+            return rhs.strip("/")
+
+        # https://github.com/owner/repo.git (or with credentials)
+        parsed = urlparse(raw)
+        host = (parsed.netloc or "").lower()
+        if "github.com" in host:
+            path = (parsed.path or "").strip("/")
+            path = path[:-4] if path.endswith(".git") else path
+            return path
+    except Exception:
+        return ""
+    return ""
 
 
 def _publish_outputs_to_github(
@@ -251,7 +281,8 @@ def render_admin_app() -> None:
 
         st.subheader("Publish")
         publish_to_github = st.checkbox("Publish outputs to GitHub after successful run", value=True)
-        default_repo = _read_streamlit_secret("GITHUB_REPO") or str(os.getenv("GITHUB_REPOSITORY", "")).strip()
+        inferred_repo = _infer_github_repo_from_git_remote()
+        default_repo = _read_streamlit_secret("GITHUB_REPO") or str(os.getenv("GITHUB_REPOSITORY", "")).strip() or inferred_repo
         default_branch = _read_streamlit_secret("GITHUB_BRANCH") or str(os.getenv("GITHUB_BRANCH", "main")).strip()
         default_push_token = _read_streamlit_secret("GITHUB_PUSH_TOKEN") or str(os.getenv("GITHUB_PUSH_TOKEN", "")).strip()
         github_repo = st.text_input("GitHub repo (owner/name)", value=default_repo, help="Example: kirbypuckett031460-web/nhl")
@@ -331,24 +362,44 @@ def render_admin_app() -> None:
 
     if rc == 0 and publish_to_github:
         effective_push_token = push_token_override.strip() or default_push_token
+        effective_repo = (github_repo or "").strip()
+        effective_branch = (github_branch or "").strip() or "main"
         publish_files = [
             "public_predictions.json",
             log_path.strip() or "bets_log.csv",
             "predictions.png",
             "nhl_real_data_dashboard.html",
         ]
-        with st.spinner("Publishing outputs to GitHub..."):
-            ok, msg, publish_details = _publish_outputs_to_github(
-                repo=github_repo,
-                branch=github_branch,
-                token=effective_push_token,
-                files_to_publish=publish_files,
-                commit_message=publish_commit_message,
-            )
-        if ok:
-            st.success(msg)
+        publish_details: Dict[str, object] = {
+            "repo": effective_repo,
+            "branch": effective_branch,
+            "published_files": publish_files,
+            "commit_sha": "",
+            "commit_url": "",
+            "committed_new_changes": False,
+            "pushed": False,
+        }
+        if not effective_repo:
+            ok = False
+            msg = "Publish skipped: GitHub repo is not configured. Set GITHUB_REPO or fill the field."
+            st.warning(msg)
+        elif not effective_push_token:
+            ok = False
+            msg = "Publish skipped: GitHub push token is not configured. Set GITHUB_PUSH_TOKEN or provide override."
+            st.warning(msg)
         else:
-            st.error(msg)
+            with st.spinner("Publishing outputs to GitHub..."):
+                ok, msg, publish_details = _publish_outputs_to_github(
+                    repo=effective_repo,
+                    branch=effective_branch,
+                    token=effective_push_token,
+                    files_to_publish=publish_files,
+                    commit_message=publish_commit_message,
+                )
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
         repo_used = str(publish_details.get("repo") or github_repo or "").strip()
         branch_used = str(publish_details.get("branch") or github_branch or "main").strip()
         commit_sha = str(publish_details.get("commit_sha") or "").strip()

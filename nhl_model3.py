@@ -10434,6 +10434,7 @@ def grade_bets_log(
         'log_path': log_path,
         'graded': 0,
         'skipped': 0,
+        'skipped_synthetic': 0,
         'ungraded_before': 0,
         'ungraded_after': 0,
         'written_path': None,
@@ -10660,6 +10661,10 @@ def grade_bets_log(
     line = pd.to_numeric(df_log.get('line'), errors='coerce')
     result_raw = df_log[result_col]
     result_norm = result_raw.astype(str).str.strip().str.upper()
+    if 'game_id' in df_log.columns:
+        game_id_series = df_log['game_id'].apply(_norm_game_id)
+    else:
+        game_id_series = pd.Series('', index=df_log.index)
 
     ungraded_tokens = {'', 'NAN', 'NONE', 'NULL', 'UNGRADED', '—', '-', 'NA'}
     ungraded_mask = result_raw.isna() | result_norm.isin(ungraded_tokens)
@@ -10670,7 +10675,10 @@ def grade_bets_log(
         | side.str.contains('ML')
         | side.isin({'HOME', 'AWAY', 'HML', 'AML'})
     )
-    candidate_mask = ungraded_mask & actionable_mask & ~ml_row_mask
+    synthetic_prefixes = ('DEMO_', 'OFFLINE_', 'SAMPLE_')
+    synthetic_id_mask = game_id_series.astype(str).str.upper().str.startswith(synthetic_prefixes)
+    candidate_mask = ungraded_mask & actionable_mask & ~ml_row_mask & ~synthetic_id_mask
+    summary['skipped_synthetic'] = int((ungraded_mask & actionable_mask & ~ml_row_mask & synthetic_id_mask).sum())
     summary['ungraded_before'] = int(candidate_mask.sum())
 
     # Parse bet dates and matchup strings now (used for both matching and picking a sufficient history window).
@@ -10770,10 +10778,6 @@ def grade_bets_log(
             matchup_date_to_total[key] = float(row['total_goals'])
 
     date_only = bet_date_only
-    if 'game_id' in df_log.columns:
-        game_id_series = df_log['game_id'].apply(_norm_game_id)
-    else:
-        game_id_series = pd.Series('', index=df_log.index)
 
     graded = 0
     skipped = 0
@@ -10886,6 +10890,8 @@ def grade_bets_log(
             f"matched_by_game_id={matched_by_gid} matched_by_matchup_date={matched_by_matchup_date} "
             f"skipped_unmatched={skipped} history_days_back={days_back_required}"
         )
+        if summary.get('skipped_synthetic'):
+            print(f"ℹ️  Grade summary: skipped synthetic/demo rows={summary['skipped_synthetic']}")
         if examples_unmatched:
             print("ℹ️  Example unmatched rows (up to 6):")
             for ex in examples_unmatched:
