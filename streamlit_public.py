@@ -145,6 +145,47 @@ def _latest_run_rows(log_path: Path) -> Tuple[List[Dict[str, str]], Optional[dat
     return [r for dt, r in rows if dt == latest_dt], latest_dt
 
 
+def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
+    """Return latest per-game graded record summary for admin metric display."""
+    if not log_path.exists():
+        return None
+
+    latest_by_game: Dict[str, Dict[str, str]] = {}
+    latest_dt_by_game: Dict[str, datetime] = {}
+    with log_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            game_id = str(row.get("game_id") or "").strip()
+            if not game_id:
+                continue
+            dt = _parse_logged_datetime(row.get("date", ""))
+            prev_dt = latest_dt_by_game.get(game_id)
+            if prev_dt is None or dt >= prev_dt:
+                latest_dt_by_game[game_id] = dt
+                latest_by_game[game_id] = row
+
+    wins = losses = pushes = 0
+    for row in latest_by_game.values():
+        result = str(row.get("result") or "").strip().upper()
+        if result == "WIN":
+            wins += 1
+        elif result == "LOSS":
+            losses += 1
+        elif result == "PUSH":
+            pushes += 1
+
+    decided = wins + losses
+    if decided <= 0:
+        return None
+    return {
+        "games": len(latest_by_game),
+        "wins": wins,
+        "losses": losses,
+        "pushes": pushes,
+        "win_rate": wins / decided,
+    }
+
+
 def _read_public_predictions(path: Path) -> Tuple[List[Dict[str, object]], Optional[datetime]]:
     if not path.exists():
         return [], None
