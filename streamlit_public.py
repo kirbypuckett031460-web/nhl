@@ -23,7 +23,11 @@ APP_ROOT = Path(__file__).resolve().parent
 
 DARK_MODE_CSS = """
 <style>
-[data-testid="stAppViewContainer"] { background-color: #0b1220; }
+[data-testid="stAppViewContainer"] {
+  background-color: #0b1220;
+  --primary-color: #ff4b4b !important;
+  --accent-color: #ff4b4b !important;
+}
 [data-testid="stHeader"] { background: transparent; }
 /* Hide Streamlit Cloud header links/actions (Fork + GitHub). */
 #MainMenu,
@@ -42,7 +46,8 @@ DARK_MODE_CSS = """
   background-color: #ff4b4b !important;
   height: 2px !important;
 }
-[data-testid="stTabs"] [data-baseweb="tab"] {
+[data-testid="stTabs"] [data-baseweb="tab"],
+[data-testid="stTabs"] button[role="tab"] {
   font-size: 0.78rem !important;
   color: #f8fafc !important;
   background: transparent !important;
@@ -65,6 +70,11 @@ DARK_MODE_CSS = """
 [data-testid="stTabs"] button[role="tab"][aria-selected="true"] span,
 [data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] p {
   color: #ff4b4b !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"]::after,
+[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"]::after {
+  background-color: #ff4b4b !important;
+  border-bottom-color: #ff4b4b !important;
 }
 [data-testid="stMetric"] {
   background-color: #111827;
