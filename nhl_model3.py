@@ -1714,7 +1714,8 @@ class RealDataNHLModel:
         self,
         days_back: int = 30,
         cache_path: Optional[str] = None,
-        force_refresh: bool = False
+        force_refresh: bool = False,
+        as_of_date: Optional[Any] = None
     ) -> pd.DataFrame:
         """Fetch historical games data with robust error handling and optional caching."""
         if cache_path and not force_refresh and os.path.exists(cache_path):
@@ -1726,9 +1727,22 @@ class RealDataNHLModel:
                     return cached
             except Exception as e:
                 print(f"⚠️  Failed to read historical cache {cache_path}: {e}")
-        print(f"Fetching historical games from last {days_back} days...")
-        
-        end_date = datetime.now()
+        resolved_as_of: Optional[date] = None
+        if isinstance(as_of_date, datetime):
+            resolved_as_of = as_of_date.date()
+        elif isinstance(as_of_date, date):
+            resolved_as_of = as_of_date
+        elif isinstance(as_of_date, str) and as_of_date.strip():
+            try:
+                resolved_as_of = datetime.strptime(as_of_date.strip(), '%Y-%m-%d').date()
+            except Exception:
+                resolved_as_of = None
+
+        end_date = datetime.combine(resolved_as_of, datetime.min.time()) if resolved_as_of else datetime.now()
+        if resolved_as_of:
+            print(f"Fetching historical games from last {days_back} days (as of {resolved_as_of.isoformat()})...")
+        else:
+            print(f"Fetching historical games from last {days_back} days...")
         start_date = end_date - timedelta(days=days_back)
         
         games = self.data_fetcher.get_schedule(
@@ -10406,7 +10420,8 @@ def grade_bets_log(
     historical_days: int = 90,
     historical_cache_path: Optional[str] = None,
     force_refresh: bool = False,
-    historical_frame: Optional[pd.DataFrame] = None
+    historical_frame: Optional[pd.DataFrame] = None,
+    historical_as_of_date: Optional[Any] = None
 ) -> Dict[str, Any]:
     """Grade/settle ungraded OVER/UNDER picks in a bets log.
 
@@ -10712,7 +10727,8 @@ def grade_bets_log(
             hist_df = model.fetch_historical_games(
                 days_back=int(days_back_required),
                 cache_path=historical_cache_path,
-                force_refresh=bool(force_refresh)
+                force_refresh=bool(force_refresh),
+                as_of_date=historical_as_of_date
             )
         except Exception as e:
             print(f"⚠️  Unable to fetch historical finals for grading: {e}")
@@ -12167,6 +12183,14 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 cache_path = cache_str or None
             force_cache_refresh = force_cache_refresh or bool(getattr(cli_args, 'historical_cache_refresh', False))
 
+        historical_as_of_date: Optional[date] = None
+        historical_as_of_arg = getattr(cli_args, 'date', None) if cli_args else None
+        if historical_as_of_arg:
+            try:
+                historical_as_of_date = datetime.strptime(str(historical_as_of_arg).strip(), '%Y-%m-%d').date()
+            except Exception:
+                historical_as_of_date = None
+
         if cli_args:
             max_samples_arg = getattr(cli_args, 'max_train_samples', 0) or 0
             if max_samples_arg and max_samples_arg > 0:
@@ -12290,7 +12314,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
         historical_data = model.fetch_historical_games(
             days_back=hist_days,
             cache_path=cache_path,
-            force_refresh=force_cache_refresh
+            force_refresh=force_cache_refresh,
+            as_of_date=historical_as_of_date
         )
         
         if len(historical_data) < 20:
@@ -12299,7 +12324,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             historical_data = model.fetch_historical_games(
                 days_back=extended_days,
                 cache_path=cache_path,
-                force_refresh=True
+                force_refresh=True,
+                as_of_date=historical_as_of_date
             )
         
         if len(historical_data) < 10:
@@ -12350,7 +12376,8 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     historical_days=hist_days,
                     historical_cache_path=cache_path,
                     force_refresh=False,
-                    historical_frame=historical_data
+                    historical_frame=historical_data,
+                    historical_as_of_date=historical_as_of_date
                 )
                 written = (grade_summary or {}).get('written_path')
                 if written:
