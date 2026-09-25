@@ -3,7 +3,7 @@ import io
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
@@ -284,7 +284,17 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
 
 
 def _compute_record_blocks(log_path: Path, prefer_remote: bool = False) -> Dict[str, Tuple[str, str]]:
-    season_start_raw = str(os.getenv("NHL_SEASON_START", "2025-10-07")).strip() or "2025-10-07"
+    season_start_raw = str(os.getenv("NHL_SEASON_START", "")).strip()
+    if not season_start_raw:
+        today_for_default = datetime.now().date()
+        current_year_start = date(today_for_default.year, 9, 29)
+        # During late off-season (Jul-Sep before opening day), track against the upcoming season start.
+        if today_for_default.month >= 7 and today_for_default < current_year_start:
+            season_start_raw = current_year_start.strftime("%Y-%m-%d")
+        elif today_for_default >= current_year_start:
+            season_start_raw = current_year_start.strftime("%Y-%m-%d")
+        else:
+            season_start_raw = date(today_for_default.year - 1, 9, 29).strftime("%Y-%m-%d")
     try:
         season_start = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
     except Exception:
@@ -298,7 +308,7 @@ def _compute_record_blocks(log_path: Path, prefer_remote: bool = False) -> Dict[
         "tot_ytd": [0, 0],
     }
     source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote)
-    if not source_rows:
+    if not source_rows or today < season_start:
         return {
             "ml_prev": ("0-0", "+0.0%"),
             "ml_ytd": ("0-0", "+0.0%"),
