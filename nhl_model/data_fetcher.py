@@ -137,32 +137,39 @@ class NHLDataFetcher:
                         if 'games' in data and isinstance(data['games'], list):
                             games_raw = data['games']
                         elif 'gameWeek' in data and isinstance(data['gameWeek'], list):
+                            # NHL schedule endpoint buckets games by local slate date in gameWeek[].date.
+                            # Use that day bucket directly so late games (e.g. 00:00Z) still remain on
+                            # the intended local date instead of being dropped by UTC-date filtering.
+                            selected: List[Dict] = []
                             for day in data['gameWeek']:
-                                games_raw.extend(day.get('games', []))
+                                day_date = str(day.get('date') or '').strip()
+                                if day_date == date_str:
+                                    selected = day.get('games', []) or []
+                                    break
+                            if selected:
+                                games_raw = selected
+                            else:
+                                for day in data['gameWeek']:
+                                    games_raw.extend(day.get('games', []))
                         elif 'dates' in data and isinstance(data['dates'], list):
+                            selected: List[Dict] = []
                             for entry in data['dates']:
-                                games_raw.extend(entry.get('games', []))
+                                day_date = str(entry.get('date') or '').strip()
+                                if day_date == date_str:
+                                    selected = entry.get('games', []) or []
+                                    break
+                            if selected:
+                                games_raw = selected
+                            else:
+                                for entry in data['dates']:
+                                    games_raw.extend(entry.get('games', []))
                     normalized = []
                     for raw_game in games_raw:
                         normalized_game = normalize_game(raw_game, expected_date=date_str)
                         if normalized_game is not None:
                             normalized.append(normalized_game)
                     if normalized:
-                        target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                        filtered = []
-                        for ng in normalized:
-                            try:
-                                gd = pd.to_datetime(ng.get('gameDate'), utc=True, errors='coerce')
-                                if pd.isna(gd):
-                                    continue
-                                # Keep only games whose official UTC date matches this endpoint date.
-                                # Caller-level filtering handles local-time slate grouping (e.g., ET).
-                                if gd.date() == target_date:
-                                    filtered.append(ng)
-                            except Exception:
-                                continue
-                        if filtered:
-                            return filtered
+                        return normalized
                 except Exception:
                     continue
             return []
