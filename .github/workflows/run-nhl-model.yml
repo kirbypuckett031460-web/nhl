@@ -16,8 +16,13 @@ on:
         required: false
         default: "auto"
   schedule:
-    # Daily run at 14:00 UTC (adjust to your preferred time).
+    # Daily run at 14:00 UTC.
     - cron: "0 14 * * *"
+    # Daily run targeting 4:00 PM ET across DST/standard transitions.
+    # 20:00 UTC == 4:00 PM ET during daylight saving time (UTC-4).
+    - cron: "0 20 * * *"
+    # 21:00 UTC == 4:00 PM ET during standard time (UTC-5).
+    - cron: "0 21 * * *"
 
 permissions:
   contents: write
@@ -35,23 +40,44 @@ jobs:
       NHL_SEASON_START: ${{ vars.NHL_SEASON_START }}
 
     steps:
+      - name: Schedule gate for 4:00 PM ET slot
+        id: schedule_gate
+        shell: bash
+        run: |
+          should_run="true"
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            cron_expr="${{ github.event.schedule }}"
+            if [[ "$cron_expr" == "0 20 * * *" || "$cron_expr" == "0 21 * * *" ]]; then
+              et_hour="$(TZ=America/New_York date +%H)"
+              if [[ "$et_hour" != "16" ]]; then
+                echo "Skipping $cron_expr because current ET hour is $et_hour (not 16)."
+                should_run="false"
+              fi
+            fi
+          fi
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
+        if: steps.schedule_gate.outputs.should_run == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Python
+        if: steps.schedule_gate.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Install dependencies
+        if: steps.schedule_gate.outputs.should_run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Restore model/cache artifacts
+        if: steps.schedule_gate.outputs.should_run == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -60,6 +86,7 @@ jobs:
           key: nhl-model-cache-v1
 
       - name: Run NHL prediction pipeline
+        if: steps.schedule_gate.outputs.should_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -102,6 +129,7 @@ jobs:
           "${CMD[@]}"
 
       - name: Commit updated outputs
+        if: steps.schedule_gate.outputs.should_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -131,3 +159,7 @@ jobs:
 
           git commit -m "chore(ci): refresh NHL model outputs [skip ci]"
           git push
+
+      - name: Skip notice
+        if: steps.schedule_gate.outputs.should_run != 'true'
+        run: echo "Skipping this scheduled run because it is not the active 4:00 PM ET slot."
