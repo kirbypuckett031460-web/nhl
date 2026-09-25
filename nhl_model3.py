@@ -7676,7 +7676,13 @@ class RealDataNHLModel:
         # Map provider team names to abbreviations (best-effort fallback)
         def normalize_team(name: str) -> str:
             """Map provider full team names to NHL abbreviations (best effort)."""
-            name_u = (name or '').upper()
+            raw = str(name or '')
+            try:
+                raw = unicodedata.normalize('NFKD', raw)
+                raw = ''.join(ch for ch in raw if not unicodedata.combining(ch))
+            except Exception:
+                pass
+            name_u = re.sub(r'\s+', ' ', raw).strip().upper()
             mapping = {
                 'ANAHEIM DUCKS': 'ANA','ARIZONA COYOTES': 'ARI','BOSTON BRUINS': 'BOS','BUFFALO SABRES': 'BUF',
                 'CALGARY FLAMES': 'CGY','CAROLINA HURRICANES': 'CAR','CHICAGO BLACKHAWKS': 'CHI','COLORADO AVALANCHE': 'COL',
