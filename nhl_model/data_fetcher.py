@@ -149,18 +149,15 @@ class NHLDataFetcher:
                             normalized.append(normalized_game)
                     if normalized:
                         target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                        tz_str = os.getenv('SCHEDULE_TZ', 'US/Eastern')
                         filtered = []
                         for ng in normalized:
                             try:
                                 gd = pd.to_datetime(ng.get('gameDate'), utc=True, errors='coerce')
                                 if pd.isna(gd):
                                     continue
-                                try:
-                                    local_date = gd.tz_convert(tz_str).date()
-                                except Exception:
-                                    local_date = gd.tz_convert(None).date()
-                                if local_date == target_date:
+                                # Keep only games whose official UTC date matches this endpoint date.
+                                # Caller-level filtering handles local-time slate grouping (e.g., ET).
+                                if gd.date() == target_date:
                                     filtered.append(ng)
                             except Exception:
                                 continue
