@@ -54,6 +54,7 @@ For Streamlit Cloud deployment:
    - `GITHUB_REPO = "owner/repo"` (recommended for admin publish, e.g. `kirbypuckett031460-web/nhl`)
    - `GITHUB_BRANCH = "main"` (recommended for admin publish target)
    - `GITHUB_PUSH_TOKEN = "github_pat_..."` (required if you want admin runs to publish outputs to GitHub; `GITHUB_TOKEN`/`GH_TOKEN` are also accepted)
+   - optional commit identity overrides: `GIT_COMMIT_NAME`, `GIT_COMMIT_EMAIL`
 5. The repo includes `runtime.txt` (`python-3.12`) to keep Cloud dependency installs stable.
 
 Admin publish behavior:

@@ -187,6 +187,31 @@ def _publish_outputs_to_github(
         text = "\n".join(part for part in [proc.stdout, proc.stderr] if part).strip()
         return proc.returncode, text
 
+    def _ensure_git_identity() -> Tuple[bool, str]:
+        name_rc, name_out = _run_git(["config", "--get", "user.name"])
+        email_rc, email_out = _run_git(["config", "--get", "user.email"])
+        existing_name = (name_out or "").strip() if name_rc == 0 else ""
+        existing_email = (email_out or "").strip() if email_rc == 0 else ""
+        if existing_name and existing_email:
+            return True, ""
+
+        desired_name = _read_first_secret_or_env(
+            ["GIT_COMMIT_NAME", "GITHUB_COMMIT_NAME", "GIT_AUTHOR_NAME", "GITHUB_ACTOR"]
+        ) or "streamlit-admin-bot"
+        desired_email = _read_first_secret_or_env(
+            ["GIT_COMMIT_EMAIL", "GITHUB_COMMIT_EMAIL", "GIT_AUTHOR_EMAIL", "GITHUB_USER_EMAIL"]
+        ) or "streamlit-admin-bot@users.noreply.github.com"
+
+        if not existing_name:
+            rc, out = _run_git(["config", "user.name", desired_name])
+            if rc != 0:
+                return False, f"git config user.name failed:\n{out or '(no output)'}"
+        if not existing_email:
+            rc, out = _run_git(["config", "user.email", desired_email])
+            if rc != 0:
+                return False, f"git config user.email failed:\n{out or '(no output)'}"
+        return True, ""
+
     rc, out = _run_git(["add", "--", *rel_files])
     if rc != 0:
         return False, f"git add failed:\n{out or '(no output)'}", details
@@ -205,6 +230,10 @@ def _publish_outputs_to_github(
     if not commit_msg:
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         commit_msg = f"chore(admin): refresh public outputs ({now_utc})"
+
+    ok_identity, identity_msg = _ensure_git_identity()
+    if not ok_identity:
+        return False, identity_msg, details
 
     rc, out = _run_git(["commit", "-m", commit_msg])
     if rc != 0:
