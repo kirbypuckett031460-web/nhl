@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-09-26T17:39:25Z",
+  "generated_at": "2026-09-26T18:20:59Z",
   "games": [
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010056",
       "away_team": "SEA",
       "home_team": "VAN",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 98.98169049110123
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010058",
       "away_team": "STL",
       "home_team": "CHI",
@@ -35,10 +35,10 @@
       "game_time_et": "07:00 PM ET",
       "game_datetime_utc": "2026-09-26 23:00:00+00:00",
       "totals_line": 6.0,
-      "totals_fair": 6.720816899612954,
+      "totals_fair": 6.720816899612955,
       "totals_pick": "OVER",
-      "totals_edge": 0.720816899612954,
-      "totals_confidence_pct": 48.41246365187356,
+      "totals_edge": 0.7208168996129549,
+      "totals_confidence_pct": 48.41246365187357,
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "CHI",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 98.845
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010061",
       "away_team": "CBJ",
       "home_team": "DET",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 61.417500000000004
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010064",
       "away_team": "MTL",
       "home_team": "OTT",
@@ -94,7 +94,7 @@
       "moneyline_confidence_pct": 88.155
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010064",
       "away_team": "MTL",
       "home_team": "OTT",
@@ -104,10 +104,10 @@
       "game_time_et": "07:00 PM ET",
       "game_datetime_utc": "2026-09-26 23:00:00+00:00",
       "totals_line": 6.0,
-      "totals_fair": 6.680802474748352,
+      "totals_fair": 6.6808024747483525,
       "totals_pick": "OVER",
-      "totals_edge": 0.6808024747483516,
-      "totals_confidence_pct": 45.872247278904524,
+      "totals_edge": 0.6808024747483525,
+      "totals_confidence_pct": 45.872247278904545,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "MTL",
@@ -117,7 +117,7 @@
       "moneyline_confidence_pct": 87.9775
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010064",
       "away_team": "MTL",
       "home_team": "OTT",
@@ -140,7 +140,7 @@
       "moneyline_confidence_pct": 88.155
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010064",
       "away_team": "MTL",
       "home_team": "OTT",
@@ -150,10 +150,10 @@
       "game_time_et": "07:00 PM ET",
       "game_datetime_utc": "2026-09-26 23:00:00+00:00",
       "totals_line": 6.0,
-      "totals_fair": 6.680802474748352,
+      "totals_fair": 6.6808024747483525,
       "totals_pick": "OVER",
-      "totals_edge": 0.6808024747483516,
-      "totals_confidence_pct": 45.872247278904524,
+      "totals_edge": 0.6808024747483525,
+      "totals_confidence_pct": 45.872247278904545,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "MTL",
@@ -163,7 +163,7 @@
       "moneyline_confidence_pct": 87.9775
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010065",
       "away_team": "OTT",
       "home_team": "MTL",
@@ -186,7 +186,7 @@
       "moneyline_confidence_pct": 90.73750000000001
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010065",
       "away_team": "OTT",
       "home_team": "MTL",
@@ -209,7 +209,7 @@
       "moneyline_confidence_pct": 90.73750000000001
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010065",
       "away_team": "OTT",
       "home_team": "MTL",
@@ -232,7 +232,7 @@
       "moneyline_confidence_pct": 91.025
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010065",
       "away_team": "OTT",
       "home_team": "MTL",
@@ -255,7 +255,7 @@
       "moneyline_confidence_pct": 91.025
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010062",
       "away_team": "NJD",
       "home_team": "NYI",
@@ -275,10 +275,10 @@
       "moneyline_market_odds": null,
       "moneyline_fair_odds": -956,
       "moneyline_edge": null,
-      "moneyline_confidence_pct": 90.52635595771618
+      "moneyline_confidence_pct": 90.52635595771616
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010060",
       "away_team": "CGY",
       "home_team": "EDM",
@@ -301,7 +301,7 @@
       "moneyline_confidence_pct": 55.677753568951935
     },
     {
-      "generated_at": "2026-09-26T17:39:25Z",
+      "generated_at": "2026-09-26T18:20:59Z",
       "game_id": "2026010063",
       "away_team": "SJS",
       "home_team": "VGK",
@@ -311,10 +311,10 @@
       "game_time_et": "10:00 PM ET",
       "game_datetime_utc": "2026-09-27 02:00:00+00:00",
       "totals_line": 6.0,
-      "totals_fair": 6.7931391975099915,
+      "totals_fair": 6.793139197509992,
       "totals_pick": "OVER",
-      "totals_edge": 0.7931391975099915,
-      "totals_confidence_pct": 49.19729812032912,
+      "totals_edge": 0.7931391975099924,
+      "totals_confidence_pct": 49.19729812032914,
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "VGK",
