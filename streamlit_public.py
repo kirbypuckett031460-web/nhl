@@ -7,6 +7,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -103,9 +104,10 @@ def _raw_data_url(path_name: str, branch_override: Optional[str] = None) -> Opti
         return f"{base_url}/{path_name.lstrip('/')}"
     repo = str(os.getenv("PUBLIC_DATA_REPO", "kirbypuckett031460-web/nhl")).strip().strip("/")
     branch = str(branch_override or os.getenv("PUBLIC_DATA_BRANCH", "main")).strip() or "main"
+    branch_ref = quote(branch, safe="")
     if not repo:
         return None
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path_name.lstrip('/')}"
+    return f"https://raw.githubusercontent.com/{repo}/{branch_ref}/{path_name.lstrip('/')}"
 
 
 def _current_git_branch() -> Optional[str]:
@@ -318,7 +320,27 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
             generated_dt = _parse_logged_datetime(generated_raw) if generated_raw else None
             if generated_dt == datetime.min:
                 generated_dt = None
-            key = (1 if generated_dt is not None else 0, generated_dt or datetime.min, len(games))
+            def _is_synthetic_game(game: Dict[str, object]) -> bool:
+                gid = str(game.get("game_id") or "").strip().upper()
+                if gid.startswith(("DEMO_", "OFFLINE_", "SAMPLE_")):
+                    return True
+                away = str(game.get("away_abbrev") or game.get("away_team") or "").strip().upper()
+                home = str(game.get("home_abbrev") or game.get("home_team") or "").strip().upper()
+                generic = {"AWAY", "HOME", "TBD", "—", ""}
+                return away in generic or home in generic
+
+            synthetic_count = sum(1 for g in games if _is_synthetic_game(g))
+            real_count = max(0, len(games) - synthetic_count)
+            # Prefer payloads with real scheduled games over synthetic/demo rows,
+            # then pick the freshest generated_at among those.
+            key = (
+                1 if real_count > 0 else 0,
+                real_count,
+                1 if generated_dt is not None else 0,
+                generated_dt or datetime.min,
+                -synthetic_count,
+                len(games),
+            )
             if best_key is None or key > best_key:
                 best_key = key
                 best_games = games
