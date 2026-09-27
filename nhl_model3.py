@@ -7037,6 +7037,56 @@ class RealDataNHLModel:
         def decimal_to_implied_prob(decimal_odds: float) -> float:
             return float(odds_decimal_to_implied_prob(decimal_odds))
 
+        # Guardrail ML probabilities so fair odds don't explode on sparse/noisy slates.
+        try:
+            ml_prob_floor_guard = float(os.getenv('ML_PROB_FLOOR_GUARD', '0.08'))
+        except Exception:
+            ml_prob_floor_guard = 0.08
+        ml_prob_floor_guard = float(min(max(ml_prob_floor_guard, 0.01), 0.49))
+        ml_prob_ceiling_guard = 1.0 - ml_prob_floor_guard
+
+        if home_win_prob is None and away_win_prob is not None:
+            home_win_prob = float(max(0.0, min(1.0, 1.0 - away_win_prob)))
+        if away_win_prob is None and home_win_prob is not None:
+            away_win_prob = float(max(0.0, min(1.0, 1.0 - home_win_prob)))
+        if home_win_prob is not None and away_win_prob is not None:
+            try:
+                pair_sum = float(home_win_prob + away_win_prob)
+            except Exception:
+                pair_sum = 0.0
+            if np.isfinite(pair_sum) and pair_sum > 0:
+                home_win_prob = float(home_win_prob / pair_sum)
+                away_win_prob = float(max(0.0, min(1.0, 1.0 - home_win_prob)))
+
+            # Lightly anchor toward no-vig market fair probs when both ML prices exist.
+            if home_moneyline_odds is not None and away_moneyline_odds is not None:
+                try:
+                    home_imp = decimal_to_implied_prob(american_to_decimal(int(home_moneyline_odds)))
+                    away_imp = decimal_to_implied_prob(american_to_decimal(int(away_moneyline_odds)))
+                    vig_ml = max(1e-9, home_imp + away_imp)
+                    fair_home_ml = float(home_imp / vig_ml)
+                    try:
+                        anchor = float(os.getenv('ML_MARKET_PROB_ANCHOR', '0.35'))
+                    except Exception:
+                        anchor = 0.35
+                    anchor = float(min(max(anchor, 0.0), 1.0))
+                    try:
+                        max_delta = float(os.getenv('ML_MAX_PROB_DELTA_FROM_MARKET', '0.20'))
+                    except Exception:
+                        max_delta = 0.20
+                    max_delta = float(min(max(max_delta, 0.0), 0.49))
+                    anchored_home = float((1.0 - anchor) * home_win_prob + anchor * fair_home_ml)
+                    delta_home = anchored_home - fair_home_ml
+                    if abs(delta_home) > max_delta:
+                        anchored_home = float(fair_home_ml + np.sign(delta_home) * max_delta)
+                    home_win_prob = anchored_home
+                    away_win_prob = float(max(0.0, min(1.0, 1.0 - home_win_prob)))
+                except Exception:
+                    pass
+
+            home_win_prob = float(np.clip(home_win_prob, ml_prob_floor_guard, ml_prob_ceiling_guard))
+            away_win_prob = float(max(0.0, min(1.0, 1.0 - home_win_prob)))
+
         over_dec = american_to_decimal(over_american_odds)
         under_dec = american_to_decimal(under_american_odds)
         imp_over = decimal_to_implied_prob(over_dec)
@@ -10188,8 +10238,21 @@ def save_public_predictions_json(
             return None
         try:
             if p >= 0.5:
-                return int(round(-100.0 * p / max(1e-9, (1.0 - p))))
-            return int(round(100.0 * (1.0 - p) / max(1e-9, p)))
+                odds = int(round(-100.0 * p / max(1e-9, (1.0 - p))))
+            else:
+                odds = int(round(100.0 * (1.0 - p) / max(1e-9, p)))
+            try:
+                max_abs = float(os.getenv('MAX_FAIR_MONEYLINE_ABS', '1500'))
+            except Exception:
+                max_abs = 1500.0
+            if np.isfinite(max_abs) and max_abs >= 100:
+                cap = int(max(100, round(max_abs)))
+                odds = int(np.clip(odds, -cap, cap))
+            if -100 < odds < 0:
+                odds = -100
+            if 0 < odds < 100:
+                odds = 100
+            return odds
         except Exception:
             return None
 
