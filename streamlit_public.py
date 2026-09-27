@@ -296,13 +296,27 @@ def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
     }
 
 
-def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, object]], Optional[datetime], Optional[str]]:
+def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, object]], Optional[datetime], Optional[str], Optional[date]]:
     payload_text: Optional[str] = None
     selected_branch: Optional[str] = None
+    selected_slate_date: Optional[date] = None
+
+    def _parse_slate_date(value: object) -> Optional[date]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except Exception:
+                continue
+        return None
+
     if prefer_remote:
         best_games: Optional[List[Dict[str, object]]] = None
         best_dt: Optional[datetime] = None
         best_branch: Optional[str] = None
+        best_slate_date: Optional[date] = None
         best_key: Optional[Tuple[int, datetime, int]] = None
         for branch in _candidate_data_branches():
             remote_text = _fetch_remote_text(path.name, branch_override=branch)
@@ -320,6 +334,7 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
             generated_dt = _parse_logged_datetime(generated_raw) if generated_raw else None
             if generated_dt == datetime.min:
                 generated_dt = None
+            slate_dt = _parse_slate_date(payload.get("slate_date"))
             def _is_synthetic_game(game: Dict[str, object]) -> bool:
                 gid = str(game.get("game_id") or "").strip().upper()
                 if gid.startswith(("DEMO_", "OFFLINE_", "SAMPLE_")):
@@ -346,27 +361,29 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
                 best_games = games
                 best_dt = generated_dt
                 best_branch = branch
+                best_slate_date = slate_dt
         if best_games is not None:
-            return best_games, best_dt, best_branch
+            return best_games, best_dt, best_branch, best_slate_date
     if not payload_text:
         if not path.exists():
-            return [], None, None
+            return [], None, None, None
         try:
             payload_text = path.read_text(encoding="utf-8")
         except Exception:
-            return [], None, None
+            return [], None, None, None
     try:
         payload = json.loads(payload_text)
     except Exception:
-        return [], None, None
+        return [], None, None, None
     games = payload.get("games")
     if not isinstance(games, list):
-        return [], None, None
+        return [], None, None, None
     generated_raw = str(payload.get("generated_at") or "").strip()
     generated_dt = _parse_logged_datetime(generated_raw) if generated_raw else None
     if generated_dt == datetime.min:
         generated_dt = None
-    return [g for g in games if isinstance(g, dict)], generated_dt, selected_branch
+    selected_slate_date = _parse_slate_date(payload.get("slate_date"))
+    return [g for g in games if isinstance(g, dict)], generated_dt, selected_branch, selected_slate_date
 
 
 def _compute_record_blocks(log_path: Path, prefer_remote: bool = False, remote_branch: Optional[str] = None) -> Dict[str, Tuple[str, str]]:
@@ -656,7 +673,7 @@ def render_public_app() -> None:
     log_path = APP_ROOT / "bets_log.csv"
     board_path = APP_ROOT / "public_predictions.json"
     prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
-    board_games, board_dt, board_branch = _read_public_predictions(board_path, prefer_remote=prefer_remote)
+    board_games, board_dt, board_branch, board_slate_date = _read_public_predictions(board_path, prefer_remote=prefer_remote)
     run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
     metrics = _compute_record_blocks(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
 
@@ -666,7 +683,11 @@ def render_public_app() -> None:
 
     shown_dt = board_dt or run_dt or datetime.now()
     last_updated_et = _format_last_updated_et(shown_dt)
-    st.write(f"Slate Date: {shown_dt.strftime('%A, %b %d, %Y')}")
+    if board_slate_date is not None:
+        slate_dt_display = datetime.combine(board_slate_date, datetime.min.time())
+    else:
+        slate_dt_display = shown_dt
+    st.write(f"Slate Date: {slate_dt_display.strftime('%A, %b %d, %Y')}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Moneyline Prev Week", metrics["ml_prev"][0], metrics["ml_prev"][1])

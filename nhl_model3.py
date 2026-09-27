@@ -10167,6 +10167,7 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
 def save_public_predictions_json(
     predictions: List[OverUnderPrediction],
     out_path: str = 'public_predictions.json',
+    slate_date: Optional[str] = None,
 ) -> Optional[str]:
     """Persist per-game totals/moneyline picks for Streamlit consumption."""
     if not predictions:
@@ -10194,6 +10195,15 @@ def save_public_predictions_json(
 
     generated_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     rows: List[Dict[str, Any]] = []
+
+    def _is_synthetic_row(row: Dict[str, Any]) -> bool:
+        gid = str(row.get('game_id') or '').strip().upper()
+        if gid.startswith(('DEMO_', 'OFFLINE_', 'SAMPLE_')):
+            return True
+        away = str(row.get('away_abbrev') or row.get('away_team') or '').strip().upper()
+        home = str(row.get('home_abbrev') or row.get('home_team') or '').strip().upper()
+        return away in {'', 'AWAY', 'TBD'} or home in {'', 'HOME', 'TBD'}
+
     for pred in predictions:
         totals_pick = resolve_totals_pick(pred)
         totals_action = 'BET' if str(getattr(pred, 'recommendation', '') or '').strip().upper() in {'OVER', 'UNDER'} else 'PICK'
@@ -10252,6 +10262,8 @@ def save_public_predictions_json(
         })
 
     payload = {'generated_at': generated_at, 'games': rows}
+    if slate_date:
+        payload['slate_date'] = str(slate_date)
     target_path = ensure_local_write_path(out_path) or os.path.abspath(out_path)
     try:
         parent = os.path.dirname(target_path)
@@ -10260,6 +10272,21 @@ def save_public_predictions_json(
     except Exception:
         pass
     try:
+        skip_synth_overwrite = str(os.getenv('PUBLIC_BOARD_SKIP_SYNTHETIC_OVERWRITE', '1')).strip().lower() in TRUTHY_FLAGS
+        current_is_synthetic = bool(rows) and all(_is_synthetic_row(r) for r in rows)
+        if skip_synth_overwrite and current_is_synthetic and os.path.exists(target_path):
+            try:
+                with open(target_path, 'r', encoding='utf-8') as existing_handle:
+                    existing_payload = json.load(existing_handle)
+                existing_games = existing_payload.get('games') if isinstance(existing_payload, dict) else None
+                if isinstance(existing_games, list):
+                    existing_rows = [g for g in existing_games if isinstance(g, dict)]
+                    existing_has_real = any(not _is_synthetic_row(g) for g in existing_rows) if existing_rows else False
+                    if existing_has_real:
+                        print(f"ℹ️  Skipping synthetic public board overwrite; retaining existing real slate at {target_path}")
+                        return target_path
+            except Exception:
+                pass
         with open(target_path, 'w', encoding='utf-8') as handle:
             json.dump(payload, handle, indent=2)
         print(f"✅ Saved public predictions JSON: {target_path}")
@@ -14148,7 +14175,11 @@ def main(cli_args: Optional[argparse.Namespace] = None):
 
             public_board_path = getattr(cli_args, 'public_board_path', 'public_predictions.json') if cli_args else 'public_predictions.json'
             try:
-                save_public_predictions_json(predictions, out_path=public_board_path)
+                save_public_predictions_json(
+                    predictions,
+                    out_path=public_board_path,
+                    slate_date=target_game_date_str
+                )
             except Exception as e:
                 print(f"⚠️  Could not save public predictions JSON: {e}")
 
