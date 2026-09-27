@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -96,21 +97,56 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on", "y"}
 
 
-def _raw_data_url(path_name: str) -> Optional[str]:
+def _raw_data_url(path_name: str, branch_override: Optional[str] = None) -> Optional[str]:
     base_url = str(os.getenv("PUBLIC_DATA_BASE_URL", "")).strip().rstrip("/")
     if base_url:
         return f"{base_url}/{path_name.lstrip('/')}"
     repo = str(os.getenv("PUBLIC_DATA_REPO", "kirbypuckett031460-web/nhl")).strip().strip("/")
-    branch = str(os.getenv("PUBLIC_DATA_BRANCH", "main")).strip() or "main"
+    branch = str(branch_override or os.getenv("PUBLIC_DATA_BRANCH", "main")).strip() or "main"
     if not repo:
         return None
     return f"https://raw.githubusercontent.com/{repo}/{branch}/{path_name.lstrip('/')}"
 
 
-def _fetch_remote_text(path_name: str) -> Optional[str]:
+def _current_git_branch() -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(APP_ROOT),
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        branch = str(proc.stdout or "").strip()
+        if not branch or branch == "HEAD":
+            return None
+        return branch
+    except Exception:
+        return None
+
+
+def _candidate_data_branches() -> List[str]:
+    candidates: List[str] = []
+    configured = str(os.getenv("PUBLIC_DATA_BRANCH", "main")).strip() or "main"
+    candidates.append(configured)
+    git_branch = _current_git_branch()
+    if git_branch:
+        candidates.append(git_branch)
+    candidates.append("main")
+    unique: List[str] = []
+    for branch in candidates:
+        val = str(branch or "").strip()
+        if val and val not in unique:
+            unique.append(val)
+    return unique
+
+
+def _fetch_remote_text(path_name: str, branch_override: Optional[str] = None) -> Optional[str]:
     if not _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True):
         return None
-    url = _raw_data_url(path_name)
+    url = _raw_data_url(path_name, branch_override=branch_override)
     if not url:
         return None
     nonce = int(time.time())
@@ -132,9 +168,9 @@ def _fetch_remote_text(path_name: str) -> Optional[str]:
         return None
 
 
-def _read_log_rows(log_path: Path, prefer_remote: bool = False) -> List[Dict[str, str]]:
+def _read_log_rows(log_path: Path, prefer_remote: bool = False, remote_branch: Optional[str] = None) -> List[Dict[str, str]]:
     if prefer_remote:
-        remote_text = _fetch_remote_text(log_path.name)
+        remote_text = _fetch_remote_text(log_path.name, branch_override=remote_branch)
         if remote_text:
             try:
                 reader = csv.DictReader(io.StringIO(remote_text))
@@ -203,8 +239,8 @@ def _fmt_american(value: Optional[int]) -> str:
     return f"{value:+d}" if value > 0 else str(value)
 
 
-def _latest_run_rows(log_path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, str]], Optional[datetime]]:
-    source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote)
+def _latest_run_rows(log_path: Path, prefer_remote: bool = False, remote_branch: Optional[str] = None) -> Tuple[List[Dict[str, str]], Optional[datetime]]:
+    source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote, remote_branch=remote_branch)
     if not source_rows:
         return [], None
     rows: List[Tuple[datetime, Dict[str, str]]] = []
@@ -258,32 +294,60 @@ def _latest_record(log_path: Path) -> Optional[Dict[str, float]]:
     }
 
 
-def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, object]], Optional[datetime]]:
+def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[List[Dict[str, object]], Optional[datetime], Optional[str]]:
     payload_text: Optional[str] = None
+    selected_branch: Optional[str] = None
     if prefer_remote:
-        payload_text = _fetch_remote_text(path.name)
+        best_games: Optional[List[Dict[str, object]]] = None
+        best_dt: Optional[datetime] = None
+        best_branch: Optional[str] = None
+        best_key: Optional[Tuple[int, datetime, int]] = None
+        for branch in _candidate_data_branches():
+            remote_text = _fetch_remote_text(path.name, branch_override=branch)
+            if not remote_text:
+                continue
+            try:
+                payload = json.loads(remote_text)
+            except Exception:
+                continue
+            games_raw = payload.get("games")
+            if not isinstance(games_raw, list):
+                continue
+            games = [g for g in games_raw if isinstance(g, dict)]
+            generated_raw = str(payload.get("generated_at") or "").strip()
+            generated_dt = _parse_logged_datetime(generated_raw) if generated_raw else None
+            if generated_dt == datetime.min:
+                generated_dt = None
+            key = (1 if generated_dt is not None else 0, generated_dt or datetime.min, len(games))
+            if best_key is None or key > best_key:
+                best_key = key
+                best_games = games
+                best_dt = generated_dt
+                best_branch = branch
+        if best_games is not None:
+            return best_games, best_dt, best_branch
     if not payload_text:
         if not path.exists():
-            return [], None
+            return [], None, None
         try:
             payload_text = path.read_text(encoding="utf-8")
         except Exception:
-            return [], None
+            return [], None, None
     try:
         payload = json.loads(payload_text)
     except Exception:
-        return [], None
+        return [], None, None
     games = payload.get("games")
     if not isinstance(games, list):
-        return [], None
+        return [], None, None
     generated_raw = str(payload.get("generated_at") or "").strip()
     generated_dt = _parse_logged_datetime(generated_raw) if generated_raw else None
     if generated_dt == datetime.min:
         generated_dt = None
-    return [g for g in games if isinstance(g, dict)], generated_dt
+    return [g for g in games if isinstance(g, dict)], generated_dt, selected_branch
 
 
-def _compute_record_blocks(log_path: Path, prefer_remote: bool = False) -> Dict[str, Tuple[str, str]]:
+def _compute_record_blocks(log_path: Path, prefer_remote: bool = False, remote_branch: Optional[str] = None) -> Dict[str, Tuple[str, str]]:
     season_start_raw = str(os.getenv("NHL_SEASON_START", "")).strip()
     if not season_start_raw:
         today_for_default = datetime.now().date()
@@ -307,7 +371,7 @@ def _compute_record_blocks(log_path: Path, prefer_remote: bool = False) -> Dict[
         "tot_prev": [0, 0],
         "tot_ytd": [0, 0],
     }
-    source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote)
+    source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote, remote_branch=remote_branch)
     if not source_rows or today < season_start:
         return {
             "ml_prev": ("0-0", "+0.0%"),
@@ -570,9 +634,9 @@ def render_public_app() -> None:
     log_path = APP_ROOT / "bets_log.csv"
     board_path = APP_ROOT / "public_predictions.json"
     prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
-    board_games, board_dt = _read_public_predictions(board_path, prefer_remote=prefer_remote)
-    run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote)
-    metrics = _compute_record_blocks(log_path, prefer_remote=prefer_remote)
+    board_games, board_dt, board_branch = _read_public_predictions(board_path, prefer_remote=prefer_remote)
+    run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
+    metrics = _compute_record_blocks(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
 
     ml_rows, ou_rows = _build_tables_from_public(board_games)
     if not ou_rows and run_rows:
