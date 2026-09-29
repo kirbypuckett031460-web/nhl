@@ -299,7 +299,7 @@ def render_admin_app() -> None:
         max_train_samples = st.number_input("Max train samples (0 = no cap)", min_value=0, max_value=20000, value=0, step=100)
 
         st.subheader("Odds + I/O")
-        realtime_odds = st.checkbox("Use realtime odds API", value=False)
+        realtime_odds = st.checkbox("Use realtime odds API", value=True)
         odds_path_input = st.text_input("Odds JSON path", value="odds.json")
         odds_regions = st.text_input("Odds regions", value="us")
 
