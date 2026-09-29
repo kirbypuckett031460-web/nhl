@@ -317,7 +317,7 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
         best_dt: Optional[datetime] = None
         best_branch: Optional[str] = None
         best_slate_date: Optional[date] = None
-        best_key: Optional[Tuple[int, datetime, int]] = None
+        best_key: Optional[Tuple[object, ...]] = None
         for branch in _candidate_data_branches():
             remote_text = _fetch_remote_text(path.name, branch_override=branch)
             if not remote_text:
@@ -346,11 +346,25 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
 
             synthetic_count = sum(1 for g in games if _is_synthetic_game(g))
             real_count = max(0, len(games) - synthetic_count)
+            totals_market_count = 0
+            moneyline_market_count = 0
+            for g in games:
+                if _safe_float(g.get("totals_line")) is not None:
+                    totals_market_count += 1
+                if _safe_int(g.get("moneyline_market_odds")) is not None:
+                    moneyline_market_count += 1
+                elif any(
+                    _safe_int(g.get(k)) is not None
+                    for k in ("home_moneyline_odds", "away_moneyline_odds", "consensus_home_moneyline", "consensus_away_moneyline")
+                ):
+                    moneyline_market_count += 1
             # Prefer payloads with real scheduled games over synthetic/demo rows,
             # then pick the freshest generated_at among those.
             key = (
                 1 if real_count > 0 else 0,
                 real_count,
+                totals_market_count,
+                moneyline_market_count,
                 1 if generated_dt is not None else 0,
                 generated_dt or datetime.min,
                 -synthetic_count,
@@ -460,6 +474,27 @@ def _compute_record_blocks(
 def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     moneyline_rows: List[Dict[str, object]] = []
     totals_rows: List[Dict[str, object]] = []
+    def _resolve_moneyline_market(game: Dict[str, object], side_hint: str) -> Optional[int]:
+        direct = _safe_int(game.get("moneyline_market_odds"))
+        if direct is not None:
+            return direct
+        side = str(side_hint or "").strip().lower()
+        if side == "home":
+            for key in ("home_moneyline_odds", "consensus_home_moneyline"):
+                val = _safe_int(game.get(key))
+                if val is not None:
+                    return val
+        if side == "away":
+            for key in ("away_moneyline_odds", "consensus_away_moneyline"):
+                val = _safe_int(game.get(key))
+                if val is not None:
+                    return val
+        for key in ("home_moneyline_odds", "away_moneyline_odds", "consensus_home_moneyline", "consensus_away_moneyline"):
+            val = _safe_int(game.get(key))
+            if val is not None:
+                return val
+        return None
+
     for game in games:
         away = str(game.get("away_abbrev") or game.get("away_team") or "").strip() or "—"
         home = str(game.get("home_abbrev") or game.get("home_team") or "").strip() or "—"
@@ -483,13 +518,16 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
         if not ml_pick:
             side_hint = str(game.get("moneyline_pick_side") or "").strip().lower()
             ml_pick = home if side_hint == "home" else away if side_hint == "away" else home
+        else:
+            side_hint = str(game.get("moneyline_pick_side") or "").strip().lower()
+        market_ml = _resolve_moneyline_market(game, side_hint)
         ml_edge = _safe_float(game.get("moneyline_edge"))
         ml_conf = _safe_float(game.get("moneyline_confidence_pct"))
         moneyline_rows.append({
             "Game Time (ET)": game_time,
             "Away": away,
             "Home": home,
-            "Mkt": _fmt_american(_safe_int(game.get("moneyline_market_odds"))),
+            "Mkt": _fmt_american(market_ml),
             "Fair": _fmt_american(_safe_int(game.get("moneyline_fair_odds"))),
             "Pick": ml_pick,
             "Edge": _fmt_signed(ml_edge * 100.0 if ml_edge is not None else None, places=1, pct=True),
