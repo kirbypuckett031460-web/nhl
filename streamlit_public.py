@@ -386,36 +386,41 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
     return [g for g in games if isinstance(g, dict)], generated_dt, selected_branch, selected_slate_date
 
 
-def _compute_record_blocks(log_path: Path, prefer_remote: bool = False, remote_branch: Optional[str] = None) -> Dict[str, Tuple[str, str]]:
+def _compute_record_blocks(
+    log_path: Path,
+    prefer_remote: bool = False,
+    remote_branch: Optional[str] = None,
+    reference_date: Optional[date] = None,
+) -> Dict[str, Tuple[str, str]]:
+    ref_date = reference_date or datetime.now().date()
     season_start_raw = str(os.getenv("NHL_SEASON_START", "")).strip()
     if not season_start_raw:
-        today_for_default = datetime.now().date()
-        current_year_start = date(today_for_default.year, 9, 29)
+        current_year_start = date(ref_date.year, 9, 29)
         # During late off-season (Jul-Sep before opening day), track against the upcoming season start.
-        if today_for_default.month >= 7 and today_for_default < current_year_start:
+        if ref_date.month >= 7 and ref_date < current_year_start:
             season_start_raw = current_year_start.strftime("%Y-%m-%d")
-        elif today_for_default >= current_year_start:
+        elif ref_date >= current_year_start:
             season_start_raw = current_year_start.strftime("%Y-%m-%d")
         else:
-            season_start_raw = date(today_for_default.year - 1, 9, 29).strftime("%Y-%m-%d")
+            season_start_raw = date(ref_date.year - 1, 9, 29).strftime("%Y-%m-%d")
     try:
         season_start = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
     except Exception:
         season_start = datetime.now().date().replace(month=1, day=1)
-    today = datetime.now().date()
-    prev_week_start = today - timedelta(days=7)
+    yesterday = ref_date - timedelta(days=1)
     blocks = {
-        "ml_prev": [0, 0],
+        "ml_prev_day": [0, 0],
         "ml_ytd": [0, 0],
-        "tot_prev": [0, 0],
+        "tot_prev_day": [0, 0],
         "tot_ytd": [0, 0],
     }
     source_rows = _read_log_rows(log_path, prefer_remote=prefer_remote, remote_branch=remote_branch)
-    if not source_rows or today < season_start:
+    # On opening day (and pre-season), show all records as 0-0.
+    if not source_rows or ref_date <= season_start:
         return {
-            "ml_prev": ("0-0", "+0.0%"),
+            "ml_prev_day": ("0-0", "+0.0%"),
             "ml_ytd": ("0-0", "+0.0%"),
-            "tot_prev": ("0-0", "+0.0%"),
+            "tot_prev_day": ("0-0", "+0.0%"),
             "tot_ytd": ("0-0", "+0.0%"),
         }
     for row in source_rows:
@@ -435,8 +440,8 @@ def _compute_record_blocks(log_path: Path, prefer_remote: bool = False, remote_b
         idx = 0 if result == "WIN" else 1
         if d >= season_start:
             blocks[f"{bucket}_ytd"][idx] += 1
-        if prev_week_start <= d < today:
-            blocks[f"{bucket}_prev"][idx] += 1
+        if d == yesterday:
+            blocks[f"{bucket}_prev_day"][idx] += 1
 
     def _fmt(block: List[int]) -> Tuple[str, str]:
         wins, losses = int(block[0]), int(block[1])
@@ -445,9 +450,9 @@ def _compute_record_blocks(log_path: Path, prefer_remote: bool = False, remote_b
         return f"{wins}-{losses}", f"{pct:+.1f}%"
 
     return {
-        "ml_prev": _fmt(blocks["ml_prev"]),
+        "ml_prev_day": _fmt(blocks["ml_prev_day"]),
         "ml_ytd": _fmt(blocks["ml_ytd"]),
-        "tot_prev": _fmt(blocks["tot_prev"]),
+        "tot_prev_day": _fmt(blocks["tot_prev_day"]),
         "tot_ytd": _fmt(blocks["tot_ytd"]),
     }
 
@@ -675,7 +680,13 @@ def render_public_app() -> None:
     prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
     board_games, board_dt, board_branch, board_slate_date = _read_public_predictions(board_path, prefer_remote=prefer_remote)
     run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
-    metrics = _compute_record_blocks(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
+    metrics_ref_date = board_slate_date or datetime.now().date()
+    metrics = _compute_record_blocks(
+        log_path,
+        prefer_remote=prefer_remote,
+        remote_branch=board_branch,
+        reference_date=metrics_ref_date,
+    )
 
     ml_rows, ou_rows = _build_tables_from_public(board_games)
     if not ou_rows and run_rows:
@@ -690,9 +701,9 @@ def render_public_app() -> None:
     st.write(f"Slate Date: {slate_dt_display.strftime('%A, %b %d, %Y')}")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Moneyline Prev Week", metrics["ml_prev"][0], metrics["ml_prev"][1])
+    c1.metric("Moneyline Yesterday", metrics["ml_prev_day"][0], metrics["ml_prev_day"][1])
     c2.metric("Moneyline YTD", metrics["ml_ytd"][0], metrics["ml_ytd"][1])
-    c3.metric("Totals Prev Week", metrics["tot_prev"][0], metrics["tot_prev"][1])
+    c3.metric("Totals Yesterday", metrics["tot_prev_day"][0], metrics["tot_prev_day"][1])
     c4.metric("Totals YTD", metrics["tot_ytd"][0], metrics["tot_ytd"][1])
 
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
