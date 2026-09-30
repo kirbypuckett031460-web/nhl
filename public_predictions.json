@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-09-30T19:47:55Z",
+  "generated_at": "2026-09-30T19:49:00Z",
   "games": [
     {
-      "generated_at": "2026-09-30T19:47:55Z",
+      "generated_at": "2026-09-30T19:49:00Z",
       "game_id": "2026020006",
       "away_team": "PIT",
       "home_team": "PHI",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 55.94854122816248
     },
     {
-      "generated_at": "2026-09-30T19:47:55Z",
+      "generated_at": "2026-09-30T19:49:00Z",
       "game_id": "2026020008",
       "away_team": "NYI",
       "home_team": "TOR",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 51.63725529576338
     },
     {
-      "generated_at": "2026-09-30T19:47:55Z",
+      "generated_at": "2026-09-30T19:49:00Z",
       "game_id": "2026020007",
       "away_team": "LAK",
       "home_team": "COL",
