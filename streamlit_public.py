@@ -437,6 +437,8 @@ def _compute_record_blocks(
             "tot_prev_day": ("0-0", "+0.0%"),
             "tot_ytd": ("0-0", "+0.0%"),
         }
+    # Deduplicate repeated runs: keep latest graded row per (market bucket, game).
+    latest_by_market_game: Dict[str, Tuple[datetime, date, str, str]] = {}
     for row in source_rows:
         result = str(row.get("result") or "").strip().upper()
         if result not in {"WIN", "LOSS"}:
@@ -451,6 +453,17 @@ def _compute_record_blocks(
         bucket = "ml" if is_ml else ("tot" if side in {"OVER", "UNDER"} else "")
         if not bucket:
             continue
+        gid = str(row.get("game_id") or "").strip()
+        if gid:
+            key = f"{bucket}|gid:{gid}"
+        else:
+            matchup = str(row.get("matchup") or "").strip().upper()
+            key = f"{bucket}|matchup:{matchup}|date:{d.isoformat()}"
+        prev = latest_by_market_game.get(key)
+        if prev is None or dt >= prev[0]:
+            latest_by_market_game[key] = (dt, d, bucket, result)
+
+    for _, (_, d, bucket, result) in latest_by_market_game.items():
         idx = 0 if result == "WIN" else 1
         if d >= season_start:
             blocks[f"{bucket}_ytd"][idx] += 1
