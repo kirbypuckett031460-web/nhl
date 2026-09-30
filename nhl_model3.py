@@ -10380,6 +10380,75 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         except Exception:
             closing = None
 
+    schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+    game_date_cache: Dict[str, str] = {}
+    fetcher_dates: Optional[NHLDataFetcher] = None
+
+    def _format_schedule_dt(ts: Any) -> Optional[str]:
+        if ts is None:
+            return None
+        try:
+            parsed = pd.to_datetime(ts, errors='coerce', utc=True)
+        except Exception:
+            parsed = pd.NaT
+        if pd.isna(parsed):
+            # Date-only fallback: preserve the intended local date.
+            raw = str(ts).strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                return f"{raw} 12:00:00"
+            return None
+        try:
+            localized = parsed.tz_convert(schedule_tz)
+        except Exception:
+            try:
+                localized = parsed.tz_localize('UTC').tz_convert(schedule_tz)  # type: ignore[union-attr]
+            except Exception:
+                localized = parsed
+        try:
+            return localized.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return None
+
+    def _resolve_log_timestamp(pred: OverUnderPrediction, gid_val: Any) -> str:
+        # Prefer datetime fields carried on prediction objects.
+        for attr_name in ('game_datetime_utc', 'game_datetime', 'start_time_utc', 'start_time', 'game_date', 'date'):
+            try:
+                raw = getattr(pred, attr_name, None)
+            except Exception:
+                raw = None
+            stamped = _format_schedule_dt(raw)
+            if stamped:
+                return stamped
+
+        gid_key = str(gid_val or '').strip()
+        if gid_key:
+            cached = game_date_cache.get(gid_key)
+            if cached:
+                return cached
+            try:
+                gid_int = int(float(gid_key))
+            except Exception:
+                gid_int = None
+            if gid_int is not None:
+                try:
+                    nonlocal fetcher_dates
+                    if fetcher_dates is None:
+                        fetcher_dates = NHLDataFetcher()
+                    payload = fetcher_dates.get_game_stats(gid_int)
+                    ts_raw = payload.get('gameDate') or payload.get('startTimeUTC') or payload.get('startTime')
+                    stamped = _format_schedule_dt(ts_raw)
+                    if stamped:
+                        game_date_cache[gid_key] = stamped
+                        return stamped
+                except Exception:
+                    pass
+
+        try:
+            now_local = pd.Timestamp.now(tz=schedule_tz).to_pydatetime()
+        except Exception:
+            now_local = datetime.now()
+        return now_local.strftime('%Y-%m-%d %H:%M:%S')
+
     rows = []
     for p in predictions:
         gid = p.game_id
@@ -10431,14 +10500,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             except Exception:
                 kelly_pct = 0.0
 
-        # Use schedule timezone for stable "Yesterday" boundaries and consistent logs.
-        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
-        try:
-            now_local = pd.Timestamp.now(tz=schedule_tz).to_pydatetime()
-        except Exception:
-            now_local = datetime.now()
+        logged_date = _resolve_log_timestamp(p, gid)
         rows.append({
-            'date': now_local.strftime('%Y-%m-%d %H:%M:%S'),
+            'date': logged_date,
             'game_id': gid,
             'matchup': matchup,
             'result': '',
@@ -10510,7 +10574,7 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             ml_kelly = 0.0
 
         rows.append({
-            'date': now_local.strftime('%Y-%m-%d %H:%M:%S'),
+            'date': logged_date,
             'game_id': gid,
             'matchup': matchup,
             'result': '',
@@ -14466,6 +14530,25 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             try:
                 closing_odds_path = getattr(cli_args, 'closing_odds_path', None) if cli_args else None
                 log_bets(predictions, logfile=getattr(cli_args, 'log_path', 'bets_log.csv'), closing_odds_path=closing_odds_path)
+                # Grade again after appending rows so backdated slates (e.g., yesterday)
+                # become visible in public records immediately, not only on the next run.
+                try:
+                    post_log_summary = grade_bets_log(
+                        log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv',
+                        historical_days=hist_days,
+                        historical_cache_path=cache_path,
+                        force_refresh=False,
+                        historical_frame=historical_data,
+                        historical_as_of_date=historical_as_of_date
+                    )
+                    post_written = (post_log_summary or {}).get('written_path')
+                    if post_written and cli_args is not None:
+                        try:
+                            setattr(cli_args, 'log_path', str(post_written))
+                        except Exception:
+                            pass
+                except Exception as grade_err:
+                    print(f"⚠️  Post-log grading skipped: {grade_err}")
             except Exception as e:
                 print(f"⚠️  Could not log bets: {e}")
         else:
