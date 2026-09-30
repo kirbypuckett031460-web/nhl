@@ -438,8 +438,8 @@ def _compute_record_blocks(
             "tot_ytd": ("0-0", "+0.0%"),
         }
     # Deduplicate repeated runs: keep latest graded row per (market bucket, game).
-    latest_by_market_game: Dict[str, Tuple[datetime, date, str, str]] = {}
-    for row in source_rows:
+    latest_by_market_game: Dict[str, Tuple[int, datetime, date, str, str]] = {}
+    for idx_row, row in enumerate(source_rows):
         result = str(row.get("result") or "").strip().upper()
         if result not in {"WIN", "LOSS"}:
             continue
@@ -460,10 +460,10 @@ def _compute_record_blocks(
             matchup = str(row.get("matchup") or "").strip().upper()
             key = f"{bucket}|matchup:{matchup}|date:{d.isoformat()}"
         prev = latest_by_market_game.get(key)
-        if prev is None or dt >= prev[0]:
-            latest_by_market_game[key] = (dt, d, bucket, result)
+        if prev is None or idx_row >= prev[0]:
+            latest_by_market_game[key] = (idx_row, dt, d, bucket, result)
 
-    for _, (_, d, bucket, result) in latest_by_market_game.items():
+    for _, (_, _, d, bucket, result) in latest_by_market_game.items():
         idx = 0 if result == "WIN" else 1
         if d >= season_start:
             blocks[f"{bucket}_ytd"][idx] += 1
@@ -731,7 +731,13 @@ def render_public_app() -> None:
     prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
     board_games, board_dt, board_branch, board_slate_date = _read_public_predictions(board_path, prefer_remote=prefer_remote)
     run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
-    metrics_ref_date = board_slate_date or datetime.now().date()
+    # "Yesterday" metrics should reflect the real calendar day in schedule timezone,
+    # not the selected slate date (which can be intentionally backdated).
+    schedule_tz = str(os.getenv("SCHEDULE_TZ", "US/Eastern") or "US/Eastern").strip() or "US/Eastern"
+    try:
+        metrics_ref_date = datetime.now(ZoneInfo(schedule_tz)).date()
+    except Exception:
+        metrics_ref_date = datetime.now().date()
     metrics = _compute_record_blocks(
         log_path,
         prefer_remote=prefer_remote,

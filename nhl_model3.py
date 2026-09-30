@@ -10380,6 +10380,75 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         except Exception:
             closing = None
 
+    schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
+    game_date_cache: Dict[str, str] = {}
+    fetcher_dates: Optional[NHLDataFetcher] = None
+
+    def _format_schedule_dt(ts: Any) -> Optional[str]:
+        if ts is None:
+            return None
+        try:
+            parsed = pd.to_datetime(ts, errors='coerce', utc=True)
+        except Exception:
+            parsed = pd.NaT
+        if pd.isna(parsed):
+            # Date-only fallback: preserve the intended local date.
+            raw = str(ts).strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                return f"{raw} 12:00:00"
+            return None
+        try:
+            localized = parsed.tz_convert(schedule_tz)
+        except Exception:
+            try:
+                localized = parsed.tz_localize('UTC').tz_convert(schedule_tz)  # type: ignore[union-attr]
+            except Exception:
+                localized = parsed
+        try:
+            return localized.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return None
+
+    def _resolve_log_timestamp(pred: OverUnderPrediction, gid_val: Any) -> str:
+        # Prefer datetime fields carried on prediction objects.
+        for attr_name in ('game_datetime_utc', 'game_datetime', 'start_time_utc', 'start_time', 'game_date', 'date'):
+            try:
+                raw = getattr(pred, attr_name, None)
+            except Exception:
+                raw = None
+            stamped = _format_schedule_dt(raw)
+            if stamped:
+                return stamped
+
+        gid_key = str(gid_val or '').strip()
+        if gid_key:
+            cached = game_date_cache.get(gid_key)
+            if cached:
+                return cached
+            try:
+                gid_int = int(float(gid_key))
+            except Exception:
+                gid_int = None
+            if gid_int is not None:
+                try:
+                    nonlocal fetcher_dates
+                    if fetcher_dates is None:
+                        fetcher_dates = NHLDataFetcher()
+                    payload = fetcher_dates.get_game_stats(gid_int)
+                    ts_raw = payload.get('gameDate') or payload.get('startTimeUTC') or payload.get('startTime')
+                    stamped = _format_schedule_dt(ts_raw)
+                    if stamped:
+                        game_date_cache[gid_key] = stamped
+                        return stamped
+                except Exception:
+                    pass
+
+        try:
+            now_local = pd.Timestamp.now(tz=schedule_tz).to_pydatetime()
+        except Exception:
+            now_local = datetime.now()
+        return now_local.strftime('%Y-%m-%d %H:%M:%S')
+
     rows = []
     for p in predictions:
         gid = p.game_id
@@ -10431,14 +10500,9 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             except Exception:
                 kelly_pct = 0.0
 
-        # Use schedule timezone for stable "Yesterday" boundaries and consistent logs.
-        schedule_tz = os.getenv('SCHEDULE_TZ', 'US/Eastern') or 'US/Eastern'
-        try:
-            now_local = pd.Timestamp.now(tz=schedule_tz).to_pydatetime()
-        except Exception:
-            now_local = datetime.now()
+        logged_date = _resolve_log_timestamp(p, gid)
         rows.append({
-            'date': now_local.strftime('%Y-%m-%d %H:%M:%S'),
+            'date': logged_date,
             'game_id': gid,
             'matchup': matchup,
             'result': '',
@@ -10467,6 +10531,78 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
             'closing_price': closing_price,
             'closing_source': closing_source,
             'clv_vs_closing': clv
+        })
+
+        # Log one deterministic moneyline row per game so ML grading/history is
+        # tracked even when the model decides "No Bet".
+        ml_side = resolve_moneyline_pick(p)
+        ml_side_norm = 'HOME' if str(ml_side).strip().lower() == 'home' else 'AWAY'
+        ml_rec = str(getattr(p, 'moneyline_recommendation', '') or '').strip().upper()
+        ml_action = 'ML_BET' if ml_rec in {'HOME ML', 'AWAY ML'} else 'ML_PICK'
+        if ml_side_norm == 'HOME':
+            ml_price = getattr(p, 'home_moneyline_odds', None)
+            ml_edge = getattr(p, 'home_moneyline_edge', None)
+            ml_model_prob = getattr(p, 'home_win_probability', None)
+            ml_ev = getattr(p, 'home_moneyline_ev', None)
+            ml_best_book = getattr(p, 'best_home_moneyline_book', None)
+        else:
+            ml_price = getattr(p, 'away_moneyline_odds', None)
+            ml_edge = getattr(p, 'away_moneyline_edge', None)
+            ml_model_prob = getattr(p, 'away_win_probability', None)
+            ml_ev = getattr(p, 'away_moneyline_ev', None)
+            ml_best_book = getattr(p, 'best_away_moneyline_book', None)
+
+        ml_market_prob = None
+        if ml_price is not None:
+            try:
+                ml_market_prob = float(odds_decimal_to_implied_prob(odds_american_to_decimal(int(float(ml_price)))))
+                if not np.isfinite(ml_market_prob):
+                    ml_market_prob = None
+            except Exception:
+                ml_market_prob = None
+        try:
+            ml_model_prob = float(ml_model_prob) if ml_model_prob is not None else None
+            if ml_model_prob is not None and not np.isfinite(ml_model_prob):
+                ml_model_prob = None
+        except Exception:
+            ml_model_prob = None
+        if ml_edge is None and ml_model_prob is not None and ml_market_prob is not None:
+            ml_edge = ml_model_prob - ml_market_prob
+
+        ml_kelly = getattr(p, 'moneyline_bet_size', 0.0)
+        if ml_action != 'ML_BET':
+            ml_kelly = 0.0
+
+        rows.append({
+            'date': logged_date,
+            'game_id': gid,
+            'matchup': matchup,
+            'result': '',
+            'action': ml_action,
+            'side': ml_side_norm,
+            'line': np.nan,
+            'price': ml_price,
+            'pred_total': p.predicted_total,
+            'edge': ml_edge,
+            'confidence': (ml_model_prob * 100.0) if ml_model_prob is not None else 50.0,
+            'kelly_pct': ml_kelly,
+            'model_prob': ml_model_prob,
+            'market_prob': ml_market_prob,
+            'fair_prob': ml_model_prob,
+            'ev_novig': ml_ev,
+            'consensus_total': np.nan,
+            'line_diff_vs_consensus': np.nan,
+            'best_book': ml_best_book,
+            'bet_month': getattr(p, 'bet_month', None),
+            'calibration_multiplier': getattr(p, 'calibration_multiplier', None),
+            'market_velocity': getattr(p, 'market_velocity', None),
+            'referee_info': p.referee_info,
+            'referee_avg_goals': p.referee_avg_goals,
+            'referee_home_bias': p.referee_home_bias,
+            'closing_total': np.nan,
+            'closing_price': np.nan,
+            'closing_source': np.nan,
+            'clv_vs_closing': np.nan
         })
 
     df = pd.DataFrame(rows)
@@ -10519,7 +10655,7 @@ def grade_bets_log(
     historical_frame: Optional[pd.DataFrame] = None,
     historical_as_of_date: Optional[Any] = None
 ) -> Dict[str, Any]:
-    """Grade/settle ungraded OVER/UNDER picks in a bets log.
+    """Grade/settle ungraded totals and moneyline picks in a bets log.
 
     This updates *only* the existing ``result`` column (WIN/LOSS/PUSH) to avoid
     breaking the fixed bets log schema (``BET_LOG_COLUMNS``), which is appended
@@ -10771,10 +10907,17 @@ def grade_bets_log(
         | side.str.contains('ML')
         | side.isin({'HOME', 'AWAY', 'HML', 'AML'})
     )
+    ml_pick_mask = ml_row_mask & (
+        side.isin({'HOME', 'AWAY', 'HML', 'AML'})
+        | side.str.contains('HOME')
+        | side.str.contains('AWAY')
+    )
     synthetic_prefixes = ('DEMO_', 'OFFLINE_', 'SAMPLE_')
     synthetic_id_mask = game_id_series.astype(str).str.upper().str.startswith(synthetic_prefixes)
-    candidate_mask = ungraded_mask & actionable_mask & ~ml_row_mask & ~synthetic_id_mask
-    summary['skipped_synthetic'] = int((ungraded_mask & actionable_mask & ~ml_row_mask & synthetic_id_mask).sum())
+    candidate_totals_mask = ungraded_mask & actionable_mask & ~ml_row_mask & ~synthetic_id_mask
+    candidate_ml_mask = ungraded_mask & ml_pick_mask & ~synthetic_id_mask
+    candidate_mask = candidate_totals_mask | candidate_ml_mask
+    summary['skipped_synthetic'] = int((ungraded_mask & (actionable_mask | ml_pick_mask) & synthetic_id_mask).sum())
     summary['ungraded_before'] = int(candidate_mask.sum())
 
     # Parse bet dates and matchup strings now (used for both matching and picking a sufficient history window).
@@ -10857,8 +11000,17 @@ def grade_bets_log(
         hist['matchup'] = hist['away_team'].astype(str).str.upper().str.strip() + '@' + hist['home_team'].astype(str).str.upper().str.strip()
     else:
         hist['matchup'] = ''
+    if 'home_goals' in hist.columns:
+        hist['home_goals'] = pd.to_numeric(hist['home_goals'], errors='coerce')
+    else:
+        hist['home_goals'] = np.nan
+    if 'away_goals' in hist.columns:
+        hist['away_goals'] = pd.to_numeric(hist['away_goals'], errors='coerce')
+    else:
+        hist['away_goals'] = np.nan
 
     gid_to_total: Dict[str, float] = {}
+    gid_to_winner: Dict[str, str] = {}
     for _, row in hist.dropna(subset=['game_id', 'total_goals']).iterrows():
         key = _norm_game_id(row.get('game_id'))
         if not key:
@@ -10867,11 +11019,26 @@ def grade_bets_log(
             gid_to_total[key] = float(row['total_goals'])
         except Exception:
             continue
+        try:
+            hg = float(row.get('home_goals'))
+            ag = float(row.get('away_goals'))
+            if np.isfinite(hg) and np.isfinite(ag):
+                gid_to_winner[key] = 'HOME' if hg > ag else ('AWAY' if ag > hg else 'PUSH')
+        except Exception:
+            pass
     matchup_date_to_total: Dict[Tuple[str, Any], float] = {}
+    matchup_date_to_winner: Dict[Tuple[str, Any], str] = {}
     for _, row in hist.dropna(subset=['matchup', 'date_only', 'total_goals']).iterrows():
         key = (_norm_matchup(row['matchup']), row['date_only'])
         if key[0] and key[1] is not None:
             matchup_date_to_total[key] = float(row['total_goals'])
+            try:
+                hg = float(row.get('home_goals'))
+                ag = float(row.get('away_goals'))
+                if np.isfinite(hg) and np.isfinite(ag):
+                    matchup_date_to_winner[key] = 'HOME' if hg > ag else ('AWAY' if ag > hg else 'PUSH')
+            except Exception:
+                pass
 
     date_only = bet_date_only
 
@@ -10884,25 +11051,30 @@ def grade_bets_log(
     # historical ETL skipped a Final due to missing advanced stats, and when bet date is NaT).
     fetcher = None
     fetched_totals: Dict[str, float] = {}
+    fetched_winners: Dict[str, str] = {}
     fetched_states: Dict[str, str] = {}
     for idx in df_log.index[candidate_mask]:
         gid = str(game_id_series.loc[idx] or '').strip()
         total = None
+        winner = None
         if gid and gid in gid_to_total:
             total = gid_to_total.get(gid)
-            if total is not None:
+            winner = gid_to_winner.get(gid)
+            if total is not None or winner is not None:
                 matched_by_gid += 1
         if total is None and date_only is not None:
             m = str(matchup_series.loc[idx] or '').strip().upper()
             d = date_only.loc[idx] if hasattr(date_only, 'loc') else None
             if m and d is not None:
                 total = matchup_date_to_total.get((m, d))
-                if total is not None:
+                winner = matchup_date_to_winner.get((m, d))
+                if total is not None or winner is not None:
                     matched_by_matchup_date += 1
-        if total is None and gid:
+        if (total is None or winner is None) and gid:
             # Fetch by game id (fast, single-game request) if we haven't already.
-            if gid in fetched_totals:
+            if gid in fetched_totals or gid in fetched_winners:
                 total = fetched_totals.get(gid)
+                winner = fetched_winners.get(gid)
             else:
                 try:
                     if fetcher is None:
@@ -10927,40 +11099,76 @@ def grade_bets_log(
                     if hs_i is not None and as_i is not None and state in {'FINAL', 'OFF', 'FINALOT', 'FINALSO'}:
                         total = float(hs_i + as_i)
                         fetched_totals[gid] = total
+                        fetched_winners[gid] = 'HOME' if hs_i > as_i else ('AWAY' if as_i > hs_i else 'PUSH')
+                        winner = fetched_winners.get(gid)
                     else:
                         fetched_totals[gid] = None  # cache miss (not final or missing)
+                        fetched_winners[gid] = None  # cache miss
                 except Exception:
                     fetched_totals[gid] = None
-        if total is None:
-            skipped += 1
-            if len(examples_unmatched) < 6:
-                try:
-                    d_str = str(date_only.loc[idx]) if (date_only is not None and hasattr(date_only, 'loc')) else ''
-                except Exception:
-                    d_str = ''
-                examples_unmatched.append(f"gid={gid or '—'} matchup={matchup_series.loc[idx] or '—'} date={d_str or '—'}")
-            continue
 
-        try:
-            line_val = float(line.loc[idx])
-        except Exception:
-            skipped += 1
-            continue
         side_val = str(side.loc[idx] or '').strip().upper()
-        if side_val not in {'OVER', 'UNDER'}:
-            skipped += 1
-            continue
-
-        if total > line_val:
-            outcome = 'OVER'
-        elif total < line_val:
-            outcome = 'UNDER'
+        is_ml_candidate = bool(candidate_ml_mask.loc[idx]) if idx in candidate_ml_mask.index else False
+        if is_ml_candidate:
+            if winner is None:
+                skipped += 1
+                if len(examples_unmatched) < 6:
+                    try:
+                        d_str = str(date_only.loc[idx]) if (date_only is not None and hasattr(date_only, 'loc')) else ''
+                    except Exception:
+                        d_str = ''
+                    examples_unmatched.append(f"gid={gid or '—'} matchup={matchup_series.loc[idx] or '—'} date={d_str or '—'}")
+                continue
+            if side_val in {'HOME', 'HML'} or 'HOME' in side_val:
+                ml_pick_side = 'HOME'
+            elif side_val in {'AWAY', 'AML'} or 'AWAY' in side_val:
+                ml_pick_side = 'AWAY'
+            else:
+                ml_pick_side = None
+                m = str(matchup_series.loc[idx] or '').strip().upper()
+                if '@' in m:
+                    away_code, home_code = m.split('@', 1)
+                    if side_val == away_code:
+                        ml_pick_side = 'AWAY'
+                    elif side_val == home_code:
+                        ml_pick_side = 'HOME'
+            if ml_pick_side is None:
+                skipped += 1
+                continue
+            outcome = winner
         else:
-            outcome = 'PUSH'
+            if total is None:
+                skipped += 1
+                if len(examples_unmatched) < 6:
+                    try:
+                        d_str = str(date_only.loc[idx]) if (date_only is not None and hasattr(date_only, 'loc')) else ''
+                    except Exception:
+                        d_str = ''
+                    examples_unmatched.append(f"gid={gid or '—'} matchup={matchup_series.loc[idx] or '—'} date={d_str or '—'}")
+                continue
+            try:
+                line_val = float(line.loc[idx])
+            except Exception:
+                skipped += 1
+                continue
+            if side_val not in {'OVER', 'UNDER'}:
+                skipped += 1
+                continue
+            if total > line_val:
+                outcome = 'OVER'
+            elif total < line_val:
+                outcome = 'UNDER'
+            else:
+                outcome = 'PUSH'
 
         grade_val = None
         if outcome == 'PUSH':
             grade_val = 'PUSH'
+        elif is_ml_candidate and winner is not None:
+            if ml_pick_side == winner:
+                grade_val = 'WIN'
+            else:
+                grade_val = 'LOSS'
         elif outcome == side_val:
             grade_val = 'WIN'
         else:
@@ -10978,7 +11186,7 @@ def grade_bets_log(
     # Recompute after-mask
     result_norm_after = df_log[result_col].astype(str).str.strip().str.upper()
     ungraded_after = result_norm_after.isin(ungraded_tokens) | df_log[result_col].isna()
-    summary['ungraded_after'] = int((ungraded_after & actionable_mask).sum())
+    summary['ungraded_after'] = int((ungraded_after & (actionable_mask | ml_pick_mask)).sum())
 
     try:
         print(
@@ -14322,6 +14530,25 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             try:
                 closing_odds_path = getattr(cli_args, 'closing_odds_path', None) if cli_args else None
                 log_bets(predictions, logfile=getattr(cli_args, 'log_path', 'bets_log.csv'), closing_odds_path=closing_odds_path)
+                # Grade again after appending rows so backdated slates (e.g., yesterday)
+                # become visible in public records immediately, not only on the next run.
+                try:
+                    post_log_summary = grade_bets_log(
+                        log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else 'bets_log.csv',
+                        historical_days=hist_days,
+                        historical_cache_path=cache_path,
+                        force_refresh=False,
+                        historical_frame=historical_data,
+                        historical_as_of_date=historical_as_of_date
+                    )
+                    post_written = (post_log_summary or {}).get('written_path')
+                    if post_written and cli_args is not None:
+                        try:
+                            setattr(cli_args, 'log_path', str(post_written))
+                        except Exception:
+                            pass
+                except Exception as grade_err:
+                    print(f"⚠️  Post-log grading skipped: {grade_err}")
             except Exception as e:
                 print(f"⚠️  Could not log bets: {e}")
         else:
