@@ -1,12 +1,15 @@
 import hashlib
 import hmac
+import json
 import os
 import subprocess
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -266,6 +269,84 @@ def _publish_outputs_to_github(
     return True, f"Published {len(rel_files)} file(s) to {repo}@{branch}.", details
 
 
+def _trigger_github_workflow_dispatch(
+    repo: str,
+    token: str,
+    workflow_id: str,
+    ref: str,
+    inputs: Optional[Dict[str, str]] = None,
+) -> Tuple[bool, str, Dict[str, object]]:
+    """Trigger a GitHub Actions workflow_dispatch run via REST API."""
+    details: Dict[str, object] = {
+        "repo": "",
+        "workflow_id": "",
+        "ref": "",
+        "inputs": {},
+        "actions_url": "",
+    }
+    repo_val = str(repo or "").strip().strip("/")
+    workflow_val = str(workflow_id or "").strip() or "run-nhl-model.yml"
+    ref_val = str(ref or "").strip() or "main"
+    token_val = str(token or "").strip()
+    details["repo"] = repo_val
+    details["workflow_id"] = workflow_val
+    details["ref"] = ref_val
+    details["actions_url"] = f"https://github.com/{repo_val}/actions/workflows/{workflow_val}" if repo_val else ""
+
+    if not repo_val:
+        return False, "Workflow dispatch skipped: GitHub repo is not configured.", details
+    if not token_val:
+        return False, "Workflow dispatch skipped: GitHub token is not configured.", details
+
+    safe_inputs: Dict[str, str] = {}
+    if isinstance(inputs, dict):
+        for k, v in inputs.items():
+            key = str(k or "").strip()
+            if not key:
+                continue
+            val = str(v or "").strip()
+            safe_inputs[key] = val
+    details["inputs"] = safe_inputs
+
+    payload: Dict[str, object] = {"ref": ref_val}
+    if safe_inputs:
+        payload["inputs"] = safe_inputs
+
+    workflow_ref = quote(workflow_val, safe="")
+    dispatch_url = f"https://api.github.com/repos/{repo_val}/actions/workflows/{workflow_ref}/dispatches"
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(
+        dispatch_url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token_val}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "nhl-streamlit-admin/1.0",
+        },
+    )
+    try:
+        with urlopen(req, timeout=20) as response:
+            status = int(getattr(response, "status", 0) or 0)
+        if status in {200, 201, 202, 204}:
+            run_hint = f"https://github.com/{repo_val}/actions/workflows/{workflow_val}"
+            return True, f"Workflow dispatch queued on {repo_val}@{ref_val}.", {**details, "actions_url": run_hint}
+        return False, f"Workflow dispatch failed with status {status}.", details
+    except HTTPError as e:
+        err_txt = ""
+        try:
+            err_txt = (e.read() or b"").decode("utf-8", errors="ignore").strip()
+        except Exception:
+            err_txt = ""
+        if err_txt:
+            return False, f"Workflow dispatch failed ({e.code}): {err_txt}", details
+        return False, f"Workflow dispatch failed with HTTP {e.code}.", details
+    except Exception as e:
+        return False, f"Workflow dispatch failed: {e}", details
+
+
 def render_admin_app() -> None:
     st.set_page_config(page_title="NHL O/U Admin Runner", layout="wide")
     st.title("NHL Over/Under Admin")
@@ -332,6 +413,18 @@ def render_admin_app() -> None:
         publish_commit_message = st.text_input(
             "Publish commit message",
             value="chore(admin): refresh public app outputs [skip ci]",
+        )
+        trigger_workflow_after_publish = st.checkbox(
+            "Trigger GitHub Action workflow after successful publish",
+            value=True,
+            help="Dispatches run-nhl-model.yml after publishing outputs so cloud-hosted artifacts refresh as well.",
+        )
+        default_workflow_file = _read_streamlit_secret("GITHUB_WORKFLOW_FILE") or "run-nhl-model.yml"
+        workflow_file = st.text_input("Workflow file to dispatch", value=default_workflow_file)
+        workflow_ref = st.text_input(
+            "Workflow ref (branch/tag)",
+            value=(default_branch or "main"),
+            help="Workflow will be dispatched against this ref.",
         )
         if default_push_token:
             st.caption("Default GitHub push token detected from secrets/env.")
@@ -401,43 +494,46 @@ def render_admin_app() -> None:
     else:
         st.error(f"Model run failed with exit code {rc}.")
 
+    effective_push_token = push_token_override.strip() or default_push_token
+    effective_repo = (github_repo or "").strip()
+    effective_branch = (github_branch or "").strip() or "main"
+    publish_ok = False
+    publish_details: Dict[str, object] = {
+        "repo": effective_repo,
+        "branch": effective_branch,
+        "published_files": [],
+        "commit_sha": "",
+        "commit_url": "",
+        "committed_new_changes": False,
+        "pushed": False,
+    }
+
     if rc == 0 and publish_to_github:
-        effective_push_token = push_token_override.strip() or default_push_token
-        effective_repo = (github_repo or "").strip()
-        effective_branch = (github_branch or "").strip() or "main"
         publish_files = [
             "public_predictions.json",
             log_path.strip() or "bets_log.csv",
             "predictions.png",
             "nhl_real_data_dashboard.html",
         ]
-        publish_details: Dict[str, object] = {
-            "repo": effective_repo,
-            "branch": effective_branch,
-            "published_files": publish_files,
-            "commit_sha": "",
-            "commit_url": "",
-            "committed_new_changes": False,
-            "pushed": False,
-        }
+        publish_details["published_files"] = publish_files
         if not effective_repo:
-            ok = False
+            publish_ok = False
             msg = "Publish skipped: GitHub repo is not configured. Set GITHUB_REPO or fill the field."
             st.warning(msg)
         elif not effective_push_token:
-            ok = False
+            publish_ok = False
             msg = "Publish skipped: GitHub push token is not configured. Set GITHUB_PUSH_TOKEN or provide override."
             st.warning(msg)
         else:
             with st.spinner("Publishing outputs to GitHub..."):
-                ok, msg, publish_details = _publish_outputs_to_github(
+                publish_ok, msg, publish_details = _publish_outputs_to_github(
                     repo=effective_repo,
                     branch=effective_branch,
                     token=effective_push_token,
                     files_to_publish=publish_files,
                     commit_message=publish_commit_message,
                 )
-            if ok:
+            if publish_ok:
                 st.success(msg)
             else:
                 st.error(msg)
@@ -457,6 +553,35 @@ def render_admin_app() -> None:
         if published_files:
             st.caption("Files considered for publish:")
             st.code("\n".join(str(v) for v in published_files), language="text")
+
+    if rc == 0 and trigger_workflow_after_publish:
+        if publish_to_github and not publish_ok:
+            st.warning("Workflow dispatch skipped because publish did not succeed.")
+        else:
+            dispatch_ref = (workflow_ref or "").strip() or (effective_branch or "main")
+            dispatch_workflow = (workflow_file or "").strip() or "run-nhl-model.yml"
+            dispatch_inputs = {
+                "run_date": run_date.isoformat(),
+                "train_speed": train_speed,
+                "train_target": train_target,
+            }
+            with st.spinner("Triggering GitHub Actions workflow..."):
+                wf_ok, wf_msg, wf_details = _trigger_github_workflow_dispatch(
+                    repo=effective_repo,
+                    token=effective_push_token,
+                    workflow_id=dispatch_workflow,
+                    ref=dispatch_ref,
+                    inputs=dispatch_inputs,
+                )
+            st.markdown("#### Workflow dispatch status")
+            if wf_ok:
+                st.success(wf_msg)
+            else:
+                st.error(wf_msg)
+            actions_url = str((wf_details or {}).get("actions_url") or "").strip()
+            if actions_url:
+                st.markdown(f"[Open workflow runs]({actions_url})")
+            st.caption(f"Dispatch target: `{effective_repo}@{dispatch_ref}` • workflow `{dispatch_workflow}`")
 
     st.subheader("Artifacts")
     predictions_image = APP_ROOT / "predictions.png"
