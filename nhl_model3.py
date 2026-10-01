@@ -57,6 +57,10 @@ import html as html_parser
 import errno
 import unicodedata
 from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # type: ignore[assignment]
 import inspect
 from scipy.stats import norm, poisson, nbinom, skellam
 from sklearn.isotonic import IsotonicRegression
@@ -11775,6 +11779,230 @@ def save_predictions_image(
 
     return None
 
+
+def save_public_app_snapshot_image(
+    log_path: Optional[str] = None,
+    image_path: str = "predictions_discord.png",
+    max_rows_per_table: int = 14,
+) -> Optional[str]:
+    """Render a Discord image that mirrors Streamlit public app content."""
+    if not MATPLOTLIB_AVAILABLE:
+        print("⚠️  Matplotlib not available; cannot render public snapshot image.")
+        return None
+    try:
+        import streamlit_public as public_view
+    except Exception as exc:
+        print(f"⚠️  Could not import streamlit_public for Discord snapshot: {exc}")
+        return None
+
+    try:
+        board_path = Path("public_predictions.json")
+        log_file = str(log_path or "bets_log.csv")
+        log_path_obj = Path(log_file)
+        board_games, board_dt, board_branch, board_slate_date = public_view._read_public_predictions(
+            board_path,
+            prefer_remote=False,
+        )
+        run_rows, run_dt = public_view._latest_run_rows(
+            log_path_obj,
+            prefer_remote=False,
+            remote_branch=board_branch,
+        )
+        schedule_tz = str(os.getenv("SCHEDULE_TZ", "US/Eastern") or "US/Eastern").strip() or "US/Eastern"
+        if ZoneInfo is not None:
+            try:
+                metrics_ref_date = datetime.now(ZoneInfo(schedule_tz)).date()
+            except Exception:
+                metrics_ref_date = datetime.now().date()
+        else:
+            metrics_ref_date = datetime.now().date()
+        metrics = public_view._compute_record_blocks(
+            log_path_obj,
+            prefer_remote=False,
+            remote_branch=board_branch,
+            reference_date=metrics_ref_date,
+        )
+        ml_rows, ou_rows = public_view._build_tables_from_public(board_games)
+        if not ou_rows and run_rows:
+            ou_rows = public_view._build_totals_from_log_rows(run_rows)
+        shown_dt = board_dt or run_dt or datetime.now()
+        last_updated_et = public_view._format_last_updated_et(shown_dt)
+        if board_slate_date is not None:
+            slate_date_text = datetime.combine(board_slate_date, datetime.min.time()).strftime("%A, %b %d, %Y")
+        else:
+            slate_date_text = shown_dt.strftime("%A, %b %d, %Y")
+    except Exception as exc:
+        print(f"⚠️  Failed to build public app snapshot payload: {exc}")
+        return None
+
+    table_columns = ["Game Time (ET)", "Away", "Home", "Mkt", "Fair", "Pick", "Edge", "Confidence"]
+
+    def _strip_internal_cols(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                out.append({k: v for k, v in row.items() if not str(k).startswith("_")})
+        return out
+
+    ml_clean = _strip_internal_cols(ml_rows)
+    ou_clean = _strip_internal_cols(ou_rows)
+    if max_rows_per_table > 0:
+        ml_clean = ml_clean[: int(max_rows_per_table)]
+        ou_clean = ou_clean[: int(max_rows_per_table)]
+
+    def _parse_number(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        txt = str(value).strip().replace("%", "")
+        if not txt or txt == "—":
+            return None
+        try:
+            out = float(txt)
+            if np.isfinite(out):
+                return out
+        except Exception:
+            return None
+        return None
+
+    def _text_color_for_bg(bg_hex: str) -> str:
+        raw = str(bg_hex or "").strip().lstrip("#")
+        if len(raw) == 3:
+            raw = "".join(ch * 2 for ch in raw)
+        if len(raw) != 6:
+            return "#f8fafc"
+        try:
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
+        except Exception:
+            return "#f8fafc"
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        return "#0b1220" if luminance > 0.55 else "#f8fafc"
+
+    def _render_table(ax: Any, title: str, rows: List[Dict[str, Any]]) -> None:
+        ax.axis("off")
+        ax.set_facecolor("#0b1220")
+        ax.text(
+            0.0,
+            1.08,
+            title,
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            color="#e2e8f0",
+            fontsize=11,
+            fontweight="bold",
+        )
+        if not rows:
+            ax.text(0.5, 0.5, "No rows available.", ha="center", va="center", color="#94a3b8", fontsize=10)
+            return
+        frame = pd.DataFrame(rows)
+        for col in table_columns:
+            if col not in frame.columns:
+                frame[col] = "—"
+        frame = frame[table_columns].fillna("—")
+        cell_text = frame.astype(str).values.tolist()
+        col_widths = [0.12, 0.18, 0.18, 0.08, 0.08, 0.14, 0.10, 0.12]
+        table = ax.table(
+            cellText=cell_text,
+            colLabels=table_columns,
+            colLoc="center",
+            cellLoc="center",
+            colWidths=col_widths,
+            loc="upper left",
+            bbox=[0.0, 0.0, 1.0, 1.0],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8.8)
+        table.scale(1, 1.14)
+
+        for (r_idx, c_idx), cell in table.get_celld().items():
+            cell.set_edgecolor("#32415f")
+            cell.set_linewidth(0.8)
+            if r_idx == 0:
+                cell.set_facecolor("#2a334a")
+                cell.get_text().set_color("#dbe7ff")
+                cell.get_text().set_fontweight("bold")
+                continue
+            row_pos = r_idx - 1
+            base_bg = "#0f1a2e" if r_idx % 2 else "#101d34"
+            cell.set_facecolor(base_bg)
+            cell.get_text().set_color("#f1f5f9")
+            col_name = table_columns[c_idx] if c_idx < len(table_columns) else ""
+            raw_val = frame.iloc[row_pos, c_idx] if row_pos < len(frame) else ""
+            txt_val = str(raw_val).strip()
+            upper_val = txt_val.upper()
+
+            if col_name == "Pick":
+                if upper_val == "OVER":
+                    cell.set_facecolor("#166534")
+                    cell.get_text().set_color("#dcfce7")
+                    cell.get_text().set_fontweight("bold")
+                elif upper_val == "UNDER":
+                    cell.set_facecolor("#991b1b")
+                    cell.get_text().set_color("#fee2e2")
+                    cell.get_text().set_fontweight("bold")
+                elif upper_val not in {"", "—", "NO BET"}:
+                    team_bg = str(get_team_primary_color(txt_val) or "#1d4ed8").strip()
+                    cell.set_facecolor(team_bg)
+                    cell.get_text().set_color(_text_color_for_bg(team_bg))
+                    cell.get_text().set_fontweight("bold")
+            elif col_name == "Edge":
+                edge_num = _parse_number(txt_val)
+                if edge_num is not None:
+                    intensity = min(0.8, 0.22 + min(abs(edge_num), 12.0) * 0.05)
+                    if edge_num >= 0:
+                        cell.set_facecolor((16 / 255.0, 185 / 255.0, 129 / 255.0, intensity))
+                        cell.get_text().set_color("#ecfeff")
+                    else:
+                        cell.set_facecolor((244 / 255.0, 63 / 255.0, 94 / 255.0, intensity))
+                        cell.get_text().set_color("#ffe4e6")
+            elif col_name == "Confidence":
+                conf_num = _parse_number(txt_val)
+                if conf_num is not None:
+                    centered = max(-1.0, min(1.0, (conf_num - 50.0) / 50.0))
+                    intensity = 0.2 + abs(centered) * 0.6
+                    if centered >= 0:
+                        cell.set_facecolor((20 / 255.0, 184 / 255.0, 166 / 255.0, intensity))
+                        cell.get_text().set_color("#ecfeff")
+                    else:
+                        cell.set_facecolor((236 / 255.0, 72 / 255.0, 153 / 255.0, intensity))
+                        cell.get_text().set_color("#fdf2f8")
+
+    metric_line = (
+        f"ML Yesterday {metrics.get('ml_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_prev_day', ('0-0', '+0.0%'))[1]})   |   "
+        f"ML YTD {metrics.get('ml_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_ytd', ('0-0', '+0.0%'))[1]})   |   "
+        f"Totals Yesterday {metrics.get('tot_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_prev_day', ('0-0', '+0.0%'))[1]})   |   "
+        f"Totals YTD {metrics.get('tot_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_ytd', ('0-0', '+0.0%'))[1]})"
+    )
+    subtitle = f"Slate Date: {slate_date_text}   |   Last updated: {last_updated_et}"
+
+    ml_rows_count = max(1, len(ml_clean))
+    ou_rows_count = max(1, len(ou_clean))
+    table_unit_h = 0.27
+    fig_height = max(8.5, 2.5 + table_unit_h * (ml_rows_count + ou_rows_count))
+    fig = plt.figure(figsize=(15.5, fig_height))
+    fig.patch.set_facecolor("#0b1220")
+    gs = fig.add_gridspec(2, 1, height_ratios=[max(2.0, 1.2 + ml_rows_count * 0.13), max(2.0, 1.2 + ou_rows_count * 0.13)], hspace=0.16)
+
+    fig.suptitle("NHL Picks", color="#f8fafc", fontsize=20, fontweight="bold", y=0.985)
+    fig.text(0.5, 0.956, metric_line, ha="center", va="center", color="#cbd5e1", fontsize=11, fontweight="semibold")
+    fig.text(0.5, 0.934, subtitle, ha="center", va="center", color="#94a3b8", fontsize=9.5)
+
+    ax_ml = fig.add_subplot(gs[0, 0])
+    ax_ou = fig.add_subplot(gs[1, 0])
+    _render_table(ax_ml, "Moneyline Picks", ml_clean)
+    _render_table(ax_ou, "Over/Under Picks", ou_clean)
+
+    try:
+        plt.savefig(image_path, bbox_inches="tight", dpi=200, facecolor=fig.get_facecolor())
+    finally:
+        plt.close(fig)
+    if os.path.exists(image_path):
+        print(f"✅ Saved public app snapshot image to {image_path}")
+        return image_path
+    return None
+
 def create_dashboard_html(
     predictions: List[OverUnderPrediction],
     training_results: Dict,
@@ -14597,7 +14825,20 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     topn = 10
                 if not cli_args or getattr(cli_args, 'post_inline', False):
                     posted_discord = False
-                    if img_path and os.path.exists(img_path):
+                    discord_img_path = None
+                    try:
+                        discord_img_path = save_public_app_snapshot_image(
+                            log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None,
+                            image_path='predictions_discord.png'
+                        )
+                    except Exception:
+                        discord_img_path = None
+                    if discord_img_path and os.path.exists(discord_img_path):
+                        posted_discord = social_poster.post_file_to_discord(
+                            discord_img_path,
+                            message='🏒 NHL Picks (Public App View)'
+                        )
+                    elif img_path and os.path.exists(img_path):
                         posted_discord = social_poster.post_file_to_discord(
                             img_path,
                             message='🏒 NHL Predictions Table'
