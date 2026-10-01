@@ -408,7 +408,7 @@ def render_admin_app() -> None:
         log_path = st.text_input("Bets log path", value="bets_log.csv")
         post_discord = st.checkbox(
             "Post to Discord after run",
-            value=False,
+            value=True,
             help="Adds --post-social + --post-inline. Requires DISCORD_WEBHOOK_URL in app secrets/env.",
         )
         discord_top_n = st.number_input("Discord top picks count", min_value=1, max_value=25, value=10, step=1)
