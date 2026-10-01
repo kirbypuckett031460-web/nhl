@@ -20,14 +20,6 @@ except ImportError:
     print("⚠️  tweepy not installed. Twitter posting disabled.")
 
 try:
-    import discord
-
-    DISCORD_AVAILABLE = True
-except ImportError:
-    DISCORD_AVAILABLE = False
-    print("⚠️  discord.py not installed. Discord bot posting disabled.")
-
-try:
     import imgkit  # requires wkhtmltoimage installed on system
 
     IMGKIT_AVAILABLE = True
