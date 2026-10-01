@@ -118,8 +118,10 @@ jobs:
           CMD+=("${DATE_ARG[@]}")
 
           if [[ -n "${ODDS_API_KEY:-}" ]]; then
+            echo "Using realtime odds API (ODDS_API_KEY present)."
             CMD+=(--realtime-odds --log-odds-history --odds-history-path odds_history.csv)
           else
+            echo "::warning::ODDS_API_KEY is not configured. Realtime odds disabled; using local odds.json fallback."
             CMD+=(--odds-path odds.json)
           fi
 
@@ -138,14 +140,20 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           FILES=(
-            "predictions.png"
-            "nhl_real_data_dashboard.html"
-            "public_predictions.json"
             "bets_log.csv"
             "odds_history.csv"
             "data/cache/trained_model.joblib"
             "data/history/historical_games.csv"
           )
+          if [[ -n "${ODDS_API_KEY:-}" ]]; then
+            FILES+=(
+              "predictions.png"
+              "nhl_real_data_dashboard.html"
+              "public_predictions.json"
+            )
+          else
+            echo "ODDS_API_KEY missing: skipping public artifact publish files to avoid overwriting market/edge data with fallback odds."
+          fi
           for file in "${FILES[@]}"; do
             if [[ -f "${file}" ]]; then
               git add "${file}"

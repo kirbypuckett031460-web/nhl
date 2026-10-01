@@ -358,15 +358,16 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
                     for k in ("home_moneyline_odds", "away_moneyline_odds", "consensus_home_moneyline", "consensus_away_moneyline")
                 ):
                     moneyline_market_count += 1
-            # Prefer payloads with real scheduled games over synthetic/demo rows,
-            # then pick the freshest generated_at among those.
+            # Prefer real slates with market coverage and fresh timestamps.
+            # This avoids selecting stale branch payloads that have more games
+            # but missing market fields.
             key = (
                 1 if real_count > 0 else 0,
-                real_count,
-                totals_market_count,
-                moneyline_market_count,
+                1 if (totals_market_count > 0 or moneyline_market_count > 0) else 0,
                 1 if generated_dt is not None else 0,
                 generated_dt or datetime.min,
+                moneyline_market_count + totals_market_count,
+                real_count,
                 -synthetic_count,
                 len(games),
             )
@@ -728,7 +729,10 @@ def render_public_app() -> None:
 
     log_path = APP_ROOT / "bets_log.csv"
     board_path = APP_ROOT / "public_predictions.json"
-    prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
+    # Prefer remote repository artifacts by default so the app reflects the
+    # latest published outputs even when the app container's local files lag.
+    # Set PUBLIC_APP_FORCE_LOCAL=true only when intentionally debugging local files.
+    prefer_remote = not _env_truthy("PUBLIC_APP_FORCE_LOCAL", default=False)
     board_games, board_dt, board_branch, board_slate_date = _read_public_predictions(board_path, prefer_remote=prefer_remote)
     run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
     # "Yesterday" metrics should reflect the real calendar day in schedule timezone,
@@ -756,6 +760,8 @@ def render_public_app() -> None:
     else:
         slate_dt_display = shown_dt
     st.write(f"Slate Date: {slate_dt_display.strftime('%A, %b %d, %Y')}")
+    source_label = f"remote:{board_branch}" if (prefer_remote and board_branch) else ("remote:unresolved" if prefer_remote else "local")
+    st.caption(f"Data source: {source_label}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Moneyline Yesterday", metrics["ml_prev_day"][0], metrics["ml_prev_day"][1])
