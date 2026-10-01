@@ -14851,7 +14851,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     if discord_img_path and os.path.exists(discord_img_path):
                         posted_discord = social_poster.post_file_to_discord(
                             discord_img_path,
-                            message='🏒 NHL Picks (Public App View)'
+                            message='🏒 NHL Picks'
                         )
                     elif img_path and os.path.exists(img_path):
                         posted_discord = social_poster.post_file_to_discord(
