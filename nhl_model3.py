@@ -11418,14 +11418,15 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
     head = (
         "<!DOCTYPE html>\n"
         "<html><head><meta charset=\"utf-8\"><style>\n"
-        "body { font-family: Segoe UI, Arial, sans-serif; background:#ffffff; color:#2c3e50; }\n"
-        "table { border-collapse: collapse; width: 100%; background:#ffffff; }\n"
-        "th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }\n"
-        "th { background:#2c3e50; color:#fff; text-align:left; }\n"
+        "body { font-family: Segoe UI, Arial, sans-serif; background:#0f1420; color:#e6edf7; }\n"
+        "table { border-collapse: collapse; width: 100%; background:#121a2b; }\n"
+        "th, td { border: 1px solid #3a445a; padding: 8px; font-size: 14px; }\n"
+        "th { background:#273248; color:#f8fbff; text-align:left; }\n"
         ".rec-over { background:#27ae60; color:#ffffff; font-weight:700; }\n"
         ".rec-under { background:#c0392b; color:#ffffff; font-weight:700; }\n"
-        ".rec-no-bet { background:#f9e79f; color:#7d6608; font-weight:700; }\n"
-        "tr:nth-child(even) { background:#fafafa; }\n"
+        ".rec-no-bet { background:#5f4f68; color:#f4e9ff; font-weight:700; }\n"
+        "tr:nth-child(odd) { background:#141b2d; }\n"
+        "tr:nth-child(even) { background:#101728; }\n"
         "</style></head><body>\n<table>\n<thead><tr>\n"
         "<th>Matchup</th><th>Line</th><th>Predicted</th><th>Edge</th><th>Home ML</th><th>Away ML</th>\n"
         "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
@@ -11630,8 +11631,8 @@ def save_predictions_image(
             ml_team = getattr(pred, 'away_team', None)
         ml_is_no_bet = ml_upper.startswith('NO BET') or ml_upper == '—'
         ml_display = 'No Bet' if ml_is_no_bet else '—'
-        ml_bg_color = '#ecf0f1'
-        ml_text_color = '#2c3e50'
+        ml_bg_color = '#2a3142'
+        ml_text_color = '#c7d3e6'
         if ml_team and not ml_is_no_bet:
             abbr = get_team_abbreviation(ml_team)
             fallback_label = 'HOME' if ml_side == 'home' else 'AWAY'
@@ -11666,8 +11667,8 @@ def save_predictions_image(
 
     df = df.sort_values(by=['_sort_key', 'Time'])
     row_count = len(df)
-    moneyline_bg = df['_MoneylineBg'].tolist() if '_MoneylineBg' in df.columns else ['#ecf0f1'] * row_count
-    moneyline_text = df['_MoneylineText'].tolist() if '_MoneylineText' in df.columns else ['#2c3e50'] * row_count
+    moneyline_bg = df['_MoneylineBg'].tolist() if '_MoneylineBg' in df.columns else ['#2a3142'] * row_count
+    moneyline_text = df['_MoneylineText'].tolist() if '_MoneylineText' in df.columns else ['#c7d3e6'] * row_count
     drop_cols = [col for col in ['_sort_key', '_MoneylineBg', '_MoneylineText'] if col in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
@@ -11680,7 +11681,8 @@ def save_predictions_image(
     bottom_pad_in = 0.25
     fig_height = max(1.0, (n_table_rows * row_height_in) + title_height_in + bottom_pad_in)
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
-    fig.patch.set_facecolor('white')
+    fig.patch.set_facecolor('#0f1420')
+    ax.set_facecolor('#0f1420')
     ax.axis('off')
 
     perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
@@ -11691,7 +11693,7 @@ def save_predictions_image(
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds from FanDuel."
     )
-    ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
+    ax.set_title(title_text, fontsize=16, fontweight='bold', color='#e8edf5', loc='center', pad=6)
     top_margin = title_height_in / fig_height
     bottom_margin = bottom_pad_in / fig_height
     ax.set_position([0.02, bottom_margin, 0.96, 1.0 - top_margin - bottom_margin])
@@ -11725,10 +11727,10 @@ def save_predictions_image(
     table.scale(1, 1.0)
 
     for (row_idx, col_idx), cell in table.get_celld().items():
-        cell.set_edgecolor('#bdc3c7')
+        cell.set_edgecolor('#3a445a')
         if row_idx == 0:
-            cell.set_facecolor('#2c3e50')
-            cell.set_text_props(color='white', weight='bold', fontsize=13)
+            cell.set_facecolor('#273248')
+            cell.set_text_props(color='#f8fbff', weight='bold', fontsize=13)
         else:
             col_name = columns[col_idx] if col_idx < len(columns) else ''
             if col_name == 'Pick':
@@ -11740,23 +11742,28 @@ def save_predictions_image(
                     cell.set_facecolor('#c0392b')
                     cell.set_text_props(color='white', weight='bold')
                 else:
-                    cell.set_facecolor('#ecf0f1')
+                    cell.set_facecolor('#5f4f68')
+                    cell.set_text_props(color='#f4e9ff', weight='bold')
             elif col_name == 'Moneyline':
                 data_idx = row_idx - 1
                 ml_val = str(df.iloc[data_idx, col_idx]).strip() if data_idx < len(df) else ''
-                bg_color = moneyline_bg[data_idx] if data_idx < len(moneyline_bg) else '#ecf0f1'
-                text_color = moneyline_text[data_idx] if data_idx < len(moneyline_text) else '#2c3e50'
+                bg_color = moneyline_bg[data_idx] if data_idx < len(moneyline_bg) else '#2a3142'
+                text_color = moneyline_text[data_idx] if data_idx < len(moneyline_text) else '#c7d3e6'
                 upper_val = ml_val.upper()
                 if not ml_val or upper_val == '—' or upper_val.startswith('NO BET'):
-                    bg_color = '#ecf0f1'
-                    text_color = '#2c3e50'
+                    bg_color = '#2a3142'
+                    text_color = '#c7d3e6'
                     font_weight = 'normal'
                 else:
                     font_weight = 'bold'
                 cell.set_facecolor(bg_color)
                 cell.set_text_props(color=text_color, weight=font_weight)
             elif row_idx % 2 == 0:
-                cell.set_facecolor('#f8f9fa')
+                cell.set_facecolor('#101728')
+                cell.set_text_props(color='#dfe7f3')
+            else:
+                cell.set_facecolor('#141b2d')
+                cell.set_text_props(color='#dfe7f3')
 
     plt.tight_layout()
     plt.savefig(image_path, bbox_inches='tight', dpi=200)
