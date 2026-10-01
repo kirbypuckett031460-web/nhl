@@ -340,9 +340,16 @@ def _trigger_github_workflow_dispatch(
             err_txt = (e.read() or b"").decode("utf-8", errors="ignore").strip()
         except Exception:
             err_txt = ""
+        if e.code == 403 and "Resource not accessible by personal access token" in err_txt:
+            guidance = (
+                " Use a token with workflow-dispatch permissions "
+                "(classic PAT: `repo` + `workflow`; fine-grained PAT: Actions Read/Write + Contents Read/Write)."
+            )
+        else:
+            guidance = ""
         if err_txt:
-            return False, f"Workflow dispatch failed ({e.code}): {err_txt}", details
-        return False, f"Workflow dispatch failed with HTTP {e.code}.", details
+            return False, f"Workflow dispatch failed ({e.code}): {err_txt}{guidance}", details
+        return False, f"Workflow dispatch failed with HTTP {e.code}.{guidance}", details
     except Exception as e:
         return False, f"Workflow dispatch failed: {e}", details
 
@@ -412,9 +419,17 @@ def render_admin_app() -> None:
         default_branch = _read_streamlit_secret("GITHUB_BRANCH") or str(os.getenv("GITHUB_BRANCH", "main")).strip()
         token_keys = ["GITHUB_PUSH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
         default_push_token = _read_first_secret_or_env(token_keys)
+        workflow_token_keys = ["GITHUB_WORKFLOW_TOKEN", "GITHUB_ACTIONS_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        default_workflow_token = _read_first_secret_or_env(workflow_token_keys)
         github_repo = st.text_input("GitHub repo (owner/name)", value=default_repo, help="Example: kirbypuckett031460-web/nhl")
         github_branch = st.text_input("GitHub branch", value=default_branch or "main")
         push_token_override = st.text_input("GitHub push token override (optional)", value="", type="password")
+        workflow_token_override = st.text_input(
+            "GitHub workflow token override (optional)",
+            value="",
+            type="password",
+            help="Used only for workflow dispatch. Leave blank to use GITHUB_WORKFLOW_TOKEN/GITHUB_ACTIONS_TOKEN/GITHUB_TOKEN.",
+        )
         publish_commit_message = st.text_input(
             "Publish commit message",
             value="chore(admin): refresh public app outputs [skip ci]",
@@ -502,6 +517,7 @@ def render_admin_app() -> None:
         st.error(f"Model run failed with exit code {rc}.")
 
     effective_push_token = push_token_override.strip() or default_push_token
+    effective_workflow_token = workflow_token_override.strip() or default_workflow_token or effective_push_token
     effective_repo = (github_repo or "").strip()
     effective_branch = (github_branch or "").strip() or "main"
     publish_ok = False
@@ -575,7 +591,7 @@ def render_admin_app() -> None:
             with st.spinner("Triggering GitHub Actions workflow..."):
                 wf_ok, wf_msg, wf_details = _trigger_github_workflow_dispatch(
                     repo=effective_repo,
-                    token=effective_push_token,
+                    token=effective_workflow_token,
                     workflow_id=dispatch_workflow,
                     ref=dispatch_ref,
                     inputs=dispatch_inputs,
