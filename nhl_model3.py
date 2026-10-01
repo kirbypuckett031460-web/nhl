@@ -14568,6 +14568,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             social_results = {'twitter': False, 'discord': False}
             try:
                 # Only post predictions image to Twitter (no text summary)
+                img_path = None
                 try:
                     img_path = save_predictions_image(
                         predictions,
@@ -14580,7 +14581,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         social_poster.post_image_to_twitter(img_path, caption='🏒 NHL Predictions')
                 except Exception:
                     pass
-                # Optional inline predictions to Discord
+                # Optional Discord posting (prefer table image; fallback to inline text).
                 topn = 10
                 try:
                     if cli_args is not None:
@@ -14588,7 +14589,19 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     topn = 10
                 if not cli_args or getattr(cli_args, 'post_inline', False):
-                    social_poster.post_inline_predictions(predictions, top_n=topn, title='NHL Predictions (Top)')
+                    posted_discord = False
+                    if img_path and os.path.exists(img_path):
+                        posted_discord = social_poster.post_file_to_discord(
+                            img_path,
+                            message='🏒 NHL Predictions Table'
+                        )
+                    if not posted_discord:
+                        posted_discord = social_poster.post_inline_predictions(
+                            predictions,
+                            top_n=topn,
+                            title='NHL Predictions (Top)'
+                        )
+                    social_results['discord'] = bool(posted_discord)
             except Exception as e:
                 print(f"⚠️  Social posting skipped/failed: {e}")
         else:
