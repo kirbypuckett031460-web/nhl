@@ -409,8 +409,17 @@ def render_admin_app() -> None:
         post_discord = st.checkbox(
             "Post to Discord after run",
             value=False,
-            help="Adds --post-social. Requires DISCORD_WEBHOOK_URL in app secrets/env.",
+            help="Adds --post-social + --post-inline. Requires DISCORD_WEBHOOK_URL in app secrets/env.",
         )
+        discord_top_n = st.number_input("Discord top picks count", min_value=1, max_value=25, value=10, step=1)
+        secret_discord_webhook = _read_streamlit_secret("DISCORD_WEBHOOK_URL")
+        env_discord_webhook = str(os.getenv("DISCORD_WEBHOOK_URL", "")).strip()
+        default_discord_webhook = secret_discord_webhook or env_discord_webhook
+        discord_webhook_override = st.text_input("DISCORD_WEBHOOK_URL override (optional)", value="", type="password")
+        if default_discord_webhook:
+            st.caption("Default Discord webhook loaded from Streamlit secrets/env. Leave override blank to use it.")
+        else:
+            st.caption("No default Discord webhook found in secrets/env.")
 
         st.subheader("Publish")
         publish_to_github = st.checkbox("Publish outputs to GitHub after successful run", value=True)
@@ -490,6 +499,8 @@ def render_admin_app() -> None:
         command.extend(["--log-path", log_path.strip() or "bets_log.csv"])
     if post_discord:
         command.append("--post-social")
+        command.append("--post-inline")
+        command.extend(["--post-inline-top", str(int(discord_top_n))])
     if realtime_odds:
         command.append("--realtime-odds")
     else:
@@ -506,6 +517,11 @@ def render_admin_app() -> None:
         env_overrides["ODDS_API_KEY"] = effective_odds_api_key
     if realtime_odds and not effective_odds_api_key:
         st.warning("Realtime odds enabled but no ODDS_API_KEY is configured (secrets/env/override).")
+    effective_discord_webhook = discord_webhook_override.strip() or default_discord_webhook
+    if effective_discord_webhook:
+        env_overrides["DISCORD_WEBHOOK_URL"] = effective_discord_webhook
+    if post_discord and not effective_discord_webhook:
+        st.warning("Discord posting enabled but no DISCORD_WEBHOOK_URL is configured (secrets/env/override).")
 
     st.subheader("Live Run Output")
     with st.spinner("Running model... this may take a while depending on training mode."):
@@ -600,7 +616,7 @@ def render_admin_app() -> None:
             if wf_ok:
                 st.success(wf_msg)
             else:
-                st.error(wf_msg)
+                st.warning(wf_msg)
             actions_url = str((wf_details or {}).get("actions_url") or "").strip()
             if actions_url:
                 st.markdown(f"[Open workflow runs]({actions_url})")
