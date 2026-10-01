@@ -11969,28 +11969,43 @@ def save_public_app_snapshot_image(
                         cell.set_facecolor((236 / 255.0, 72 / 255.0, 153 / 255.0, intensity))
                         cell.get_text().set_color("#fdf2f8")
 
-    metric_line = (
-        f"ML Yesterday {metrics.get('ml_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_prev_day', ('0-0', '+0.0%'))[1]})   |   "
-        f"ML YTD {metrics.get('ml_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_ytd', ('0-0', '+0.0%'))[1]})   |   "
-        f"Totals Yesterday {metrics.get('tot_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_prev_day', ('0-0', '+0.0%'))[1]})   |   "
-        f"Totals YTD {metrics.get('tot_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_ytd', ('0-0', '+0.0%'))[1]})"
+    metric_ml_line = (
+        f"ML Yesterday {metrics.get('ml_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_prev_day', ('0-0', '+0.0%'))[1]})"
+        f"   |   ML YTD {metrics.get('ml_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_ytd', ('0-0', '+0.0%'))[1]})"
+    )
+    metric_totals_line = (
+        f"Totals Yesterday {metrics.get('tot_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_prev_day', ('0-0', '+0.0%'))[1]})"
+        f"   |   Totals YTD {metrics.get('tot_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_ytd', ('0-0', '+0.0%'))[1]})"
     )
     subtitle = f"Slate Date: {slate_date_text}   |   Last updated: {last_updated_et}"
 
     ml_rows_count = max(1, len(ml_clean))
     ou_rows_count = max(1, len(ou_clean))
     table_unit_h = 0.27
-    fig_height = max(8.5, 2.5 + table_unit_h * (ml_rows_count + ou_rows_count))
+    fig_height = max(9.3, 3.0 + table_unit_h * (ml_rows_count + ou_rows_count))
     fig = plt.figure(figsize=(15.5, fig_height))
     fig.patch.set_facecolor("#0b1220")
-    gs = fig.add_gridspec(2, 1, height_ratios=[max(2.0, 1.2 + ml_rows_count * 0.13), max(2.0, 1.2 + ou_rows_count * 0.13)], hspace=0.16)
+    gs = fig.add_gridspec(
+        3,
+        1,
+        height_ratios=[
+            1.15,
+            max(2.0, 1.2 + ml_rows_count * 0.13),
+            max(2.0, 1.2 + ou_rows_count * 0.13),
+        ],
+        hspace=0.22,
+    )
 
-    fig.suptitle("NHL Picks", color="#f8fafc", fontsize=20, fontweight="bold", y=0.985)
-    fig.text(0.5, 0.956, metric_line, ha="center", va="center", color="#cbd5e1", fontsize=11, fontweight="semibold")
-    fig.text(0.5, 0.934, subtitle, ha="center", va="center", color="#94a3b8", fontsize=9.5)
+    ax_head = fig.add_subplot(gs[0, 0])
+    ax_head.axis("off")
+    ax_head.set_facecolor("#0b1220")
+    ax_head.text(0.5, 0.78, "NHL Picks", ha="center", va="center", color="#f8fafc", fontsize=24, fontweight="bold")
+    ax_head.text(0.5, 0.52, metric_ml_line, ha="center", va="center", color="#cbd5e1", fontsize=12, fontweight="semibold")
+    ax_head.text(0.5, 0.30, metric_totals_line, ha="center", va="center", color="#cbd5e1", fontsize=12, fontweight="semibold")
+    ax_head.text(0.5, 0.10, subtitle, ha="center", va="center", color="#94a3b8", fontsize=10)
 
-    ax_ml = fig.add_subplot(gs[0, 0])
-    ax_ou = fig.add_subplot(gs[1, 0])
+    ax_ml = fig.add_subplot(gs[1, 0])
+    ax_ou = fig.add_subplot(gs[2, 0])
     _render_table(ax_ml, "Moneyline Picks", ml_clean)
     _render_table(ax_ou, "Over/Under Picks", ou_clean)
 
