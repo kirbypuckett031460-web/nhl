@@ -399,6 +399,11 @@ def render_admin_app() -> None:
 
         log_bets = st.checkbox("Log bets", value=True)
         log_path = st.text_input("Bets log path", value="bets_log.csv")
+        post_discord = st.checkbox(
+            "Post to Discord after run",
+            value=False,
+            help="Adds --post-social. Requires DISCORD_WEBHOOK_URL in app secrets/env.",
+        )
 
         st.subheader("Publish")
         publish_to_github = st.checkbox("Publish outputs to GitHub after successful run", value=True)
@@ -468,6 +473,8 @@ def render_admin_app() -> None:
         command.extend(["--log-bets", "--log-path", log_path.strip() or "bets_log.csv"])
     else:
         command.extend(["--log-path", log_path.strip() or "bets_log.csv"])
+    if post_discord:
+        command.append("--post-social")
     if realtime_odds:
         command.append("--realtime-odds")
     else:
