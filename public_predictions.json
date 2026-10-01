@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-01T18:26:32Z",
+  "generated_at": "2026-10-01T18:30:04Z",
   "games": [
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020009",
       "away_team": "PHI",
       "home_team": "NJD",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 46.527505257801906
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020010",
       "away_team": "TBL",
       "home_team": "NYR",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 76.8511892233214
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020011",
       "away_team": "BUF",
       "home_team": "CBJ",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 50.71737778262767
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020012",
       "away_team": "MIN",
       "home_team": "NSH",
@@ -94,7 +94,7 @@
       "moneyline_confidence_pct": 68.74528240523918
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020014",
       "away_team": "SEA",
       "home_team": "CGY",
@@ -117,7 +117,7 @@
       "moneyline_confidence_pct": 62.4367656140963
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020013",
       "away_team": "CHI",
       "home_team": "UTA",
@@ -140,7 +140,7 @@
       "moneyline_confidence_pct": 49.04343696581197
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020015",
       "away_team": "EDM",
       "home_team": "VAN",
@@ -163,7 +163,7 @@
       "moneyline_confidence_pct": 85.75676920785725
     },
     {
-      "generated_at": "2026-10-01T18:26:32Z",
+      "generated_at": "2026-10-01T18:30:04Z",
       "game_id": "2026020016",
       "away_team": "FLA",
       "home_team": "SJS",
