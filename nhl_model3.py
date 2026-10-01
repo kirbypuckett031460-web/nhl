@@ -57,6 +57,10 @@ import html as html_parser
 import errno
 import unicodedata
 from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # type: ignore[assignment]
 import inspect
 from scipy.stats import norm, poisson, nbinom, skellam
 from sklearn.isotonic import IsotonicRegression
@@ -11805,9 +11809,12 @@ def save_public_app_snapshot_image(
             remote_branch=board_branch,
         )
         schedule_tz = str(os.getenv("SCHEDULE_TZ", "US/Eastern") or "US/Eastern").strip() or "US/Eastern"
-        try:
-            metrics_ref_date = datetime.now(ZoneInfo(schedule_tz)).date()
-        except Exception:
+        if ZoneInfo is not None:
+            try:
+                metrics_ref_date = datetime.now(ZoneInfo(schedule_tz)).date()
+            except Exception:
+                metrics_ref_date = datetime.now().date()
+        else:
             metrics_ref_date = datetime.now().date()
         metrics = public_view._compute_record_blocks(
             log_path_obj,
