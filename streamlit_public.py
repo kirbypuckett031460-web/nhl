@@ -760,8 +760,6 @@ def render_public_app() -> None:
     else:
         slate_dt_display = shown_dt
     st.write(f"Slate Date: {slate_dt_display.strftime('%A, %b %d, %Y')}")
-    source_label = f"remote:{board_branch}" if (prefer_remote and board_branch) else ("remote:unresolved" if prefer_remote else "local")
-    st.caption(f"Data source: {source_label}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Moneyline Yesterday", metrics["ml_prev_day"][0], metrics["ml_prev_day"][1])
