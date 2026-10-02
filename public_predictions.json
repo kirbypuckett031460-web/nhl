@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-02T13:27:22Z",
+  "generated_at": "2026-10-02T13:28:56Z",
   "games": [
     {
-      "generated_at": "2026-10-02T13:27:22Z",
+      "generated_at": "2026-10-02T13:28:56Z",
       "game_id": "2026020017",
       "away_team": "NYR",
       "home_team": "DET",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 67.55650563619518
     },
     {
-      "generated_at": "2026-10-02T13:27:22Z",
+      "generated_at": "2026-10-02T13:28:56Z",
       "game_id": "2026020018",
       "away_team": "WSH",
       "home_team": "CAR",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 59.315798604023904
     },
     {
-      "generated_at": "2026-10-02T13:27:22Z",
+      "generated_at": "2026-10-02T13:28:56Z",
       "game_id": "2026020019",
       "away_team": "BOS",
       "home_team": "WPG",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 67.82608695652175
     },
     {
-      "generated_at": "2026-10-02T13:27:22Z",
+      "generated_at": "2026-10-02T13:28:56Z",
       "game_id": "2026020020",
       "away_team": "STL",
       "home_team": "DAL",
@@ -94,7 +94,7 @@
       "moneyline_confidence_pct": 90.84835250239234
     },
     {
-      "generated_at": "2026-10-02T13:27:22Z",
+      "generated_at": "2026-10-02T13:28:56Z",
       "game_id": "2026020021",
       "away_team": "ANA",
       "home_team": "VGK",
