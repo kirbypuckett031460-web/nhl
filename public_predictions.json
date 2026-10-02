@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-02T17:51:09Z",
+  "generated_at": "2026-10-02T19:02:33Z",
   "games": [
     {
-      "generated_at": "2026-10-02T17:51:09Z",
+      "generated_at": "2026-10-02T19:02:33Z",
       "game_id": "2026020017",
       "away_team": "NYR",
       "home_team": "DET",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 67.03202346169729
     },
     {
-      "generated_at": "2026-10-02T17:51:09Z",
+      "generated_at": "2026-10-02T19:02:33Z",
       "game_id": "2026020018",
       "away_team": "WSH",
       "home_team": "CAR",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 58.74633377183751
     },
     {
-      "generated_at": "2026-10-02T17:51:09Z",
+      "generated_at": "2026-10-02T19:02:33Z",
       "game_id": "2026020019",
       "away_team": "BOS",
       "home_team": "WPG",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 68.263587428373
     },
     {
-      "generated_at": "2026-10-02T17:51:09Z",
+      "generated_at": "2026-10-02T19:02:33Z",
       "game_id": "2026020020",
       "away_team": "STL",
       "home_team": "DAL",
@@ -94,7 +94,7 @@
       "moneyline_confidence_pct": 90.84835250239234
     },
     {
-      "generated_at": "2026-10-02T17:51:09Z",
+      "generated_at": "2026-10-02T19:02:33Z",
       "game_id": "2026020021",
       "away_team": "ANA",
       "home_team": "VGK",
@@ -111,10 +111,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "ANA",
-      "moneyline_market_odds": 162.0,
-      "moneyline_fair_odds": -130,
-      "moneyline_edge": 0.18396939021069136,
-      "moneyline_confidence_pct": 56.56487795236684
+      "moneyline_market_odds": 172.0,
+      "moneyline_fair_odds": -123,
+      "moneyline_edge": 0.18414595070892625,
+      "moneyline_confidence_pct": 55.17930095324557
     }
   ],
   "slate_date": "2026-10-02"
