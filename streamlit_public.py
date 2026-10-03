@@ -651,8 +651,11 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
         st.info("No rows available.")
         return
     clean_rows = [{k: v for k, v in row.items() if not str(k).startswith("_")} for row in rows]
+    # Expand table height to fit all rows so users can view the full slate
+    # without scrolling inside the dataframe widget.
+    table_height = max(180, min(1800, 42 + len(clean_rows) * 34))
     if pd is None:
-        st.dataframe(clean_rows, use_container_width=True, hide_index=True)
+        st.dataframe(clean_rows, use_container_width=True, hide_index=True, height=table_height)
         return
     frame = pd.DataFrame(clean_rows)
     width_map = {
@@ -711,7 +714,7 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
         styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
     styled = styled.set_table_styles(table_styles)
     styled = styled.set_properties(**{"text-align": "center"})
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=table_height)
 
 
 def render_public_app() -> None:
