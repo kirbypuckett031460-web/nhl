@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-05T20:24:10Z",
+  "generated_at": "2026-10-05T21:24:34Z",
   "games": [
     {
-      "generated_at": "2026-10-05T20:24:10Z",
+      "generated_at": "2026-10-05T21:24:34Z",
       "game_id": "2026020040",
       "away_team": "PHI",
       "home_team": "TBL",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 43.027686965811974
     },
     {
-      "generated_at": "2026-10-05T20:24:10Z",
+      "generated_at": "2026-10-05T21:24:34Z",
       "game_id": "2026020041",
       "away_team": "OTT",
       "home_team": "BOS",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 71.20034919249237
     },
     {
-      "generated_at": "2026-10-05T20:24:10Z",
+      "generated_at": "2026-10-05T21:24:34Z",
       "game_id": "2026020042",
       "away_team": "WPG",
       "home_team": "PIT",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 60.52858659272504
     },
     {
-      "generated_at": "2026-10-05T20:24:10Z",
+      "generated_at": "2026-10-05T21:24:34Z",
       "game_id": "2026020043",
       "away_team": "SJS",
       "home_team": "DAL",
