@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-05T12:54:40Z",
+  "generated_at": "2026-10-05T19:32:46Z",
   "games": [
     {
-      "generated_at": "2026-10-05T12:54:40Z",
+      "generated_at": "2026-10-05T19:32:46Z",
       "game_id": "2026020040",
       "away_team": "PHI",
       "home_team": "TBL",
@@ -19,13 +19,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "PHI",
-      "moneyline_market_odds": 168.0,
-      "moneyline_fair_odds": 127,
-      "moneyline_edge": 0.06678090104254014,
-      "moneyline_confidence_pct": 43.991522940074915
+      "moneyline_market_odds": 184.0,
+      "moneyline_fair_odds": 130,
+      "moneyline_edge": 0.08360524925486529,
+      "moneyline_confidence_pct": 43.57179253112034
     },
     {
-      "generated_at": "2026-10-05T12:54:40Z",
+      "generated_at": "2026-10-05T19:32:46Z",
       "game_id": "2026020041",
       "away_team": "OTT",
       "home_team": "BOS",
@@ -42,13 +42,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "OTT",
-      "moneyline_market_odds": -120.0,
-      "moneyline_fair_odds": -259,
-      "moneyline_edge": 0.17628458498023725,
-      "moneyline_confidence_pct": 72.17391304347827
+      "moneyline_market_odds": -115.0,
+      "moneyline_fair_odds": -247,
+      "moneyline_edge": 0.177119770994691,
+      "moneyline_confidence_pct": 71.20034919249237
     },
     {
-      "generated_at": "2026-10-05T12:54:40Z",
+      "generated_at": "2026-10-05T19:32:46Z",
       "game_id": "2026020042",
       "away_team": "WPG",
       "home_team": "PIT",
@@ -65,13 +65,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "PIT",
-      "moneyline_market_odds": -182.0,
-      "moneyline_fair_odds": -153,
-      "moneyline_edge": -0.04106637350000486,
-      "moneyline_confidence_pct": 60.43236974219809
+      "moneyline_market_odds": -178.0,
+      "moneyline_fair_odds": -151,
+      "moneyline_edge": -0.037959403856922425,
+      "moneyline_confidence_pct": 60.23283659272502
     },
     {
-      "generated_at": "2026-10-05T12:54:40Z",
+      "generated_at": "2026-10-05T19:32:46Z",
       "game_id": "2026020043",
       "away_team": "SJS",
       "home_team": "DAL",
@@ -88,10 +88,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "SJS",
-      "moneyline_market_odds": 140.0,
-      "moneyline_fair_odds": -149,
-      "moneyline_edge": 0.18156342182890867,
-      "moneyline_confidence_pct": 59.82300884955754
+      "moneyline_market_odds": 172.0,
+      "moneyline_fair_odds": -123,
+      "moneyline_edge": 0.18414595070892625,
+      "moneyline_confidence_pct": 55.17930095324557
     }
   ],
   "slate_date": "2026-10-05"
