@@ -433,10 +433,10 @@ def _compute_record_blocks(
     # On opening day (and pre-season), show all records as 0-0.
     if not source_rows or ref_date <= season_start:
         return {
-            "ml_prev_day": ("0-0", "+0.0%"),
-            "ml_ytd": ("0-0", "+0.0%"),
-            "tot_prev_day": ("0-0", "+0.0%"),
-            "tot_ytd": ("0-0", "+0.0%"),
+            "ml_prev_day": ("0-0", "0.0%"),
+            "ml_ytd": ("0-0", "0.0%"),
+            "tot_prev_day": ("0-0", "0.0%"),
+            "tot_ytd": ("0-0", "0.0%"),
         }
     # Deduplicate repeated runs: keep latest graded row per (market bucket, game).
     latest_by_market_game: Dict[str, Tuple[int, datetime, date, str, str]] = {}
@@ -475,7 +475,7 @@ def _compute_record_blocks(
         wins, losses = int(block[0]), int(block[1])
         decided = wins + losses
         pct = (wins / decided * 100.0) if decided > 0 else 0.0
-        return f"{wins}-{losses}", f"{pct:+.1f}%"
+        return f"{wins}-{losses}", f"{pct:.1f}%"
 
     return {
         "ml_prev_day": _fmt(blocks["ml_prev_day"]),
@@ -652,8 +652,11 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
         st.info("No rows available.")
         return
     clean_rows = [{k: v for k, v in row.items() if not str(k).startswith("_")} for row in rows]
+    # Expand table height to fit all rows so users can view the full slate
+    # without scrolling inside the dataframe widget.
+    table_height = max(180, min(1800, 42 + len(clean_rows) * 34))
     if pd is None:
-        st.dataframe(clean_rows, use_container_width=True, hide_index=True)
+        st.dataframe(clean_rows, use_container_width=True, hide_index=True, height=table_height)
         return
     frame = pd.DataFrame(clean_rows)
     width_map = {
@@ -712,7 +715,7 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
         styled = styled.applymap(_style_conf_cell, subset=["Confidence"])
     styled = styled.set_table_styles(table_styles)
     styled = styled.set_properties(**{"text-align": "center"})
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=table_height)
 
 
 def render_public_app() -> None:
