@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-06T13:33:48Z",
+  "generated_at": "2026-10-06T13:34:49Z",
   "games": [
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020044",
       "away_team": "NSH",
       "home_team": "TOR",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 75.09232410100476
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020045",
       "away_team": "CAR",
       "home_team": "MTL",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 60.007119565217394
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020046",
       "away_team": "OTT",
       "home_team": "DET",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 69.37899721737233
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020047",
       "away_team": "UTA",
       "home_team": "NJD",
@@ -94,7 +94,7 @@
       "moneyline_confidence_pct": 55.21868166287016
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020049",
       "away_team": "MIN",
       "home_team": "BUF",
@@ -117,7 +117,7 @@
       "moneyline_confidence_pct": 71.20034919249237
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020048",
       "away_team": "NYI",
       "home_team": "NYR",
@@ -140,7 +140,7 @@
       "moneyline_confidence_pct": 62.315959161741
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020050",
       "away_team": "STL",
       "home_team": "CHI",
@@ -163,7 +163,7 @@
       "moneyline_confidence_pct": 64.27000000000001
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020051",
       "away_team": "VGK",
       "home_team": "SEA",
@@ -186,7 +186,7 @@
       "moneyline_confidence_pct": 59.521097291642455
     },
     {
-      "generated_at": "2026-10-06T13:33:48Z",
+      "generated_at": "2026-10-06T13:34:49Z",
       "game_id": "2026020052",
       "away_team": "FLA",
       "home_team": "LAK",
