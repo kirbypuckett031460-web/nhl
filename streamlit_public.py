@@ -765,10 +765,14 @@ def render_public_app() -> None:
     st.write(f"Slate Date: {slate_dt_display.strftime('%A, %b %d, %Y')}")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Moneyline Yesterday", metrics["ml_prev_day"][0], metrics["ml_prev_day"][1])
-    c2.metric("Moneyline YTD", metrics["ml_ytd"][0], metrics["ml_ytd"][1])
-    c3.metric("Totals Yesterday", metrics["tot_prev_day"][0], metrics["tot_prev_day"][1])
-    c4.metric("Totals YTD", metrics["tot_ytd"][0], metrics["tot_ytd"][1])
+    c1.metric("Moneyline Yesterday", metrics["ml_prev_day"][0])
+    c1.caption(metrics["ml_prev_day"][1])
+    c2.metric("Moneyline YTD", metrics["ml_ytd"][0])
+    c2.caption(metrics["ml_ytd"][1])
+    c3.metric("Totals Yesterday", metrics["tot_prev_day"][0])
+    c3.caption(metrics["tot_prev_day"][1])
+    c4.metric("Totals YTD", metrics["tot_ytd"][0])
+    c4.caption(metrics["tot_ytd"][1])
 
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
     with tab_ml:
