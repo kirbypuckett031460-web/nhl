@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-07T13:56:22Z",
+  "generated_at": "2026-10-07T15:34:54Z",
   "games": [
     {
-      "generated_at": "2026-10-07T13:56:22Z",
+      "generated_at": "2026-10-07T15:34:54Z",
       "game_id": "2026020053",
       "away_team": "PIT",
       "home_team": "WSH",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 61.76138797809946
     },
     {
-      "generated_at": "2026-10-07T13:56:22Z",
+      "generated_at": "2026-10-07T15:34:54Z",
       "game_id": "2026020054",
       "away_team": "COL",
       "home_team": "WPG",
@@ -35,20 +35,20 @@
       "game_time_et": "07:30 PM ET",
       "game_datetime_utc": "2026-10-07 23:30:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 7.14634793750335,
+      "totals_fair": 7.146347937503348,
       "totals_pick": "OVER",
-      "totals_edge": 0.6463479375033501,
-      "totals_confidence_pct": 47.351429220229505,
+      "totals_edge": 0.6463479375033483,
+      "totals_confidence_pct": 47.35142922022947,
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "WPG",
-      "moneyline_market_odds": 150.0,
-      "moneyline_fair_odds": -140,
-      "moneyline_edge": 0.18263229308005424,
-      "moneyline_confidence_pct": 58.26322930800543
+      "moneyline_market_odds": 152.0,
+      "moneyline_fair_odds": -138,
+      "moneyline_edge": 0.18301624665844657,
+      "moneyline_confidence_pct": 57.98416434838434
     },
     {
-      "generated_at": "2026-10-07T13:56:22Z",
+      "generated_at": "2026-10-07T15:34:54Z",
       "game_id": "2026020055",
       "away_team": "EDM",
       "home_team": "ANA",
