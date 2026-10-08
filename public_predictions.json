@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-08T13:15:07Z",
+  "generated_at": "2026-10-08T14:36:09Z",
   "games": [
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020056",
       "away_team": "UTA",
       "home_team": "BOS",
@@ -19,13 +19,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "UTA",
-      "moneyline_market_odds": -126.0,
-      "moneyline_fair_odds": -108,
-      "moneyline_edge": -0.037254389276832445,
-      "moneyline_confidence_pct": 52.026773461697296
+      "moneyline_market_odds": -125.0,
+      "moneyline_fair_odds": -107,
+      "moneyline_edge": -0.03769555555555559,
+      "moneyline_confidence_pct": 51.786
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020057",
       "away_team": "DAL",
       "home_team": "BUF",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 72.17391304347827
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020058",
       "away_team": "NSH",
       "home_team": "MTL",
@@ -65,13 +65,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "NSH",
-      "moneyline_market_odds": 142.0,
-      "moneyline_fair_odds": -147,
-      "moneyline_edge": 0.18198783242055677,
-      "moneyline_confidence_pct": 59.521097291642455
+      "moneyline_market_odds": 146.0,
+      "moneyline_fair_odds": -143,
+      "moneyline_edge": 0.1827985754468242,
+      "moneyline_confidence_pct": 58.93026404874746
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020059",
       "away_team": "PHI",
       "home_team": "OTT",
@@ -88,13 +88,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "PHI",
-      "moneyline_market_odds": 125.0,
-      "moneyline_fair_odds": -107,
-      "moneyline_edge": 0.07266797576832151,
-      "moneyline_confidence_pct": 51.71124202127659
+      "moneyline_market_odds": 138.0,
+      "moneyline_fair_odds": -103,
+      "moneyline_edge": 0.08839958948636634,
+      "moneyline_confidence_pct": 50.85676567132571
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020060",
       "away_team": "MIN",
       "home_team": "TBL",
@@ -111,13 +111,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "MIN",
-      "moneyline_market_odds": 126.0,
-      "moneyline_fair_odds": -121,
-      "moneyline_edge": 0.10521548095989885,
-      "moneyline_confidence_pct": 54.769335706609354
+      "moneyline_market_odds": 132.0,
+      "moneyline_fair_odds": -115,
+      "moneyline_edge": 0.1037853524758533,
+      "moneyline_confidence_pct": 53.4819835234474
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020061",
       "away_team": "VAN",
       "home_team": "CAR",
@@ -134,13 +134,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "VAN",
-      "moneyline_market_odds": 265.0,
-      "moneyline_fair_odds": 117,
-      "moneyline_edge": 0.18713932332745897,
-      "moneyline_confidence_pct": 46.1111926067185
+      "moneyline_market_odds": 270.0,
+      "moneyline_fair_odds": 118,
+      "moneyline_edge": 0.18822522784184142,
+      "moneyline_confidence_pct": 45.84954981121116
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020062",
       "away_team": "CHI",
       "home_team": "NYI",
@@ -163,7 +163,7 @@
       "moneyline_confidence_pct": 58.26322930800545
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020063",
       "away_team": "SJS",
       "home_team": "STL",
@@ -186,7 +186,7 @@
       "moneyline_confidence_pct": 92.0
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020064",
       "away_team": "COL",
       "home_team": "CGY",
@@ -203,13 +203,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "CGY",
-      "moneyline_market_odds": 190.0,
-      "moneyline_fair_odds": -113,
-      "moneyline_edge": 0.1847346371084011,
-      "moneyline_confidence_pct": 52.956222331529766
+      "moneyline_market_odds": 195.0,
+      "moneyline_fair_odds": -110,
+      "moneyline_edge": 0.18544443006857292,
+      "moneyline_confidence_pct": 52.44274809160305
     },
     {
-      "generated_at": "2026-10-08T13:15:07Z",
+      "generated_at": "2026-10-08T14:36:09Z",
       "game_id": "2026020065",
       "away_team": "TOR",
       "home_team": "VGK",
