@@ -635,6 +635,47 @@ class RealDataNHLModel:
         self.kelly_cap_pct: float = float(os.getenv('KELLY_CAP_PCT', 2.0))  # percent
         self.daily_exposure_cap_pct: float = float(os.getenv('DAILY_EXPOSURE_CAP_PCT', 6.0))  # percent
         self.kelly_use_fair: bool = False
+        # Moneyline calibration / guardrails (accuracy-first defaults)
+        self.ml_market_prob_shrink_enable: bool = str(os.getenv('ML_MARKET_PROB_SHRINK_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_market_prob_anchor_base: float = float(os.getenv('ML_MARKET_PROB_ANCHOR_BASE', os.getenv('ML_MARKET_PROB_ANCHOR', '0.35')))
+        except Exception:
+            self.ml_market_prob_anchor_base = 0.35
+        try:
+            self.ml_market_prob_anchor_longshot: float = float(os.getenv('ML_MARKET_PROB_ANCHOR_LONGSHOT', '0.70'))
+        except Exception:
+            self.ml_market_prob_anchor_longshot = 0.70
+        try:
+            self.ml_market_prob_anchor_weak_gap: float = float(os.getenv('ML_MARKET_PROB_ANCHOR_WEAK_GAP', '0.65'))
+        except Exception:
+            self.ml_market_prob_anchor_weak_gap = 0.65
+        try:
+            self.ml_market_prob_weak_gap: float = float(os.getenv('ML_MARKET_PROB_WEAK_GAP', '0.03'))
+        except Exception:
+            self.ml_market_prob_weak_gap = 0.03
+        try:
+            self.ml_longshot_odds_threshold: int = int(float(os.getenv('ML_LONGSHOT_ODDS_THRESHOLD', '140')))
+        except Exception:
+            self.ml_longshot_odds_threshold = 140
+        self.ml_longshot_filter_enable: bool = str(os.getenv('ML_LONGSHOT_FILTER_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_longshot_min_prob: float = float(os.getenv('ML_LONGSHOT_MIN_PROB', '0.58'))
+        except Exception:
+            self.ml_longshot_min_prob = 0.58
+        try:
+            self.ml_longshot_min_edge: float = float(os.getenv('ML_LONGSHOT_MIN_EDGE', '0.04'))
+        except Exception:
+            self.ml_longshot_min_edge = 0.04
+        self.ml_force_decision: bool = str(os.getenv('ML_FORCE_DECISION', '0')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_force_min_prob_gap: float = float(os.getenv('ML_FORCE_MIN_PROB_GAP', '0.03'))
+        except Exception:
+            self.ml_force_min_prob_gap = 0.03
+        self.ml_no_bet_market_favorite: bool = str(os.getenv('ML_NO_BET_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_no_bet_min_prob_gap: float = float(os.getenv('ML_NO_BET_MIN_PROB_GAP', '0.03'))
+        except Exception:
+            self.ml_no_bet_min_prob_gap = 0.03
         self._team_alias_map: Optional[Dict[str, str]] = None
         self.ref_goal_baseline: Optional[float] = None
         try:
@@ -7058,17 +7099,24 @@ class RealDataNHLModel:
                 home_win_prob = float(home_win_prob / pair_sum)
                 away_win_prob = float(max(0.0, min(1.0, 1.0 - home_win_prob)))
 
-            # Lightly anchor toward no-vig market fair probs when both ML prices exist.
-            if home_moneyline_odds is not None and away_moneyline_odds is not None:
+            # Accuracy guard: anchor toward no-vig market fair probabilities,
+            # with stronger shrinkage on longshots and near-coinflip model calls.
+            if self.ml_market_prob_shrink_enable and home_moneyline_odds is not None and away_moneyline_odds is not None:
                 try:
                     home_imp = decimal_to_implied_prob(american_to_decimal(int(home_moneyline_odds)))
                     away_imp = decimal_to_implied_prob(american_to_decimal(int(away_moneyline_odds)))
                     vig_ml = max(1e-9, home_imp + away_imp)
                     fair_home_ml = float(home_imp / vig_ml)
-                    try:
-                        anchor = float(os.getenv('ML_MARKET_PROB_ANCHOR', '0.35'))
-                    except Exception:
-                        anchor = 0.35
+                    model_gap = float(abs(float(home_win_prob) - float(away_win_prob)))
+                    longshot_present = bool(
+                        (isinstance(home_moneyline_odds, (int, float)) and float(home_moneyline_odds) >= float(self.ml_longshot_odds_threshold))
+                        or (isinstance(away_moneyline_odds, (int, float)) and float(away_moneyline_odds) >= float(self.ml_longshot_odds_threshold))
+                    )
+                    anchor = float(self.ml_market_prob_anchor_base)
+                    if longshot_present:
+                        anchor = max(anchor, float(self.ml_market_prob_anchor_longshot))
+                    if model_gap < float(self.ml_market_prob_weak_gap):
+                        anchor = max(anchor, float(self.ml_market_prob_anchor_weak_gap))
                     anchor = float(min(max(anchor, 0.0), 1.0))
                     try:
                         max_delta = float(os.getenv('ML_MAX_PROB_DELTA_FROM_MARKET', '0.20'))
@@ -7136,11 +7184,31 @@ class RealDataNHLModel:
         ml_edge_floor = float(getattr(self, 'moneyline_edge_floor', 0.02))
         ml_prob_floor = float(getattr(self, 'moneyline_prob_floor', 0.0))
         ml_candidates: List[Tuple[str, float, float]] = []
+        longshot_filtered = False
+
+        def _ml_side_allowed(prob: Optional[float], edge_val: Optional[float], odds_val: Optional[int]) -> bool:
+            nonlocal longshot_filtered
+            if not self.ml_longshot_filter_enable:
+                return True
+            try:
+                odds_num = float(odds_val) if odds_val is not None else None
+            except Exception:
+                odds_num = None
+            # Longshot guard applies to plus-money underdogs at/above threshold only.
+            if odds_num is None or odds_num < float(self.ml_longshot_odds_threshold):
+                return True
+            prob_num = float(prob) if prob is not None else 0.0
+            edge_num = float(edge_val) if edge_val is not None else 0.0
+            allow = (prob_num >= float(self.ml_longshot_min_prob)) and (edge_num >= float(self.ml_longshot_min_edge))
+            if not allow:
+                longshot_filtered = True
+            return allow
+
         if home_ml_edge is not None and home_win_prob is not None and home_ml_ev is not None:
-            if home_win_prob >= ml_prob_floor and home_ml_edge >= ml_edge_floor:
+            if home_win_prob >= ml_prob_floor and home_ml_edge >= ml_edge_floor and _ml_side_allowed(home_win_prob, home_ml_edge, home_moneyline_odds):
                 ml_candidates.append(('HOME ML', home_ml_edge, home_ml_ev))
         if away_ml_edge is not None and away_win_prob is not None and away_ml_ev is not None:
-            if away_win_prob >= ml_prob_floor and away_ml_edge >= ml_edge_floor:
+            if away_win_prob >= ml_prob_floor and away_ml_edge >= ml_edge_floor and _ml_side_allowed(away_win_prob, away_ml_edge, away_moneyline_odds):
                 ml_candidates.append(('AWAY ML', away_ml_edge, away_ml_ev))
         if ml_candidates:
             ml_candidates.sort(key=lambda x: (x[1], x[2]))
@@ -7159,6 +7227,8 @@ class RealDataNHLModel:
                 moneyline_no_bet_reason = 'odds_missing'
             elif home_win_prob is None or away_win_prob is None:
                 moneyline_no_bet_reason = 'prob_missing'
+            elif longshot_filtered:
+                moneyline_no_bet_reason = 'longshot_guard'
             else:
                 moneyline_no_bet_reason = 'edge_guard'
 
@@ -7174,15 +7244,19 @@ class RealDataNHLModel:
 
             home_prob_val = _coerce_prob(home_win_prob)
             away_prob_val = _coerce_prob(away_win_prob)
-            if home_prob_val is not None or away_prob_val is not None:
+            if self.ml_force_decision and (home_prob_val is not None or away_prob_val is not None):
                 home_score = home_prob_val if home_prob_val is not None else -1.0
                 away_score = away_prob_val if away_prob_val is not None else -1.0
-                forced_side = 'home' if home_score >= away_score else 'away'
-                moneyline_recommendation_side = forced_side
-                moneyline_recommendation = 'HOME ML' if forced_side == 'home' else 'AWAY ML'
-                moneyline_bet_size = 0.0
-                if moneyline_no_bet_reason in (None, 'edge_guard'):
-                    moneyline_no_bet_reason = 'forced_decision'
+                prob_gap = abs(home_score - away_score)
+                if prob_gap >= float(self.ml_force_min_prob_gap):
+                    forced_side = 'home' if home_score >= away_score else 'away'
+                    moneyline_recommendation_side = forced_side
+                    moneyline_recommendation = 'HOME ML' if forced_side == 'home' else 'AWAY ML'
+                    moneyline_bet_size = 0.0
+                    if moneyline_no_bet_reason in (None, 'edge_guard', 'longshot_guard'):
+                        moneyline_no_bet_reason = 'forced_decision'
+                elif moneyline_no_bet_reason in (None, 'edge_guard'):
+                    moneyline_no_bet_reason = 'weak_signal'
         
         # Isotonic calibration of probability towards historical outcomes (if calibration fitted)
         try:
@@ -10174,6 +10248,29 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
             away_prob = None
     except Exception:
         away_prob = None
+    no_bet_market_favorite = str(os.getenv('ML_NO_BET_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
+    try:
+        no_bet_min_gap = float(os.getenv('ML_NO_BET_MIN_PROB_GAP', '0.03'))
+    except Exception:
+        no_bet_min_gap = 0.03
+    is_no_bet = (not ml_raw) or ml_raw.startswith('NO BET')
+    if is_no_bet and no_bet_market_favorite:
+        try:
+            h_odds = getattr(prediction, 'home_moneyline_odds', None)
+            a_odds = getattr(prediction, 'away_moneyline_odds', None)
+            h_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
+            a_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
+        except Exception:
+            h_imp = None
+            a_imp = None
+        if home_prob is not None and away_prob is not None:
+            prob_gap = abs(float(home_prob) - float(away_prob))
+        else:
+            prob_gap = 0.0
+        if (home_prob is None or away_prob is None or prob_gap < no_bet_min_gap) and (h_imp is not None or a_imp is not None):
+            h_score = float(h_imp) if h_imp is not None else -1.0
+            a_score = float(a_imp) if a_imp is not None else -1.0
+            return 'home' if h_score >= a_score else 'away'
     if home_prob is not None or away_prob is not None:
         home_score = home_prob if home_prob is not None else -1.0
         away_score = away_prob if away_prob is not None else -1.0
