@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-11T14:28:48Z",
+  "generated_at": "2026-10-11T18:40:52Z",
   "games": [
     {
-      "generated_at": "2026-10-11T14:28:48Z",
+      "generated_at": "2026-10-11T18:40:52Z",
       "game_id": "2026020084",
       "away_team": "SEA",
       "home_team": "WSH",
@@ -12,20 +12,20 @@
       "game_time_et": "05:00 PM ET",
       "game_datetime_utc": "2026-10-11 21:00:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 7.080396608316066,
+      "totals_fair": 7.097944227363685,
       "totals_pick": "OVER",
-      "totals_edge": 0.5803966083160663,
-      "totals_confidence_pct": 46.362159282420244,
+      "totals_edge": 0.5979442273636852,
+      "totals_confidence_pct": 46.625373568134535,
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "WSH",
       "moneyline_market_odds": -215.0,
-      "moneyline_fair_odds": -210,
-      "moneyline_edge": -0.004968171641399843,
-      "moneyline_confidence_pct": 67.75715108982827
+      "moneyline_fair_odds": -209,
+      "moneyline_edge": -0.00651192164140002,
+      "moneyline_confidence_pct": 67.60277608982825
     },
     {
-      "generated_at": "2026-10-11T14:28:48Z",
+      "generated_at": "2026-10-11T18:40:52Z",
       "game_id": "2026020085",
       "away_team": "VAN",
       "home_team": "NYR",
@@ -35,10 +35,10 @@
       "game_time_et": "06:00 PM ET",
       "game_datetime_utc": "2026-10-11 22:00:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 6.964653954281269,
+      "totals_fair": 6.982201573328888,
       "totals_pick": "OVER",
-      "totals_edge": 0.4646539542812693,
-      "totals_confidence_pct": 44.626019471898296,
+      "totals_edge": 0.48220157332888824,
+      "totals_confidence_pct": 44.889233757612566,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "VAN",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 50.423004792665125
     },
     {
-      "generated_at": "2026-10-11T14:28:48Z",
+      "generated_at": "2026-10-11T18:40:52Z",
       "game_id": "2026020086",
       "away_team": "CAR",
       "home_team": "PHI",
@@ -58,17 +58,17 @@
       "game_time_et": "07:00 PM ET",
       "game_datetime_utc": "2026-10-11 23:00:00+00:00",
       "totals_line": 5.5,
-      "totals_fair": 6.5228310820978095,
+      "totals_fair": 6.540378701145428,
       "totals_pick": "OVER",
-      "totals_edge": 1.0228310820978095,
-      "totals_confidence_pct": 52.9986763891464,
+      "totals_edge": 1.0403787011454284,
+      "totals_confidence_pct": 53.26189067486068,
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "PHI",
-      "moneyline_market_odds": 168.0,
-      "moneyline_fair_odds": 123,
-      "moneyline_edge": 0.07513340104254013,
-      "moneyline_confidence_pct": 44.82677294007491
+      "moneyline_market_odds": 176.0,
+      "moneyline_fair_odds": 125,
+      "moneyline_edge": 0.08245589852200713,
+      "moneyline_confidence_pct": 44.47747391017173
     }
   ],
   "slate_date": "2026-10-11"
