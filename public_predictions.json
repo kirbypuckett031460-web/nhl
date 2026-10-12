@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-12T09:11:05Z",
+  "generated_at": "2026-10-12T22:00:04Z",
   "games": [
     {
-      "generated_at": "2026-10-12T09:11:05Z",
+      "generated_at": "2026-10-12T22:00:04Z",
       "game_id": "2026020087",
       "away_team": "FLA",
       "home_team": "BUF",
@@ -19,13 +19,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "BUF",
-      "moneyline_market_odds": -110.0,
-      "moneyline_fair_odds": -118,
-      "moneyline_edge": 0.017741726190476093,
-      "moneyline_confidence_pct": 54.15512499999999
+      "moneyline_market_odds": null,
+      "moneyline_fair_odds": -127,
+      "moneyline_edge": null,
+      "moneyline_confidence_pct": 55.9975
     },
     {
-      "generated_at": "2026-10-12T09:11:05Z",
+      "generated_at": "2026-10-12T22:00:04Z",
       "game_id": "2026020088",
       "away_team": "OTT",
       "home_team": "NJD",
@@ -42,13 +42,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "OTT",
-      "moneyline_market_odds": 112.0,
-      "moneyline_fair_odds": -187,
-      "moneyline_edge": 0.179969582901162,
-      "moneyline_confidence_pct": 65.16676961087092
+      "moneyline_market_odds": -102.0,
+      "moneyline_fair_odds": -215,
+      "moneyline_edge": 0.177685379234225,
+      "moneyline_confidence_pct": 68.263587428373
     },
     {
-      "generated_at": "2026-10-12T09:11:05Z",
+      "generated_at": "2026-10-12T22:00:04Z",
       "game_id": "2026020089",
       "away_team": "VGK",
       "home_team": "MIN",
@@ -65,10 +65,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "VGK",
-      "moneyline_market_odds": -104.0,
-      "moneyline_fair_odds": -221,
-      "moneyline_edge": 0.17819258650644887,
-      "moneyline_confidence_pct": 68.79965080750763
+      "moneyline_market_odds": -113.0,
+      "moneyline_fair_odds": -242,
+      "moneyline_edge": 0.1771161570492975,
+      "moneyline_confidence_pct": 70.76325889741801
     }
   ],
   "slate_date": "2026-10-12"
