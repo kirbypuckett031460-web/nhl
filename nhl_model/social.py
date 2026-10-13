@@ -201,21 +201,36 @@ class SocialMediaPoster:
             print(f"❌ Discord file upload failed: {exc}")
             return False
 
-    def post_inline_predictions(self, predictions: List[OverUnderPrediction], top_n: int = 10, title: str = "NHL Predictions (Top)") -> bool:
-        """Post a compact inline summary of top predictions to Discord as embeds."""
+    def post_inline_predictions(self, predictions: List[OverUnderPrediction], top_n: int = 0, title: str = "NHL Predictions") -> bool:
+        """Post a compact inline summary of predictions to Discord as embeds."""
         if not self.discord_webhook_url:
             print("⚠️  Discord webhook URL not available")
             return False
         try:
             preds = list(predictions or [])
             preds.sort(key=lambda pred: (pred.recommendation == 'No Bet', -abs(float(getattr(pred, 'edge', 0.0) or 0.0))), reverse=False)
-            preds = preds[:max(1, int(top_n))]
+            total_games = len(preds)
+            if total_games == 0:
+                print("ℹ️  No predictions available for Discord inline post.")
+                return False
+            # Always post the complete slate. `top_n` remains accepted for backward
+            # compatibility, but never truncates rows anymore.
+            try:
+                requested_cap = int(top_n)
+            except Exception:
+                requested_cap = 0
+            if requested_cap > 0 and requested_cap < total_games:
+                print(
+                    f"ℹ️  Discord inline cap ({requested_cap}) is below slate size "
+                    f"({total_games}); posting full slate."
+                )
             chunk_size = 8
             posted_any = False
             for i in range(0, len(preds), chunk_size):
                 chunk = preds[i:i + chunk_size]
+                range_suffix = f" {i + 1}-{i + len(chunk)} of {total_games}" if total_games > chunk_size else ""
                 embed = {
-                    "title": f"{title} {i + 1}-{i + len(chunk)}",
+                    "title": f"{title}{range_suffix}",
                     "color": 0x2ecc71,
                     "fields": []
                 }
