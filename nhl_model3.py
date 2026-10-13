@@ -13969,6 +13969,71 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'expected_pace_shrunk': baseline_total
             }
 
+            def _safe_float_or_default(value: Any, default: float) -> float:
+                try:
+                    out = float(value)
+                    if np.isfinite(out):
+                        return out
+                except Exception:
+                    pass
+                return float(default)
+
+            def _safe_int_or_default(value: Any, default: int) -> int:
+                try:
+                    return int(float(value))
+                except Exception:
+                    return int(default)
+
+            def _build_fallback_prediction(game_row: Any, reason: str) -> OverUnderPrediction:
+                """Create a deterministic placeholder prediction so every game appears in outputs."""
+                game_id_local = str(game_row.get('game_id', f'fallback_{len(predictions)}'))
+                odds_row = betting_odds.get(game_id_local, {}) if isinstance(betting_odds, dict) else {}
+                default_line = float(os.getenv('DEFAULT_MARKET_TOTAL', '6.0'))
+                line_local = _safe_float_or_default(odds_row.get('total', default_line) if isinstance(odds_row, dict) else default_line, default_line)
+                over_local = _safe_int_or_default(odds_row.get('over', -110) if isinstance(odds_row, dict) else -110, -110)
+                under_local = _safe_int_or_default(odds_row.get('under', -110) if isinstance(odds_row, dict) else -110, -110)
+                pred = OverUnderPrediction(
+                    game_id=game_id_local,
+                    home_team=str(game_row.get('home_team', 'HOME')),
+                    away_team=str(game_row.get('away_team', 'AWAY')),
+                    predicted_total=float(line_local),
+                    betting_line=float(line_local),
+                    over_probability=0.5,
+                    under_probability=0.5,
+                    push_probability=0.0,
+                    confidence=0.5,
+                    expected_value_over=0.0,
+                    expected_value_under=0.0,
+                    recommendation='No Bet',
+                    edge=0.0,
+                    kelly_bet_size=0.0,
+                    over_american_odds=over_local,
+                    under_american_odds=under_local,
+                    moneyline_recommendation='No Bet',
+                    moneyline_no_bet_reason=reason,
+                )
+                try:
+                    home_ml = odds_row.get('home_moneyline') if isinstance(odds_row, dict) else None
+                    away_ml = odds_row.get('away_moneyline') if isinstance(odds_row, dict) else None
+                    pred.home_moneyline_odds = int(home_ml) if home_ml is not None else None
+                    pred.away_moneyline_odds = int(away_ml) if away_ml is not None else None
+                except Exception:
+                    pred.home_moneyline_odds = None
+                    pred.away_moneyline_odds = None
+                try:
+                    game_date_raw = game_row.get('date')
+                    start_ts = pd.to_datetime(game_date_raw, errors='coerce', utc=True)
+                    if start_ts is not None and not pd.isna(start_ts):
+                        start_ts_et = start_ts.tz_convert('US/Eastern')
+                        pred.game_datetime = start_ts_et.to_pydatetime()
+                        pred.game_datetime_utc = start_ts.tz_convert('UTC').to_pydatetime()
+                        pred.start_time_display = start_ts_et.strftime('%I:%M %p ET')
+                except Exception:
+                    pred.game_datetime = None
+                    pred.game_datetime_utc = None
+                    pred.start_time_display = ''
+                return pred
+
             for idx, game in todays_features.iterrows():
                 try:
                     game_id = str(game.get('game_id', f'game_{idx}'))
@@ -14531,8 +14596,38 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     predictions.append(pred)
 
                 except Exception as e:
-                    print(f"⚠️  Error predicting game {idx}: {e}")
+                    try:
+                        game_id_err = str(game.get('game_id', f'game_{idx}'))
+                    except Exception:
+                        game_id_err = f'game_{idx}'
+                    print(f"⚠️  Error predicting game {idx} ({game_id_err}): {e}")
+                    predictions.append(_build_fallback_prediction(game, reason='prediction_error'))
                     continue
+
+            # Safety net: ensure all scheduled games are represented, even if a row
+            # failed during feature/prediction plumbing.
+            try:
+                expected_games = todays_games.copy() if isinstance(todays_games, pd.DataFrame) else pd.DataFrame()
+                expected_ids: List[str] = []
+                if not expected_games.empty and 'game_id' in expected_games.columns:
+                    expected_ids = [str(v) for v in expected_games['game_id'].tolist()]
+                predicted_ids = {str(getattr(pred, 'game_id', '') or '') for pred in predictions}
+                recovered = 0
+                if expected_ids:
+                    row_lookup: Dict[str, Any] = {}
+                    for _, g_row in expected_games.iterrows():
+                        gid_val = str(g_row.get('game_id', ''))
+                        if gid_val and gid_val not in row_lookup:
+                            row_lookup[gid_val] = g_row
+                    for gid in expected_ids:
+                        if gid and gid not in predicted_ids and gid in row_lookup:
+                            predictions.append(_build_fallback_prediction(row_lookup[gid], reason='prediction_missing'))
+                            predicted_ids.add(gid)
+                            recovered += 1
+                if recovered:
+                    print(f"ℹ️  Added fallback predictions for {recovered} game(s) to preserve full slate output.")
+            except Exception as reconciliation_err:
+                print(f"⚠️  Could not reconcile full slate predictions: {reconciliation_err}")
 
             try:
                 model.apply_risk_budget(predictions)
