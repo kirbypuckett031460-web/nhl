@@ -14678,14 +14678,14 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     pass
                 # Optional inline predictions to Discord
-                topn = 10
+                topn = 0
                 try:
                     if cli_args is not None:
-                        topn = int(getattr(cli_args, 'post_inline_top', 10))
+                        topn = int(getattr(cli_args, 'post_inline_top', 0))
                 except Exception:
-                    topn = 10
+                    topn = 0
                 if not cli_args or getattr(cli_args, 'post_inline', False):
-                    social_poster.post_inline_predictions(predictions, top_n=topn, title='NHL Predictions (Top)')
+                    social_poster.post_inline_predictions(predictions, top_n=topn, title='NHL Predictions')
             except Exception as e:
                 print(f"⚠️  Social posting skipped/failed: {e}")
         else:
@@ -14837,7 +14837,7 @@ if __name__ == "__main__":
     parser.add_argument('--post-excel', action='store_true', help='Upload the Excel file to Discord via webhook')
     # Inline Discord options
     parser.add_argument('--post-inline', action='store_true', help='Post a compact inline summary of predictions to Discord')
-    parser.add_argument('--post-inline-top', type=int, default=int(os.getenv('POST_INLINE_TOP', '10')), help='How many rows to include in inline Discord posts')
+    parser.add_argument('--post-inline-top', type=int, default=0, help='Maximum rows for inline Discord post (0 = full slate)')
     parser.add_argument('--use-compoisson', action='store_true', help='Enable Generalized Poisson (COM-Poisson proxy) calibration fallback')
     parser.add_argument('--calibration-report', action='store_true', help='Print calibration report by month and book after training')
     parser.add_argument('--calibration-report-top', type=int, default=int(os.getenv('CALIBRATION_REPORT_TOP', '12')), help='Max rows to show in calibration report sections')
