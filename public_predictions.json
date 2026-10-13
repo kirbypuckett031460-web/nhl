@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-13T15:26:09Z",
+  "generated_at": "2026-10-13T15:53:48Z",
   "games": [
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020090",
       "away_team": "NJD",
       "home_team": "DET",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 58.82375
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020091",
       "away_team": "FLA",
       "home_team": "CBJ",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 65.56166535742341
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020092",
       "away_team": "BUF",
       "home_team": "MTL",
@@ -71,7 +71,7 @@
       "moneyline_confidence_pct": 56.11047015289525
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020093",
       "away_team": "WSH",
       "home_team": "CAR",
@@ -94,7 +94,7 @@
       "moneyline_confidence_pct": 58.76726647655259
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020094",
       "away_team": "SEA",
       "home_team": "PHI",
@@ -117,7 +117,7 @@
       "moneyline_confidence_pct": 67.82608695652175
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020095",
       "away_team": "TBL",
       "home_team": "NYR",
@@ -140,7 +140,7 @@
       "moneyline_confidence_pct": 63.16527984710475
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020096",
       "away_team": "STL",
       "home_team": "OTT",
@@ -163,7 +163,7 @@
       "moneyline_confidence_pct": 92.0
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020097",
       "away_team": "VAN",
       "home_team": "NYI",
@@ -180,13 +180,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "NYI",
-      "moneyline_market_odds": -215.0,
-      "moneyline_fair_odds": -581,
-      "moneyline_edge": 0.17069677716969656,
-      "moneyline_confidence_pct": 85.32364597093792
+      "moneyline_market_odds": -220.0,
+      "moneyline_fair_odds": -605,
+      "moneyline_edge": 0.17061965811965818,
+      "moneyline_confidence_pct": 85.81196581196582
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020098",
       "away_team": "PIT",
       "home_team": "CHI",
@@ -203,13 +203,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "PIT",
-      "moneyline_market_odds": -164.0,
-      "moneyline_fair_odds": -133,
-      "moneyline_edge": -0.05071513454463539,
-      "moneyline_confidence_pct": 57.04969866674858
+      "moneyline_market_odds": -150.0,
+      "moneyline_fair_odds": -131,
+      "moneyline_edge": -0.032742420212765966,
+      "moneyline_confidence_pct": 56.725757978723415
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020099",
       "away_team": "MIN",
       "home_team": "WPG",
@@ -232,7 +232,7 @@
       "moneyline_confidence_pct": 70.0
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020100",
       "away_team": "COL",
       "home_team": "DAL",
@@ -249,13 +249,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "DAL",
-      "moneyline_market_odds": -106.0,
-      "moneyline_fair_odds": -136,
-      "moneyline_edge": 0.061984237062920555,
-      "moneyline_confidence_pct": 57.65473438590371
+      "moneyline_market_odds": -104.0,
+      "moneyline_fair_odds": -138,
+      "moneyline_edge": 0.07002360625764925,
+      "moneyline_confidence_pct": 57.982752782627664
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020101",
       "away_team": "VGK",
       "home_team": "NSH",
@@ -278,7 +278,7 @@
       "moneyline_confidence_pct": 53.070431662870156
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020102",
       "away_team": "TOR",
       "home_team": "UTA",
@@ -301,7 +301,7 @@
       "moneyline_confidence_pct": 69.1234486667486
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020103",
       "away_team": "CGY",
       "home_team": "ANA",
@@ -324,7 +324,7 @@
       "moneyline_confidence_pct": 81.16667597921439
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020104",
       "away_team": "EDM",
       "home_team": "LAK",
@@ -347,7 +347,7 @@
       "moneyline_confidence_pct": 65.56166535742341
     },
     {
-      "generated_at": "2026-10-13T15:26:09Z",
+      "generated_at": "2026-10-13T15:53:48Z",
       "game_id": "2026020105",
       "away_team": "BOS",
       "home_team": "SJS",
