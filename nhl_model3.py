@@ -11783,9 +11783,14 @@ def save_predictions_image(
 def save_public_app_snapshot_image(
     log_path: Optional[str] = None,
     image_path: str = "predictions_discord.png",
-    max_rows_per_table: int = 14,
+    max_rows_per_table: int = 0,
 ) -> Optional[str]:
-    """Render a Discord image that mirrors Streamlit public app content."""
+    """Render a Discord image that mirrors Streamlit public app content.
+
+    max_rows_per_table:
+        0 or negative => include the full slate (no truncation).
+        positive      => cap rows per table.
+    """
     if not MATPLOTLIB_AVAILABLE:
         print("⚠️  Matplotlib not available; cannot render public snapshot image.")
         return None
@@ -11846,9 +11851,18 @@ def save_public_app_snapshot_image(
 
     ml_clean = _strip_internal_cols(ml_rows)
     ou_clean = _strip_internal_cols(ou_rows)
-    if max_rows_per_table > 0:
-        ml_clean = ml_clean[: int(max_rows_per_table)]
-        ou_clean = ou_clean[: int(max_rows_per_table)]
+    try:
+        row_cap = int(max_rows_per_table)
+    except Exception:
+        row_cap = 0
+    if row_cap > 0:
+        if len(ml_clean) > row_cap or len(ou_clean) > row_cap:
+            print(
+                f"ℹ️  Discord snapshot row cap enabled ({row_cap}); "
+                f"ML rows={len(ml_clean)}, O/U rows={len(ou_clean)} before cap."
+            )
+        ml_clean = ml_clean[:row_cap]
+        ou_clean = ou_clean[:row_cap]
 
     def _parse_number(value: Any) -> Optional[float]:
         if value is None:
@@ -14832,12 +14846,12 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     pass
                 # Optional Discord posting (prefer table image; fallback to inline text).
-                topn = 10
+                topn = 0
                 try:
                     if cli_args is not None:
-                        topn = int(getattr(cli_args, 'post_inline_top', 10))
+                        topn = int(getattr(cli_args, 'post_inline_top', 0))
                 except Exception:
-                    topn = 10
+                    topn = 0
                 if not cli_args or getattr(cli_args, 'post_inline', False):
                     posted_discord = False
                     discord_img_path = None
@@ -14862,7 +14876,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         posted_discord = social_poster.post_inline_predictions(
                             predictions,
                             top_n=topn,
-                            title='NHL Predictions (Top)'
+                            title='NHL Predictions'
                         )
                     social_results['discord'] = bool(posted_discord)
             except Exception as e:
@@ -15016,7 +15030,7 @@ if __name__ == "__main__":
     parser.add_argument('--post-excel', action='store_true', help='Upload the Excel file to Discord via webhook')
     # Inline Discord options
     parser.add_argument('--post-inline', action='store_true', help='Post a compact inline summary of predictions to Discord')
-    parser.add_argument('--post-inline-top', type=int, default=int(os.getenv('POST_INLINE_TOP', '10')), help='How many rows to include in inline Discord posts')
+    parser.add_argument('--post-inline-top', type=int, default=0, help='Maximum rows for inline Discord post (0 = full slate)')
     parser.add_argument('--use-compoisson', action='store_true', help='Enable Generalized Poisson (COM-Poisson proxy) calibration fallback')
     parser.add_argument('--calibration-report', action='store_true', help='Print calibration report by month and book after training')
     parser.add_argument('--calibration-report-top', type=int, default=int(os.getenv('CALIBRATION_REPORT_TOP', '12')), help='Max rows to show in calibration report sections')
