@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-14T13:11:54Z",
+  "generated_at": "2026-10-14T18:22:32Z",
   "games": [
     {
-      "generated_at": "2026-10-14T13:11:54Z",
+      "generated_at": "2026-10-14T18:22:32Z",
       "game_id": "2026020106",
       "away_team": "MTL",
       "home_team": "WSH",
@@ -19,13 +19,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "WSH",
-      "moneyline_market_odds": -132.0,
-      "moneyline_fair_odds": -144,
-      "moneyline_edge": 0.02169240400763872,
-      "moneyline_confidence_pct": 59.065792124901805
+      "moneyline_market_odds": -125.0,
+      "moneyline_fair_odds": -141,
+      "moneyline_edge": 0.02993694444444439,
+      "moneyline_confidence_pct": 58.54925
     },
     {
-      "generated_at": "2026-10-14T13:11:54Z",
+      "generated_at": "2026-10-14T18:22:32Z",
       "game_id": "2026020107",
       "away_team": "DAL",
       "home_team": "COL",
@@ -42,10 +42,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "DAL",
-      "moneyline_market_odds": 130.0,
-      "moneyline_fair_odds": -161,
-      "moneyline_edge": 0.181612967101355,
-      "moneyline_confidence_pct": 61.63955757970072
+      "moneyline_market_odds": 114.0,
+      "moneyline_fair_odds": -183,
+      "moneyline_edge": 0.17972827426269977,
+      "moneyline_confidence_pct": 64.7017993888868
     }
   ],
   "slate_date": "2026-10-14"
