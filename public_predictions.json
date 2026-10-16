@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-16T13:15:05Z",
+  "generated_at": "2026-10-16T13:16:18Z",
   "games": [
     {
-      "generated_at": "2026-10-16T13:15:05Z",
+      "generated_at": "2026-10-16T13:16:18Z",
       "game_id": "2026020119",
       "away_team": "PIT",
       "home_team": "COL",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 54.676354029062104
     },
     {
-      "generated_at": "2026-10-16T13:15:05Z",
+      "generated_at": "2026-10-16T13:16:18Z",
       "game_id": "2026020120",
       "away_team": "BOS",
       "home_team": "ANA",
