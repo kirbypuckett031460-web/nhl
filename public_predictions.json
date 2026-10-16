@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-16T13:38:16Z",
+  "generated_at": "2026-10-16T13:41:06Z",
   "games": [
     {
-      "generated_at": "2026-10-16T13:38:16Z",
+      "generated_at": "2026-10-16T13:41:06Z",
       "game_id": "2026020119",
       "away_team": "PIT",
       "home_team": "COL",
@@ -12,10 +12,10 @@
       "game_time_et": "09:00 PM ET",
       "game_datetime_utc": "2026-10-17 01:00:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 7.042488167444937,
+      "totals_fair": 7.017404834111604,
       "totals_pick": "OVER",
-      "totals_edge": 0.5424881674449367,
-      "totals_confidence_pct": 45.7935326693533,
+      "totals_edge": 0.5174048341116038,
+      "totals_confidence_pct": 45.41728266935331,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "PIT",
@@ -25,7 +25,7 @@
       "moneyline_confidence_pct": 54.676354029062104
     },
     {
-      "generated_at": "2026-10-16T13:38:16Z",
+      "generated_at": "2026-10-16T13:41:06Z",
       "game_id": "2026020120",
       "away_team": "BOS",
       "home_team": "ANA",
@@ -35,10 +35,10 @@
       "game_time_et": "10:00 PM ET",
       "game_datetime_utc": "2026-10-17 02:00:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 7.215572132775755,
+      "totals_fair": 7.190488799442422,
       "totals_pick": "OVER",
-      "totals_edge": 0.7155721327757547,
-      "totals_confidence_pct": 48.38979214931557,
+      "totals_edge": 0.6904887994424218,
+      "totals_confidence_pct": 48.01354214931558,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "BOS",
