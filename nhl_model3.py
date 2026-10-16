@@ -10248,6 +10248,136 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
             away_prob = None
     except Exception:
         away_prob = None
+    # Side-resolution guardrails tuned for ML record stability:
+    # - blend model win probs toward no-vig market probabilities
+    # - avoid weak/coinflip model calls by preferring market favorite
+    # - block fragile longshot side selections unless model conviction is strong
+    try:
+        resolve_market_anchor_base = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_BASE', '0.40'))
+    except Exception:
+        resolve_market_anchor_base = 0.40
+    try:
+        resolve_market_anchor_longshot = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_LONGSHOT', '0.70'))
+    except Exception:
+        resolve_market_anchor_longshot = 0.70
+    try:
+        resolve_market_anchor_weak_gap = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_WEAK_GAP', '0.70'))
+    except Exception:
+        resolve_market_anchor_weak_gap = 0.70
+    try:
+        resolve_weak_gap = float(os.getenv('ML_RESOLVE_WEAK_GAP', '0.03'))
+    except Exception:
+        resolve_weak_gap = 0.03
+    try:
+        resolve_longshot_odds_threshold = int(float(os.getenv('ML_RESOLVE_LONGSHOT_ODDS_THRESHOLD', '130')))
+    except Exception:
+        resolve_longshot_odds_threshold = 130
+    try:
+        resolve_longshot_min_prob = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_PROB', '0.56'))
+    except Exception:
+        resolve_longshot_min_prob = 0.56
+    try:
+        resolve_longshot_min_edge = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_EDGE', '0.02'))
+    except Exception:
+        resolve_longshot_min_edge = 0.02
+    try:
+        resolve_max_delta_from_market = float(os.getenv('ML_RESOLVE_MAX_DELTA_FROM_MARKET', '0.20'))
+    except Exception:
+        resolve_max_delta_from_market = 0.20
+    resolve_market_favorite = str(os.getenv('ML_RESOLVE_MARKET_FAVORITE_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+    try:
+        resolve_market_favorite_min_prob = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_PROB', '0.54'))
+    except Exception:
+        resolve_market_favorite_min_prob = 0.54
+    try:
+        resolve_market_favorite_min_gap = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_GAP', '0.03'))
+    except Exception:
+        resolve_market_favorite_min_gap = 0.03
+
+    h_odds = getattr(prediction, 'home_moneyline_odds', None)
+    a_odds = getattr(prediction, 'away_moneyline_odds', None)
+    try:
+        h_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
+    except Exception:
+        h_imp = None
+    try:
+        a_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
+    except Exception:
+        a_imp = None
+    market_home_prob = None
+    market_away_prob = None
+    if h_imp is not None or a_imp is not None:
+        if h_imp is not None and a_imp is not None:
+            vig = max(1e-9, float(h_imp) + float(a_imp))
+            market_home_prob = float(h_imp) / vig
+            market_away_prob = float(a_imp) / vig
+        elif h_imp is not None:
+            market_home_prob = float(h_imp)
+        elif a_imp is not None:
+            market_away_prob = float(a_imp)
+
+    def _market_favorite_side() -> Optional[str]:
+        if market_home_prob is None and market_away_prob is None:
+            return None
+        home_score = float(market_home_prob) if market_home_prob is not None else -1.0
+        away_score = float(market_away_prob) if market_away_prob is not None else -1.0
+        return 'home' if home_score >= away_score else 'away'
+
+    if home_prob is not None and away_prob is not None:
+        pair_sum = float(home_prob + away_prob)
+        if np.isfinite(pair_sum) and pair_sum > 0:
+            home_prob = float(home_prob / pair_sum)
+            away_prob = float(max(0.0, min(1.0, 1.0 - home_prob)))
+
+    if home_prob is not None and away_prob is not None and market_home_prob is not None and market_away_prob is not None:
+        model_gap = abs(float(home_prob) - float(away_prob))
+        longshot_present = bool(
+            (isinstance(h_odds, (int, float)) and float(h_odds) >= float(resolve_longshot_odds_threshold))
+            or (isinstance(a_odds, (int, float)) and float(a_odds) >= float(resolve_longshot_odds_threshold))
+        )
+        anchor = float(resolve_market_anchor_base)
+        if longshot_present:
+            anchor = max(anchor, float(resolve_market_anchor_longshot))
+        if model_gap < float(resolve_weak_gap):
+            anchor = max(anchor, float(resolve_market_anchor_weak_gap))
+        anchor = float(min(max(anchor, 0.0), 1.0))
+        max_delta = float(min(max(resolve_max_delta_from_market, 0.0), 0.49))
+        blended_home = float((1.0 - anchor) * home_prob + anchor * market_home_prob)
+        delta_home = blended_home - float(market_home_prob)
+        if abs(delta_home) > max_delta:
+            blended_home = float(float(market_home_prob) + np.sign(delta_home) * max_delta)
+        home_prob = float(max(0.0, min(1.0, blended_home)))
+        away_prob = float(max(0.0, min(1.0, 1.0 - home_prob)))
+
+    if home_prob is not None or away_prob is not None:
+        home_score = home_prob if home_prob is not None else -1.0
+        away_score = away_prob if away_prob is not None else -1.0
+        prob_gap = abs(float(home_score) - float(away_score))
+        top_prob = max(float(home_score), float(away_score))
+        market_side = _market_favorite_side()
+        if resolve_market_favorite and market_side and (
+            top_prob < float(resolve_market_favorite_min_prob) or prob_gap < float(resolve_market_favorite_min_gap)
+        ):
+            return market_side
+
+        picked_side = 'home' if home_score >= away_score else 'away'
+        picked_prob = float(home_score) if picked_side == 'home' else float(away_score)
+        picked_market_prob = market_home_prob if picked_side == 'home' else market_away_prob
+        picked_odds = h_odds if picked_side == 'home' else a_odds
+        if (
+            isinstance(picked_odds, (int, float))
+            and float(picked_odds) >= float(resolve_longshot_odds_threshold)
+        ):
+            implied_edge = (picked_prob - float(picked_market_prob)) if picked_market_prob is not None else 0.0
+            if (
+                picked_prob < float(resolve_longshot_min_prob)
+                or implied_edge < float(resolve_longshot_min_edge)
+            ):
+                if market_side:
+                    return market_side
+                return 'away' if picked_side == 'home' else 'home'
+        return picked_side
+
     no_bet_market_favorite = str(os.getenv('ML_NO_BET_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
     try:
         no_bet_min_gap = float(os.getenv('ML_NO_BET_MIN_PROB_GAP', '0.03'))
@@ -10255,26 +10385,14 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
         no_bet_min_gap = 0.03
     is_no_bet = (not ml_raw) or ml_raw.startswith('NO BET')
     if is_no_bet and no_bet_market_favorite:
-        try:
-            h_odds = getattr(prediction, 'home_moneyline_odds', None)
-            a_odds = getattr(prediction, 'away_moneyline_odds', None)
-            h_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
-            a_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
-        except Exception:
-            h_imp = None
-            a_imp = None
         if home_prob is not None and away_prob is not None:
             prob_gap = abs(float(home_prob) - float(away_prob))
         else:
             prob_gap = 0.0
-        if (home_prob is None or away_prob is None or prob_gap < no_bet_min_gap) and (h_imp is not None or a_imp is not None):
-            h_score = float(h_imp) if h_imp is not None else -1.0
-            a_score = float(a_imp) if a_imp is not None else -1.0
-            return 'home' if h_score >= a_score else 'away'
-    if home_prob is not None or away_prob is not None:
-        home_score = home_prob if home_prob is not None else -1.0
-        away_score = away_prob if away_prob is not None else -1.0
-        return 'home' if home_score >= away_score else 'away'
+        if (home_prob is None or away_prob is None or prob_gap < no_bet_min_gap):
+            market_side = _market_favorite_side()
+            if market_side:
+                return market_side
 
     home_edge = None
     away_edge = None
