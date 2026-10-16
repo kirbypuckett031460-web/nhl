@@ -10253,46 +10253,46 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
     # - avoid weak/coinflip model calls by preferring market favorite
     # - block fragile longshot side selections unless model conviction is strong
     try:
-        resolve_market_anchor_base = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_BASE', '0.45'))
+        resolve_market_anchor_base = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_BASE', '0.40'))
     except Exception:
-        resolve_market_anchor_base = 0.45
+        resolve_market_anchor_base = 0.40
     try:
-        resolve_market_anchor_longshot = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_LONGSHOT', '0.75'))
+        resolve_market_anchor_longshot = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_LONGSHOT', '0.70'))
     except Exception:
-        resolve_market_anchor_longshot = 0.75
+        resolve_market_anchor_longshot = 0.70
     try:
-        resolve_market_anchor_weak_gap = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_WEAK_GAP', '0.75'))
+        resolve_market_anchor_weak_gap = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_WEAK_GAP', '0.70'))
     except Exception:
-        resolve_market_anchor_weak_gap = 0.75
+        resolve_market_anchor_weak_gap = 0.70
     try:
-        resolve_weak_gap = float(os.getenv('ML_RESOLVE_WEAK_GAP', '0.04'))
+        resolve_weak_gap = float(os.getenv('ML_RESOLVE_WEAK_GAP', '0.03'))
     except Exception:
-        resolve_weak_gap = 0.04
+        resolve_weak_gap = 0.03
     try:
-        resolve_longshot_odds_threshold = int(float(os.getenv('ML_RESOLVE_LONGSHOT_ODDS_THRESHOLD', '140')))
+        resolve_longshot_odds_threshold = int(float(os.getenv('ML_RESOLVE_LONGSHOT_ODDS_THRESHOLD', '130')))
     except Exception:
-        resolve_longshot_odds_threshold = 140
+        resolve_longshot_odds_threshold = 130
     try:
-        resolve_longshot_min_prob = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_PROB', '0.58'))
+        resolve_longshot_min_prob = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_PROB', '0.56'))
     except Exception:
-        resolve_longshot_min_prob = 0.58
+        resolve_longshot_min_prob = 0.56
     try:
-        resolve_longshot_min_edge = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_EDGE', '0.03'))
+        resolve_longshot_min_edge = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_EDGE', '0.02'))
     except Exception:
-        resolve_longshot_min_edge = 0.03
+        resolve_longshot_min_edge = 0.02
     try:
         resolve_max_delta_from_market = float(os.getenv('ML_RESOLVE_MAX_DELTA_FROM_MARKET', '0.20'))
     except Exception:
         resolve_max_delta_from_market = 0.20
     resolve_market_favorite = str(os.getenv('ML_RESOLVE_MARKET_FAVORITE_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
     try:
-        resolve_market_favorite_min_prob = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_PROB', '0.56'))
+        resolve_market_favorite_min_prob = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_PROB', '0.54'))
     except Exception:
-        resolve_market_favorite_min_prob = 0.56
+        resolve_market_favorite_min_prob = 0.54
     try:
-        resolve_market_favorite_min_gap = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_GAP', '0.04'))
+        resolve_market_favorite_min_gap = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_GAP', '0.03'))
     except Exception:
-        resolve_market_favorite_min_gap = 0.04
+        resolve_market_favorite_min_gap = 0.03
 
     h_odds = getattr(prediction, 'home_moneyline_odds', None)
     a_odds = getattr(prediction, 'away_moneyline_odds', None)
