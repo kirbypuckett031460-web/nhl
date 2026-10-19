@@ -19,6 +19,10 @@ on:
         description: "Commit/push generated artifacts back to the repo"
         required: false
         default: "true"
+      post_to_discord:
+        description: "Post results to Discord webhook if configured"
+        required: false
+        default: "true"
   schedule:
     # Daily run at 14:00 UTC.
     - cron: "0 14 * * *"
@@ -41,6 +45,7 @@ jobs:
     timeout-minutes: 90
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       NHL_SEASON_START: ${{ vars.NHL_SEASON_START }}
 
     steps:
@@ -125,6 +130,20 @@ jobs:
             CMD+=(--realtime-odds --log-odds-history --odds-history-path odds_history.csv)
           else
             CMD+=(--odds-path odds.json)
+          fi
+
+          POST_TO_DISCORD_INPUT="${{ github.event.inputs.post_to_discord }}"
+          if [[ -z "${POST_TO_DISCORD_INPUT}" ]]; then
+            POST_TO_DISCORD_INPUT="true"
+          fi
+          if [[ "${POST_TO_DISCORD_INPUT,,}" == "true" ]]; then
+            if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
+              CMD+=(--post-social --post-inline --post-inline-top 0)
+            else
+              echo "Discord posting requested but DISCORD_WEBHOOK_URL secret is not configured; skipping Discord post."
+            fi
+          else
+            echo "Discord posting disabled via workflow input."
           fi
 
           echo "Running command:"
