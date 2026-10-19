@@ -15,6 +15,14 @@ on:
         description: "Training target mode"
         required: false
         default: "auto"
+      publish_outputs:
+        description: "Commit/push generated artifacts back to the repo"
+        required: false
+        default: "true"
+      post_to_discord:
+        description: "Post results to Discord webhook if configured"
+        required: false
+        default: "true"
   schedule:
     # Daily run at 14:00 UTC.
     - cron: "0 14 * * *"
@@ -37,6 +45,7 @@ jobs:
     timeout-minutes: 90
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       NHL_SEASON_START: ${{ vars.NHL_SEASON_START }}
 
     steps:
@@ -123,16 +132,39 @@ jobs:
             CMD+=(--odds-path odds.json)
           fi
 
+          POST_TO_DISCORD_INPUT="${{ github.event.inputs.post_to_discord }}"
+          if [[ -z "${POST_TO_DISCORD_INPUT}" ]]; then
+            POST_TO_DISCORD_INPUT="true"
+          fi
+          if [[ "${POST_TO_DISCORD_INPUT,,}" == "true" ]]; then
+            if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
+              CMD+=(--post-social --post-inline --post-inline-top 0)
+            else
+              echo "Discord posting requested but DISCORD_WEBHOOK_URL secret is not configured; skipping Discord post."
+            fi
+          else
+            echo "Discord posting disabled via workflow input."
+          fi
+
           echo "Running command:"
           printf ' %q' "${CMD[@]}"
           echo
           "${CMD[@]}"
 
-      - name: Commit updated outputs
+      - name: Publish updated outputs
         if: steps.schedule_gate.outputs.should_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
+
+          PUBLISH_INPUT="${{ github.event.inputs.publish_outputs }}"
+          if [[ -z "${PUBLISH_INPUT}" ]]; then
+            PUBLISH_INPUT="true"
+          fi
+          if [[ "${PUBLISH_INPUT,,}" != "true" ]]; then
+            echo "Publish disabled via workflow input."
+            exit 0
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -158,7 +190,25 @@ jobs:
           fi
 
           git commit -m "chore(ci): refresh NHL model outputs [skip ci]"
-          git push
+
+          branch_name="${GITHUB_REF_NAME:-main}"
+          for attempt in 1 2 3 4; do
+            if git push origin "HEAD:${branch_name}"; then
+              echo "Published outputs to ${branch_name}."
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed; refreshing branch state and retrying..."
+            git fetch origin "${branch_name}"
+            if ! git pull --rebase origin "${branch_name}"; then
+              echo "Rebase failed while retrying publish."
+              git rebase --abort || true
+              exit 1
+            fi
+            sleep $((attempt * 3))
+          done
+
+          echo "Failed to publish outputs after retries."
+          exit 1
 
       - name: Skip notice
         if: steps.schedule_gate.outputs.should_run != 'true'
