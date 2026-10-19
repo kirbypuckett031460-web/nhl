@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-19T12:55:11Z",
+  "generated_at": "2026-10-19T19:41:51Z",
   "games": [
     {
-      "generated_at": "2026-10-19T12:55:11Z",
+      "generated_at": "2026-10-19T19:41:51Z",
       "game_id": "2026020137",
       "away_team": "ANA",
       "home_team": "NYR",
@@ -19,13 +19,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "ANA",
-      "moneyline_market_odds": 115.0,
-      "moneyline_fair_odds": -120,
-      "moneyline_edge": 0.08132201343070017,
-      "moneyline_confidence_pct": 54.643829250046764
+      "moneyline_market_odds": 130.0,
+      "moneyline_fair_odds": -114,
+      "moneyline_edge": 0.09859959283330033,
+      "moneyline_confidence_pct": 53.33822015289525
     },
     {
-      "generated_at": "2026-10-19T12:55:11Z",
+      "generated_at": "2026-10-19T19:41:51Z",
       "game_id": "2026020138",
       "away_team": "COL",
       "home_team": "PHI",
@@ -48,7 +48,7 @@
       "moneyline_confidence_pct": 52.090038135987356
     },
     {
-      "generated_at": "2026-10-19T12:55:11Z",
+      "generated_at": "2026-10-19T19:41:51Z",
       "game_id": "2026020139",
       "away_team": "SJS",
       "home_team": "TOR",
@@ -65,13 +65,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "SJS",
-      "moneyline_market_odds": 120.0,
-      "moneyline_fair_odds": -174,
-      "moneyline_edge": 0.18054727013357535,
-      "moneyline_confidence_pct": 63.50927246790299
+      "moneyline_market_odds": 108.0,
+      "moneyline_fair_odds": -194,
+      "moneyline_edge": 0.17886306339543745,
+      "moneyline_confidence_pct": 65.96322941646682
     },
     {
-      "generated_at": "2026-10-19T12:55:11Z",
+      "generated_at": "2026-10-19T19:41:51Z",
       "game_id": "2026020140",
       "away_team": "PIT",
       "home_team": "UTA",
@@ -88,10 +88,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "PIT",
-      "moneyline_market_odds": 146.0,
-      "moneyline_fair_odds": 111,
-      "moneyline_edge": 0.06681131903209925,
-      "moneyline_confidence_pct": 47.33153840727496
+      "moneyline_market_odds": 152.0,
+      "moneyline_fair_odds": 113,
+      "moneyline_edge": 0.07351792839394838,
+      "moneyline_confidence_pct": 47.034332521934516
     }
   ],
   "slate_date": "2026-10-19"
