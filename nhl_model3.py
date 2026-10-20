@@ -10218,6 +10218,23 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
     return 'home'
 
 
+def resolve_moneyline_action(prediction: OverUnderPrediction) -> str:
+    """Classify moneyline output as actionable bet or directional pick.
+
+    This stays stable even when display labels replace HOME/AWAY ML text.
+    """
+    ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
+    ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
+    no_bet_reason = str(getattr(prediction, 'moneyline_no_bet_reason', '') or '').strip()
+    if ml_raw.startswith('NO BET'):
+        return 'ML_PICK'
+    if ml_side in {'home', 'away'} and not no_bet_reason:
+        return 'ML_BET'
+    if ('HOME ML' in ml_raw or 'AWAY ML' in ml_raw) and not no_bet_reason:
+        return 'ML_BET'
+    return 'ML_PICK'
+
+
 def save_public_predictions_json(
     predictions: List[OverUnderPrediction],
     out_path: str = 'public_predictions.json',
@@ -10274,6 +10291,7 @@ def save_public_predictions_json(
     for pred in predictions:
         totals_pick = resolve_totals_pick(pred)
         totals_action = 'BET' if str(getattr(pred, 'recommendation', '') or '').strip().upper() in {'OVER', 'UNDER'} else 'PICK'
+        moneyline_action = resolve_moneyline_action(pred)
 
         totals_conf = _safe_float(getattr(pred, 'confidence', None))
         if totals_conf is not None and totals_conf <= 1.0:
@@ -10326,6 +10344,9 @@ def save_public_predictions_json(
             'moneyline_fair_odds': _prob_to_american(ml_prob),
             'moneyline_edge': ml_edge,
             'moneyline_confidence_pct': _safe_float((ml_prob * 100.0) if ml_prob is not None else 50.0),
+            'moneyline_action': moneyline_action,
+            'moneyline_no_bet_reason': str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip() or None,
+            'moneyline_bet_size_pct': _safe_float(getattr(pred, 'moneyline_bet_size', None)),
         })
 
     payload = {'generated_at': generated_at, 'games': rows}
@@ -10541,8 +10562,7 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         # tracked even when the model decides "No Bet".
         ml_side = resolve_moneyline_pick(p)
         ml_side_norm = 'HOME' if str(ml_side).strip().lower() == 'home' else 'AWAY'
-        ml_rec = str(getattr(p, 'moneyline_recommendation', '') or '').strip().upper()
-        ml_action = 'ML_BET' if ml_rec in {'HOME ML', 'AWAY ML'} else 'ML_PICK'
+        ml_action = resolve_moneyline_action(p)
         if ml_side_norm == 'HOME':
             ml_price = getattr(p, 'home_moneyline_odds', None)
             ml_edge = getattr(p, 'home_moneyline_edge', None)

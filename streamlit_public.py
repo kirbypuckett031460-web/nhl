@@ -578,6 +578,9 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
         market_ml = _resolve_moneyline_market(game, side_hint)
         ml_edge = _safe_float(game.get("moneyline_edge"))
         ml_conf = _safe_float(game.get("moneyline_confidence_pct"))
+        ml_action = str(game.get("moneyline_action") or "").strip().upper()
+        if ml_action not in {"ML_BET", "ML_PICK"}:
+            ml_action = "ML_PICK"
         moneyline_rows.append({
             "Game Time (ET)": game_time,
             "Away": away,
@@ -588,6 +591,7 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
             "Edge": _fmt_signed(ml_edge * 100.0 if ml_edge is not None else None, places=1, pct=True),
             "Confidence": _fmt_signed(ml_conf, places=1, pct=True).replace("+", ""),
             "_edge_abs": abs(ml_edge) if ml_edge is not None else -1.0,
+            "_ml_action": ml_action,
         })
 
     totals_rows.sort(key=lambda r: str(r.get("Game Time (ET)") or ""))
@@ -819,8 +823,19 @@ def render_public_app() -> None:
 
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
     with tab_ml:
-        _render_table(ml_rows)
-        top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
+        ml_best_rows = [r for r in ml_rows if str(r.get("_ml_action") or "").upper() == "ML_BET"]
+        show_all_ml = st.toggle("Show all model moneyline picks (include leans)", value=False, key="show_all_ml_rows")
+        if show_all_ml:
+            ml_display_rows = ml_rows
+        else:
+            ml_display_rows = ml_best_rows
+            if not ml_display_rows:
+                st.info("No ML_BET rows for this slate yet. Showing all model moneyline picks instead.")
+                ml_display_rows = ml_rows
+        st.caption(f"Moneyline rows: {len(ml_best_rows)} best bets / {len(ml_rows)} total model picks")
+        _render_table(ml_display_rows)
+        top_source = ml_best_rows if ml_best_rows else ml_rows
+        top_ml = sorted(top_source, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ml, "Top Plays")
     with tab_ou:
         _render_table(ou_rows)
