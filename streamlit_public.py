@@ -824,17 +824,9 @@ def render_public_app() -> None:
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
     with tab_ml:
         ml_best_rows = [r for r in ml_rows if str(r.get("_ml_action") or "").upper() == "ML_BET"]
-        show_all_ml = st.toggle("Show all model moneyline picks (include leans)", value=False, key="show_all_ml_rows")
-        if show_all_ml:
-            ml_display_rows = ml_rows
-        else:
-            ml_display_rows = ml_best_rows
-            if not ml_display_rows:
-                st.info("No ML_BET rows for this slate yet. Showing all model moneyline picks instead.")
-                ml_display_rows = ml_rows
         st.caption(f"Moneyline rows: {len(ml_best_rows)} best bets / {len(ml_rows)} total model picks")
-        _render_table(ml_display_rows)
-        top_source = ml_best_rows if ml_best_rows else ml_rows
+        _render_table(ml_rows)
+        top_source = ml_rows
         top_ml = sorted(top_source, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ml, "Top Plays")
     with tab_ou:
