@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-21T18:27:31Z",
+  "generated_at": "2026-10-21T20:01:37Z",
   "games": [
     {
-      "generated_at": "2026-10-21T18:27:31Z",
+      "generated_at": "2026-10-21T20:01:37Z",
       "game_id": "2026020152",
       "away_team": "PHI",
       "home_team": "BUF",
@@ -19,16 +19,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "BUF",
-      "moneyline_market_odds": -188.0,
-      "moneyline_fair_odds": -235,
-      "moneyline_edge": 0.0489658529884458,
-      "moneyline_confidence_pct": 70.17436307662236,
+      "moneyline_market_odds": -200.0,
+      "moneyline_fair_odds": -240,
+      "moneyline_edge": 0.039617989130434794,
+      "moneyline_confidence_pct": 70.62846557971014,
       "moneyline_action": "ML_BET",
       "moneyline_no_bet_reason": null,
       "moneyline_bet_size_pct": 2.0
     },
     {
-      "generated_at": "2026-10-21T18:27:31Z",
+      "generated_at": "2026-10-21T20:01:37Z",
       "game_id": "2026020153",
       "away_team": "FLA",
       "home_team": "OTT",
