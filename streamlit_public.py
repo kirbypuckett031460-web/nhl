@@ -826,8 +826,6 @@ def render_public_app() -> None:
 
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
     with tab_ml:
-        ml_best_rows = [r for r in ml_rows if str(r.get("_ml_action") or "").upper() == "ML_BET"]
-        st.caption(f"Moneyline rows: {len(ml_best_rows)} best bets / {len(ml_rows)} total model picks")
         _render_table(ml_rows)
         top_source = ml_rows
         top_ml = sorted(top_source, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
