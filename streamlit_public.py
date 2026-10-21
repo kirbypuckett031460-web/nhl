@@ -438,20 +438,23 @@ def _compute_record_blocks(
     reference_date: Optional[date] = None,
 ) -> Dict[str, Tuple[str, str]]:
     ref_date = reference_date or datetime.now().date()
+
+    def _default_season_start(ref: date) -> date:
+        same_year_start = date(ref.year, 9, 29)
+        return same_year_start if ref >= same_year_start else date(ref.year - 1, 9, 29)
+
+    season_start = _default_season_start(ref_date)
     season_start_raw = str(os.getenv("NHL_SEASON_START", "")).strip()
-    if not season_start_raw:
-        current_year_start = date(ref_date.year, 9, 29)
-        # During late off-season (Jul-Sep before opening day), track against the upcoming season start.
-        if ref_date.month >= 7 and ref_date < current_year_start:
-            season_start_raw = current_year_start.strftime("%Y-%m-%d")
-        elif ref_date >= current_year_start:
-            season_start_raw = current_year_start.strftime("%Y-%m-%d")
-        else:
-            season_start_raw = date(ref_date.year - 1, 9, 29).strftime("%Y-%m-%d")
-    try:
-        season_start = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
-    except Exception:
-        season_start = datetime.now().date().replace(month=1, day=1)
+    if season_start_raw:
+        try:
+            configured = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
+            # Accept configured start only when it's plausibly this season
+            # (allows a few-week override without letting stale prior-season
+            # values inflate current YTD records).
+            if abs((configured - season_start).days) <= 45:
+                season_start = configured
+        except Exception:
+            pass
     yesterday = ref_date - timedelta(days=1)
     blocks = {
         "ml_prev_day": [0, 0],
