@@ -9870,18 +9870,34 @@ def compute_bet_performance_summary(
         seen_paths.add(key)
         log_candidates.append(normalized)
 
-    # YTD should represent the current season's picks, not the model's last training split.
-    # Default season start requested: Oct 7, 2025 (inclusive).
-    season_start_str = str(os.getenv('NHL_SEASON_START', '2025-10-07')).strip() or '2025-10-07'
-    season_start_eastern: Optional[pd.Timestamp] = None
+    # YTD should represent the current season only.
+    # Derive season start from today's season boundary, and only honor an
+    # NHL_SEASON_START override when it's plausibly within this season window.
     try:
-        candidate = pd.Timestamp(season_start_str)
-        if candidate.tzinfo is None:
-            season_start_eastern = candidate.tz_localize('US/Eastern')
-        else:
-            season_start_eastern = candidate.tz_convert('US/Eastern')
+        now_eastern_ref = pd.Timestamp.now(tz='US/Eastern')
+        ref_date = now_eastern_ref.date()
+    except Exception:
+        ref_date = datetime.now().date()
+    same_year_start = date(ref_date.year, 9, 29)
+    default_start = same_year_start if ref_date >= same_year_start else date(ref_date.year - 1, 9, 29)
+    season_start_eastern: Optional[pd.Timestamp]
+    try:
+        season_start_eastern = pd.Timestamp(default_start).tz_localize('US/Eastern')
     except Exception:
         season_start_eastern = None
+
+    season_start_str = str(os.getenv('NHL_SEASON_START', '')).strip()
+    if season_start_str and season_start_eastern is not None:
+        try:
+            configured = pd.Timestamp(season_start_str)
+            if configured.tzinfo is None:
+                configured = configured.tz_localize('US/Eastern')
+            else:
+                configured = configured.tz_convert('US/Eastern')
+            if abs((configured.date() - default_start).days) <= 45:
+                season_start_eastern = configured
+        except Exception:
+            pass
 
     for path in log_candidates:
         if not path:
@@ -9947,6 +9963,7 @@ def compute_bet_performance_summary(
         )
         dates_utc = None
         dates_local = None
+        parsed = None
         season_mask = None
         yesterday_mask = None
         last_week_mask = None
@@ -9994,6 +10011,51 @@ def compute_bet_performance_summary(
                     dates_utc = dates_local.dt.tz_convert('UTC')
                 except Exception:
                     dates_utc = None
+
+            # Deduplicate repeated reruns: keep the latest directional row per game key.
+            # This prevents YTD totals from ballooning when the same slate is re-run.
+            try:
+                gid_col = next(
+                    (c for c in df_log.columns if str(c).lower() in {'game_id', 'gameid', 'gid'}),
+                    None
+                )
+                matchup_col = next(
+                    (c for c in df_log.columns if str(c).lower() in {'matchup', 'game', 'event'}),
+                    None
+                )
+                dedupe_keys = pd.Series('', index=df_log.index, dtype='object')
+                if gid_col:
+                    gid_series = df_log[gid_col].astype(str).str.strip()
+                    gid_mask = gid_series.ne('') & ~gid_series.str.lower().isin({'nan', 'none', 'null'})
+                    dedupe_keys = dedupe_keys.mask(gid_mask, 'gid:' + gid_series)
+
+                if matchup_col:
+                    matchup_series = (
+                        df_log[matchup_col]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                    )
+                    matchup_mask = matchup_series.ne('') & ~matchup_series.str.lower().isin({'nan', 'none', 'null'})
+                    if dates_local is not None and dates_local.notna().any():
+                        date_part = dates_local.dt.date.astype(str).replace('NaT', '')
+                    elif parsed is not None and hasattr(parsed, 'dt'):
+                        date_part = parsed.dt.date.astype(str).replace('NaT', '')
+                    else:
+                        date_part = pd.Series('', index=df_log.index, dtype='object')
+                    fill_mask = dedupe_keys.eq('') & matchup_mask
+                    dedupe_keys = dedupe_keys.mask(fill_mask, 'matchup:' + matchup_series + '|date:' + date_part)
+
+                directional_df = df_log[direction_mask].copy()
+                if not directional_df.empty:
+                    directional_keys = dedupe_keys.loc[directional_df.index]
+                    directional_df = directional_df.assign(_dedupe_key=directional_keys)
+                    directional_df = directional_df[directional_df['_dedupe_key'].astype(str).str.strip() != '']
+                    if not directional_df.empty:
+                        keep_idx = directional_df.groupby('_dedupe_key', sort=False).tail(1).index
+                        direction_mask = direction_mask & df_log.index.isin(keep_idx)
+            except Exception:
+                pass
 
             if dates_local is not None and dates_local.notna().any():
                 if season_start_eastern is not None:
