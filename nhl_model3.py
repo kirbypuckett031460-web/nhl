@@ -10216,68 +10216,157 @@ def resolve_totals_pick(prediction: OverUnderPrediction) -> str:
 
 def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
     """Return a deterministic moneyline side ('home' or 'away') for every game."""
-    ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
-    if ml_side in {'home', 'away'}:
-        return ml_side
+    def _safe_prob(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+            if np.isfinite(out):
+                return out
+        except Exception:
+            return None
+        return None
 
+    def _safe_american(value: Any) -> Optional[int]:
+        try:
+            out = int(float(value))
+            return out
+        except Exception:
+            return None
+
+    def _implied_prob_from_american(value: Any) -> Optional[float]:
+        odds = _safe_american(value)
+        if odds is None:
+            return None
+        try:
+            return float(odds_decimal_to_implied_prob(odds_american_to_decimal(odds)))
+        except Exception:
+            return None
+
+    # Signals carried on each prediction
+    ml_side_attr = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
     ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
-    if 'HOME' in ml_raw:
-        return 'home'
-    if 'AWAY' in ml_raw:
-        return 'away'
+    home_prob = _safe_prob(getattr(prediction, 'home_win_probability', None))
+    away_prob = _safe_prob(getattr(prediction, 'away_win_probability', None))
+    home_edge = _safe_prob(getattr(prediction, 'home_moneyline_edge', None))
+    away_edge = _safe_prob(getattr(prediction, 'away_moneyline_edge', None))
+    home_odds = _safe_american(getattr(prediction, 'home_moneyline_odds', None))
+    away_odds = _safe_american(getattr(prediction, 'away_moneyline_odds', None))
 
-    home_prob = None
-    away_prob = None
-    try:
-        home_prob = float(getattr(prediction, 'home_win_probability', np.nan))
-        if not np.isfinite(home_prob):
-            home_prob = None
-    except Exception:
-        home_prob = None
-    try:
-        away_prob = float(getattr(prediction, 'away_win_probability', np.nan))
-        if not np.isfinite(away_prob):
-            away_prob = None
-    except Exception:
-        away_prob = None
-    if home_prob is not None or away_prob is not None:
-        home_score = home_prob if home_prob is not None else -1.0
-        away_score = away_prob if away_prob is not None else -1.0
-        return 'home' if home_score >= away_score else 'away'
+    home_imp_raw = _implied_prob_from_american(home_odds)
+    away_imp_raw = _implied_prob_from_american(away_odds)
+    market_home_prob = None
+    market_away_prob = None
+    if home_imp_raw is not None and away_imp_raw is not None:
+        vig = max(1e-9, float(home_imp_raw) + float(away_imp_raw))
+        market_home_prob = float(home_imp_raw / vig)
+        market_away_prob = float(away_imp_raw / vig)
+    else:
+        market_home_prob = home_imp_raw
+        market_away_prob = away_imp_raw
 
-    home_edge = None
-    away_edge = None
-    try:
-        home_edge = float(getattr(prediction, 'home_moneyline_edge', np.nan))
-        if not np.isfinite(home_edge):
-            home_edge = None
-    except Exception:
-        home_edge = None
-    try:
-        away_edge = float(getattr(prediction, 'away_moneyline_edge', np.nan))
-        if not np.isfinite(away_edge):
-            away_edge = None
-    except Exception:
-        away_edge = None
-    if home_edge is not None or away_edge is not None:
-        home_score = home_edge if home_edge is not None else -1e9
-        away_score = away_edge if away_edge is not None else -1e9
-        return 'home' if home_score >= away_score else 'away'
+    def _market_favorite_side() -> Optional[str]:
+        if market_home_prob is None and market_away_prob is None:
+            return None
+        hs = float(market_home_prob) if market_home_prob is not None else -1.0
+        as_ = float(market_away_prob) if market_away_prob is not None else -1.0
+        return 'home' if hs >= as_ else 'away'
 
-    # Last fallback: choose side with stronger market implied probability when odds exist.
-    try:
-        h_odds = getattr(prediction, 'home_moneyline_odds', None)
-        a_odds = getattr(prediction, 'away_moneyline_odds', None)
-        h_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
-        a_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
-        if h_prob is not None or a_prob is not None:
-            h_score = float(h_prob) if h_prob is not None else -1.0
-            a_score = float(a_prob) if a_prob is not None else -1.0
-            return 'home' if h_score >= a_score else 'away'
-    except Exception:
-        pass
+    # 1) Start with explicit recommendation if available
+    candidate_side: Optional[str] = None
+    if ml_side_attr in {'home', 'away'}:
+        candidate_side = ml_side_attr
+    elif 'HOME' in ml_raw:
+        candidate_side = 'home'
+    elif 'AWAY' in ml_raw:
+        candidate_side = 'away'
 
-    return 'home'
+    # 2) Fall back to model probabilities / edges / market
+    if candidate_side is None and (home_prob is not None or away_prob is not None):
+        hs = home_prob if home_prob is not None else -1.0
+        as_ = away_prob if away_prob is not None else -1.0
+        candidate_side = 'home' if hs >= as_ else 'away'
+    if candidate_side is None and (home_edge is not None or away_edge is not None):
+        hs = home_edge if home_edge is not None else -1e9
+        as_ = away_edge if away_edge is not None else -1e9
+        candidate_side = 'home' if hs >= as_ else 'away'
+    if candidate_side is None:
+        market_side = _market_favorite_side()
+        candidate_side = market_side if market_side in {'home', 'away'} else 'home'
+
+    # 3) Weak-signal guard: if model is near coinflip, prefer market favorite.
+    clamp_market_favorite = str(os.getenv('ML_DOG_CLAMP_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
+    try:
+        weak_gap = float(os.getenv('ML_DOG_CLAMP_WEAK_GAP', '0.03'))
+    except Exception:
+        weak_gap = 0.03
+    market_side = _market_favorite_side()
+    if (
+        clamp_market_favorite
+        and market_side in {'home', 'away'}
+        and home_prob is not None
+        and away_prob is not None
+        and abs(float(home_prob) - float(away_prob)) < float(max(0.0, weak_gap))
+    ):
+        candidate_side = market_side
+
+    # 4) Targeted dog-bias clamp: reject fragile underdog picks, especially +130+.
+    dog_clamp_enabled = str(os.getenv('ML_DOG_CLAMP_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+    if dog_clamp_enabled and candidate_side in {'home', 'away'}:
+        try:
+            dog_threshold = int(float(os.getenv('ML_DOG_CLAMP_ODDS_THRESHOLD', '130')))
+        except Exception:
+            dog_threshold = 130
+        try:
+            dog_min_prob = float(os.getenv('ML_DOG_CLAMP_MIN_PROB', '0.56'))
+        except Exception:
+            dog_min_prob = 0.56
+        try:
+            dog_min_edge = float(os.getenv('ML_DOG_CLAMP_MIN_EDGE', '0.02'))
+        except Exception:
+            dog_min_edge = 0.02
+        try:
+            extreme_threshold = int(float(os.getenv('ML_DOG_CLAMP_EXTREME_ODDS_THRESHOLD', '170')))
+        except Exception:
+            extreme_threshold = 170
+        try:
+            extreme_min_prob = float(os.getenv('ML_DOG_CLAMP_EXTREME_MIN_PROB', '0.60'))
+        except Exception:
+            extreme_min_prob = 0.60
+        try:
+            extreme_min_edge = float(os.getenv('ML_DOG_CLAMP_EXTREME_MIN_EDGE', '0.04'))
+        except Exception:
+            extreme_min_edge = 0.04
+
+        chosen_odds = home_odds if candidate_side == 'home' else away_odds
+        chosen_prob = home_prob if candidate_side == 'home' else away_prob
+        chosen_edge = home_edge if candidate_side == 'home' else away_edge
+        chosen_market_prob = market_home_prob if candidate_side == 'home' else market_away_prob
+
+        if isinstance(chosen_odds, int) and chosen_odds >= dog_threshold:
+            implied_edge = None
+            if chosen_prob is not None and chosen_market_prob is not None:
+                implied_edge = float(chosen_prob - chosen_market_prob)
+            elif chosen_edge is not None:
+                implied_edge = float(chosen_edge)
+
+            fails = False
+            if chosen_prob is None or float(chosen_prob) < float(dog_min_prob):
+                fails = True
+            if implied_edge is None or float(implied_edge) < float(dog_min_edge):
+                fails = True
+
+            if chosen_odds >= int(extreme_threshold):
+                if chosen_prob is None or float(chosen_prob) < float(extreme_min_prob):
+                    fails = True
+                if implied_edge is None or float(implied_edge) < float(extreme_min_edge):
+                    fails = True
+
+            if fails:
+                if clamp_market_favorite and market_side in {'home', 'away'}:
+                    candidate_side = market_side
+                else:
+                    candidate_side = 'away' if candidate_side == 'home' else 'home'
+
+    return candidate_side or 'home'
 
 
 def resolve_moneyline_action(prediction: OverUnderPrediction) -> str:
