@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-23T12:41:26Z",
+  "generated_at": "2026-10-23T18:08:56Z",
   "games": [
     {
-      "generated_at": "2026-10-23T12:41:26Z",
+      "generated_at": "2026-10-23T18:08:56Z",
       "game_id": "2026020166",
       "away_team": "MTL",
       "home_team": "CHI",
@@ -19,16 +19,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "MTL",
-      "moneyline_market_odds": -142.0,
-      "moneyline_fair_odds": -165,
-      "moneyline_edge": 0.03625370507633041,
-      "moneyline_confidence_pct": 62.30305645804627,
-      "moneyline_action": "ML_BET",
-      "moneyline_no_bet_reason": null,
-      "moneyline_bet_size_pct": 2.0
+      "moneyline_market_odds": -160.0,
+      "moneyline_fair_odds": -172,
+      "moneyline_edge": 0.016699299380910526,
+      "moneyline_confidence_pct": 63.20839147655259,
+      "moneyline_action": "ML_PICK",
+      "moneyline_no_bet_reason": "forced_decision",
+      "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-10-23T12:41:26Z",
+      "generated_at": "2026-10-23T18:08:56Z",
       "game_id": "2026020167",
       "away_team": "TBL",
       "home_team": "COL",
@@ -45,10 +45,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "TBL",
-      "moneyline_market_odds": 112.0,
-      "moneyline_fair_odds": -187,
-      "moneyline_edge": 0.179969582901162,
-      "moneyline_confidence_pct": 65.16676961087092,
+      "moneyline_market_odds": 106.0,
+      "moneyline_fair_odds": -197,
+      "moneyline_edge": 0.17827934499982634,
+      "moneyline_confidence_pct": 66.37162382037098,
       "moneyline_action": "ML_BET",
       "moneyline_no_bet_reason": null,
       "moneyline_bet_size_pct": 2.0
