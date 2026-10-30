@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-30T13:26:09Z",
+  "generated_at": "2026-10-30T19:01:02Z",
   "games": [
     {
-      "generated_at": "2026-10-30T13:26:09Z",
+      "generated_at": "2026-10-30T19:01:02Z",
       "game_id": "2026020214",
       "away_team": "NJD",
       "home_team": "VGK",
@@ -28,7 +28,7 @@
       "moneyline_bet_size_pct": 2.0
     },
     {
-      "generated_at": "2026-10-30T13:26:09Z",
+      "generated_at": "2026-10-30T19:01:02Z",
       "game_id": "2026020215",
       "away_team": "WPG",
       "home_team": "FLA",
@@ -54,7 +54,7 @@
       "moneyline_bet_size_pct": 2.0
     },
     {
-      "generated_at": "2026-10-30T13:26:09Z",
+      "generated_at": "2026-10-30T19:01:02Z",
       "game_id": "2026020216",
       "away_team": "SEA",
       "home_team": "CGY",
@@ -72,9 +72,9 @@
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "SEA",
       "moneyline_market_odds": -120.0,
-      "moneyline_fair_odds": -108,
-      "moneyline_edge": -0.025788349802371546,
-      "moneyline_confidence_pct": 51.966619565217385,
+      "moneyline_fair_odds": -110,
+      "moneyline_edge": -0.02144959980237149,
+      "moneyline_confidence_pct": 52.40049456521739,
       "moneyline_action": "ML_PICK",
       "moneyline_no_bet_reason": "forced_decision",
       "moneyline_bet_size_pct": 0.0
