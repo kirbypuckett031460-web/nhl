@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-02T13:33:26Z",
+  "generated_at": "2026-11-02T22:37:37Z",
   "games": [
     {
-      "generated_at": "2026-11-02T13:33:26Z",
+      "generated_at": "2026-11-02T22:37:37Z",
       "game_id": "2026020232",
       "away_team": "VGK",
       "home_team": "BOS",
@@ -28,7 +28,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-02T13:33:26Z",
+      "generated_at": "2026-11-02T22:37:37Z",
       "game_id": "2026020233",
       "away_team": "DET",
       "home_team": "FLA",
@@ -45,16 +45,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "DET",
-      "moneyline_market_odds": 150.0,
-      "moneyline_fair_odds": -140,
-      "moneyline_edge": 0.18263229308005446,
-      "moneyline_confidence_pct": 58.26322930800545,
+      "moneyline_market_odds": 152.0,
+      "moneyline_fair_odds": -138,
+      "moneyline_edge": 0.18301624665844657,
+      "moneyline_confidence_pct": 57.98416434838434,
       "moneyline_action": "ML_BET",
       "moneyline_no_bet_reason": null,
       "moneyline_bet_size_pct": 2.0
     },
     {
-      "generated_at": "2026-11-02T13:33:26Z",
+      "generated_at": "2026-11-02T22:37:37Z",
       "game_id": "2026020234",
       "away_team": "COL",
       "home_team": "CHI",
@@ -71,16 +71,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "COL",
-      "moneyline_market_odds": -240.0,
-      "moneyline_fair_odds": 110,
-      "moneyline_edge": -0.23030983385720694,
-      "moneyline_confidence_pct": 47.55725190839695,
+      "moneyline_market_odds": -230.0,
+      "moneyline_fair_odds": 114,
+      "moneyline_edge": -0.22949690374116016,
+      "moneyline_confidence_pct": 46.747279322853686,
       "moneyline_action": "ML_BET",
       "moneyline_no_bet_reason": null,
       "moneyline_bet_size_pct": 2.0
     },
     {
-      "generated_at": "2026-11-02T13:33:26Z",
+      "generated_at": "2026-11-02T22:37:37Z",
       "game_id": "2026020235",
       "away_team": "CGY",
       "home_team": "SJS",
@@ -97,10 +97,10 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "SJS",
-      "moneyline_market_odds": -130.0,
-      "moneyline_fair_odds": -148,
-      "moneyline_edge": 0.031006305738018214,
-      "moneyline_confidence_pct": 59.62236970423661,
+      "moneyline_market_odds": -125.0,
+      "moneyline_fair_odds": -146,
+      "moneyline_edge": 0.03747694444444438,
+      "moneyline_confidence_pct": 59.30325,
       "moneyline_action": "ML_BET",
       "moneyline_no_bet_reason": null,
       "moneyline_bet_size_pct": 2.0
