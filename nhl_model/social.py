@@ -20,14 +20,6 @@ except ImportError:
     print("⚠️  tweepy not installed. Twitter posting disabled.")
 
 try:
-    import discord
-
-    DISCORD_AVAILABLE = True
-except ImportError:
-    DISCORD_AVAILABLE = False
-    print("⚠️  discord.py not installed. Discord bot posting disabled.")
-
-try:
     import imgkit  # requires wkhtmltoimage installed on system
 
     IMGKIT_AVAILABLE = True
@@ -221,9 +213,8 @@ class SocialMediaPoster:
             if total_games == 0:
                 print("ℹ️  No predictions available for Discord inline post.")
                 return False
-
-            # Always post the complete slate. `top_n` is accepted for backward compatibility
-            # but intentionally ignored when it would truncate games.
+            # Always post the complete slate. `top_n` remains accepted for backward
+            # compatibility, but never truncates rows anymore.
             try:
                 requested_cap = int(top_n)
             except Exception:
@@ -233,7 +224,6 @@ class SocialMediaPoster:
                     f"ℹ️  Discord inline cap ({requested_cap}) is below slate size "
                     f"({total_games}); posting full slate."
                 )
-
             chunk_size = 8
             posted_any = False
             for i in range(0, len(preds), chunk_size):

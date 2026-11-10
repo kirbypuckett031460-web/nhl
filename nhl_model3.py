@@ -57,6 +57,10 @@ import html as html_parser
 import errno
 import unicodedata
 from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # type: ignore[assignment]
 import inspect
 from scipy.stats import norm, poisson, nbinom, skellam
 from sklearn.isotonic import IsotonicRegression
@@ -9940,18 +9944,34 @@ def compute_bet_performance_summary(
         seen_paths.add(key)
         log_candidates.append(normalized)
 
-    # YTD should represent the current season's picks, not the model's last training split.
-    # Default season start requested: Oct 7, 2025 (inclusive).
-    season_start_str = str(os.getenv('NHL_SEASON_START', '2025-10-07')).strip() or '2025-10-07'
-    season_start_eastern: Optional[pd.Timestamp] = None
+    # YTD should represent the current season only.
+    # Derive season start from today's season boundary, and only honor an
+    # NHL_SEASON_START override when it's plausibly within this season window.
     try:
-        candidate = pd.Timestamp(season_start_str)
-        if candidate.tzinfo is None:
-            season_start_eastern = candidate.tz_localize('US/Eastern')
-        else:
-            season_start_eastern = candidate.tz_convert('US/Eastern')
+        now_eastern_ref = pd.Timestamp.now(tz='US/Eastern')
+        ref_date = now_eastern_ref.date()
+    except Exception:
+        ref_date = datetime.now().date()
+    same_year_start = date(ref_date.year, 9, 29)
+    default_start = same_year_start if ref_date >= same_year_start else date(ref_date.year - 1, 9, 29)
+    season_start_eastern: Optional[pd.Timestamp]
+    try:
+        season_start_eastern = pd.Timestamp(default_start).tz_localize('US/Eastern')
     except Exception:
         season_start_eastern = None
+
+    season_start_str = str(os.getenv('NHL_SEASON_START', '')).strip()
+    if season_start_str and season_start_eastern is not None:
+        try:
+            configured = pd.Timestamp(season_start_str)
+            if configured.tzinfo is None:
+                configured = configured.tz_localize('US/Eastern')
+            else:
+                configured = configured.tz_convert('US/Eastern')
+            if abs((configured.date() - default_start).days) <= 45:
+                season_start_eastern = configured
+        except Exception:
+            pass
 
     for path in log_candidates:
         if not path:
@@ -10017,6 +10037,7 @@ def compute_bet_performance_summary(
         )
         dates_utc = None
         dates_local = None
+        parsed = None
         season_mask = None
         yesterday_mask = None
         last_week_mask = None
@@ -10064,6 +10085,51 @@ def compute_bet_performance_summary(
                     dates_utc = dates_local.dt.tz_convert('UTC')
                 except Exception:
                     dates_utc = None
+
+            # Deduplicate repeated reruns: keep the latest directional row per game key.
+            # This prevents YTD totals from ballooning when the same slate is re-run.
+            try:
+                gid_col = next(
+                    (c for c in df_log.columns if str(c).lower() in {'game_id', 'gameid', 'gid'}),
+                    None
+                )
+                matchup_col = next(
+                    (c for c in df_log.columns if str(c).lower() in {'matchup', 'game', 'event'}),
+                    None
+                )
+                dedupe_keys = pd.Series('', index=df_log.index, dtype='object')
+                if gid_col:
+                    gid_series = df_log[gid_col].astype(str).str.strip()
+                    gid_mask = gid_series.ne('') & ~gid_series.str.lower().isin({'nan', 'none', 'null'})
+                    dedupe_keys = dedupe_keys.mask(gid_mask, 'gid:' + gid_series)
+
+                if matchup_col:
+                    matchup_series = (
+                        df_log[matchup_col]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                    )
+                    matchup_mask = matchup_series.ne('') & ~matchup_series.str.lower().isin({'nan', 'none', 'null'})
+                    if dates_local is not None and dates_local.notna().any():
+                        date_part = dates_local.dt.date.astype(str).replace('NaT', '')
+                    elif parsed is not None and hasattr(parsed, 'dt'):
+                        date_part = parsed.dt.date.astype(str).replace('NaT', '')
+                    else:
+                        date_part = pd.Series('', index=df_log.index, dtype='object')
+                    fill_mask = dedupe_keys.eq('') & matchup_mask
+                    dedupe_keys = dedupe_keys.mask(fill_mask, 'matchup:' + matchup_series + '|date:' + date_part)
+
+                directional_df = df_log[direction_mask].copy()
+                if not directional_df.empty:
+                    directional_keys = dedupe_keys.loc[directional_df.index]
+                    directional_df = directional_df.assign(_dedupe_key=directional_keys)
+                    directional_df = directional_df[directional_df['_dedupe_key'].astype(str).str.strip() != '']
+                    if not directional_df.empty:
+                        keep_idx = directional_df.groupby('_dedupe_key', sort=False).tail(1).index
+                        direction_mask = direction_mask & df_log.index.isin(keep_idx)
+            except Exception:
+                pass
 
             if dates_local is not None and dates_local.notna().any():
                 if season_start_eastern is not None:
@@ -10224,253 +10290,174 @@ def resolve_totals_pick(prediction: OverUnderPrediction) -> str:
 
 def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
     """Return a deterministic moneyline side ('home' or 'away') for every game."""
-    ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
-    explicit_side: Optional[str] = ml_side if ml_side in {'home', 'away'} else None
+    def _safe_prob(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+            if np.isfinite(out):
+                return out
+        except Exception:
+            return None
+        return None
+
+    def _safe_american(value: Any) -> Optional[int]:
+        try:
+            out = int(float(value))
+            return out
+        except Exception:
+            return None
+
+    def _implied_prob_from_american(value: Any) -> Optional[float]:
+        odds = _safe_american(value)
+        if odds is None:
+            return None
+        try:
+            return float(odds_decimal_to_implied_prob(odds_american_to_decimal(odds)))
+        except Exception:
+            return None
+
+    # Signals carried on each prediction
+    ml_side_attr = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
     ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
-    if explicit_side is None:
-        if 'HOME' in ml_raw:
-            explicit_side = 'home'
-        elif 'AWAY' in ml_raw:
-            explicit_side = 'away'
+    home_prob = _safe_prob(getattr(prediction, 'home_win_probability', None))
+    away_prob = _safe_prob(getattr(prediction, 'away_win_probability', None))
+    home_edge = _safe_prob(getattr(prediction, 'home_moneyline_edge', None))
+    away_edge = _safe_prob(getattr(prediction, 'away_moneyline_edge', None))
+    home_odds = _safe_american(getattr(prediction, 'home_moneyline_odds', None))
+    away_odds = _safe_american(getattr(prediction, 'away_moneyline_odds', None))
 
-    home_prob = None
-    away_prob = None
-    try:
-        home_prob = float(getattr(prediction, 'home_win_probability', np.nan))
-        if not np.isfinite(home_prob):
-            home_prob = None
-    except Exception:
-        home_prob = None
-    try:
-        away_prob = float(getattr(prediction, 'away_win_probability', np.nan))
-        if not np.isfinite(away_prob):
-            away_prob = None
-    except Exception:
-        away_prob = None
-    # Side-resolution guardrails tuned for ML record stability:
-    # - blend model win probs toward no-vig market probabilities
-    # - avoid weak/coinflip model calls by preferring market favorite
-    # - block fragile longshot side selections unless model conviction is strong
-    try:
-        resolve_market_anchor_base = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_BASE', '0.40'))
-    except Exception:
-        resolve_market_anchor_base = 0.40
-    try:
-        resolve_market_anchor_longshot = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_LONGSHOT', '0.70'))
-    except Exception:
-        resolve_market_anchor_longshot = 0.70
-    try:
-        resolve_market_anchor_weak_gap = float(os.getenv('ML_RESOLVE_MARKET_ANCHOR_WEAK_GAP', '0.70'))
-    except Exception:
-        resolve_market_anchor_weak_gap = 0.70
-    try:
-        resolve_weak_gap = float(os.getenv('ML_RESOLVE_WEAK_GAP', '0.03'))
-    except Exception:
-        resolve_weak_gap = 0.03
-    try:
-        resolve_longshot_odds_threshold = int(float(os.getenv('ML_RESOLVE_LONGSHOT_ODDS_THRESHOLD', '130')))
-    except Exception:
-        resolve_longshot_odds_threshold = 130
-    try:
-        resolve_longshot_min_prob = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_PROB', '0.56'))
-    except Exception:
-        resolve_longshot_min_prob = 0.56
-    try:
-        resolve_longshot_min_edge = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_EDGE', '0.02'))
-    except Exception:
-        resolve_longshot_min_edge = 0.02
-    resolve_away_dog_enable = str(os.getenv('ML_RESOLVE_AWAY_DOG_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
-    try:
-        resolve_away_dog_odds_threshold = int(float(os.getenv('ML_RESOLVE_AWAY_DOG_ODDS_THRESHOLD', '100')))
-    except Exception:
-        resolve_away_dog_odds_threshold = 100
-    try:
-        resolve_away_dog_min_prob = float(os.getenv('ML_RESOLVE_AWAY_DOG_MIN_PROB', '0.57'))
-    except Exception:
-        resolve_away_dog_min_prob = 0.57
-    try:
-        resolve_away_dog_min_edge = float(os.getenv('ML_RESOLVE_AWAY_DOG_MIN_EDGE', '0.03'))
-    except Exception:
-        resolve_away_dog_min_edge = 0.03
-    try:
-        resolve_away_dog_extreme_odds_threshold = int(float(os.getenv('ML_RESOLVE_AWAY_DOG_EXTREME_ODDS_THRESHOLD', '130')))
-    except Exception:
-        resolve_away_dog_extreme_odds_threshold = 130
-    try:
-        resolve_away_dog_extreme_min_prob = float(os.getenv('ML_RESOLVE_AWAY_DOG_EXTREME_MIN_PROB', '0.61'))
-    except Exception:
-        resolve_away_dog_extreme_min_prob = 0.61
-    try:
-        resolve_away_dog_extreme_min_edge = float(os.getenv('ML_RESOLVE_AWAY_DOG_EXTREME_MIN_EDGE', '0.06'))
-    except Exception:
-        resolve_away_dog_extreme_min_edge = 0.06
-    try:
-        resolve_max_delta_from_market = float(os.getenv('ML_RESOLVE_MAX_DELTA_FROM_MARKET', '0.20'))
-    except Exception:
-        resolve_max_delta_from_market = 0.20
-    resolve_market_favorite = str(os.getenv('ML_RESOLVE_MARKET_FAVORITE_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
-    try:
-        resolve_market_favorite_min_prob = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_PROB', '0.54'))
-    except Exception:
-        resolve_market_favorite_min_prob = 0.54
-    try:
-        resolve_market_favorite_min_gap = float(os.getenv('ML_RESOLVE_MARKET_FAVORITE_MIN_GAP', '0.03'))
-    except Exception:
-        resolve_market_favorite_min_gap = 0.03
-
-    h_odds = getattr(prediction, 'home_moneyline_odds', None)
-    a_odds = getattr(prediction, 'away_moneyline_odds', None)
-    try:
-        h_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
-    except Exception:
-        h_imp = None
-    try:
-        a_imp = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
-    except Exception:
-        a_imp = None
+    home_imp_raw = _implied_prob_from_american(home_odds)
+    away_imp_raw = _implied_prob_from_american(away_odds)
     market_home_prob = None
     market_away_prob = None
-    if h_imp is not None or a_imp is not None:
-        if h_imp is not None and a_imp is not None:
-            vig = max(1e-9, float(h_imp) + float(a_imp))
-            market_home_prob = float(h_imp) / vig
-            market_away_prob = float(a_imp) / vig
-        elif h_imp is not None:
-            market_home_prob = float(h_imp)
-        elif a_imp is not None:
-            market_away_prob = float(a_imp)
+    if home_imp_raw is not None and away_imp_raw is not None:
+        vig = max(1e-9, float(home_imp_raw) + float(away_imp_raw))
+        market_home_prob = float(home_imp_raw / vig)
+        market_away_prob = float(away_imp_raw / vig)
+    else:
+        market_home_prob = home_imp_raw
+        market_away_prob = away_imp_raw
 
     def _market_favorite_side() -> Optional[str]:
         if market_home_prob is None and market_away_prob is None:
             return None
-        home_score = float(market_home_prob) if market_home_prob is not None else -1.0
-        away_score = float(market_away_prob) if market_away_prob is not None else -1.0
-        return 'home' if home_score >= away_score else 'away'
+        hs = float(market_home_prob) if market_home_prob is not None else -1.0
+        as_ = float(market_away_prob) if market_away_prob is not None else -1.0
+        return 'home' if hs >= as_ else 'away'
 
-    if home_prob is not None and away_prob is not None:
-        pair_sum = float(home_prob + away_prob)
-        if np.isfinite(pair_sum) and pair_sum > 0:
-            home_prob = float(home_prob / pair_sum)
-            away_prob = float(max(0.0, min(1.0, 1.0 - home_prob)))
+    # 1) Start with explicit recommendation if available
+    candidate_side: Optional[str] = None
+    if ml_side_attr in {'home', 'away'}:
+        candidate_side = ml_side_attr
+    elif 'HOME' in ml_raw:
+        candidate_side = 'home'
+    elif 'AWAY' in ml_raw:
+        candidate_side = 'away'
 
-    if home_prob is not None and away_prob is not None and market_home_prob is not None and market_away_prob is not None:
-        model_gap = abs(float(home_prob) - float(away_prob))
-        longshot_present = bool(
-            (isinstance(h_odds, (int, float)) and float(h_odds) >= float(resolve_longshot_odds_threshold))
-            or (isinstance(a_odds, (int, float)) and float(a_odds) >= float(resolve_longshot_odds_threshold))
-        )
-        anchor = float(resolve_market_anchor_base)
-        if longshot_present:
-            anchor = max(anchor, float(resolve_market_anchor_longshot))
-        if model_gap < float(resolve_weak_gap):
-            anchor = max(anchor, float(resolve_market_anchor_weak_gap))
-        anchor = float(min(max(anchor, 0.0), 1.0))
-        max_delta = float(min(max(resolve_max_delta_from_market, 0.0), 0.49))
-        blended_home = float((1.0 - anchor) * home_prob + anchor * market_home_prob)
-        delta_home = blended_home - float(market_home_prob)
-        if abs(delta_home) > max_delta:
-            blended_home = float(float(market_home_prob) + np.sign(delta_home) * max_delta)
-        home_prob = float(max(0.0, min(1.0, blended_home)))
-        away_prob = float(max(0.0, min(1.0, 1.0 - home_prob)))
-
-    if home_prob is not None or away_prob is not None:
-        home_score = home_prob if home_prob is not None else -1.0
-        away_score = away_prob if away_prob is not None else -1.0
-        prob_gap = abs(float(home_score) - float(away_score))
-        top_prob = max(float(home_score), float(away_score))
+    # 2) Fall back to model probabilities / edges / market
+    if candidate_side is None and (home_prob is not None or away_prob is not None):
+        hs = home_prob if home_prob is not None else -1.0
+        as_ = away_prob if away_prob is not None else -1.0
+        candidate_side = 'home' if hs >= as_ else 'away'
+    if candidate_side is None and (home_edge is not None or away_edge is not None):
+        hs = home_edge if home_edge is not None else -1e9
+        as_ = away_edge if away_edge is not None else -1e9
+        candidate_side = 'home' if hs >= as_ else 'away'
+    if candidate_side is None:
         market_side = _market_favorite_side()
-        if resolve_market_favorite and market_side and (
-            top_prob < float(resolve_market_favorite_min_prob) or prob_gap < float(resolve_market_favorite_min_gap)
-        ):
-            return market_side
+        candidate_side = market_side if market_side in {'home', 'away'} else 'home'
 
-        picked_side = explicit_side if explicit_side in {'home', 'away'} else ('home' if home_score >= away_score else 'away')
-        picked_prob = float(home_score) if picked_side == 'home' else float(away_score)
-        picked_market_prob = market_home_prob if picked_side == 'home' else market_away_prob
-        picked_odds = h_odds if picked_side == 'home' else a_odds
-        if (
-            isinstance(picked_odds, (int, float))
-            and float(picked_odds) >= float(resolve_longshot_odds_threshold)
-        ):
-            implied_edge = (picked_prob - float(picked_market_prob)) if picked_market_prob is not None else 0.0
-            if (
-                picked_prob < float(resolve_longshot_min_prob)
-                or implied_edge < float(resolve_longshot_min_edge)
-            ):
-                if market_side:
-                    return market_side
-                return 'away' if picked_side == 'home' else 'home'
-        if (
-            resolve_away_dog_enable
-            and picked_side == 'away'
-            and isinstance(picked_odds, (int, float))
-            and float(picked_odds) >= float(resolve_away_dog_odds_threshold)
-        ):
-            implied_edge = (picked_prob - float(picked_market_prob)) if picked_market_prob is not None else None
-            min_prob_req = float(resolve_away_dog_min_prob)
-            min_edge_req = float(resolve_away_dog_min_edge)
-            if float(picked_odds) >= float(resolve_away_dog_extreme_odds_threshold):
-                min_prob_req = max(min_prob_req, float(resolve_away_dog_extreme_min_prob))
-                min_edge_req = max(min_edge_req, float(resolve_away_dog_extreme_min_edge))
-            if (
-                picked_prob < min_prob_req
-                or implied_edge is None
-                or implied_edge < min_edge_req
-            ):
-                if resolve_market_favorite and market_side:
-                    return market_side
-                return 'home'
-        return picked_side
-
-    no_bet_market_favorite = str(os.getenv('ML_NO_BET_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
+    # 3) Weak-signal guard: if model is near coinflip, prefer market favorite.
+    clamp_market_favorite = str(os.getenv('ML_DOG_CLAMP_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
     try:
-        no_bet_min_gap = float(os.getenv('ML_NO_BET_MIN_PROB_GAP', '0.03'))
+        weak_gap = float(os.getenv('ML_DOG_CLAMP_WEAK_GAP', '0.03'))
     except Exception:
-        no_bet_min_gap = 0.03
-    is_no_bet = (not ml_raw) or ml_raw.startswith('NO BET')
-    if is_no_bet and no_bet_market_favorite:
-        if home_prob is not None and away_prob is not None:
-            prob_gap = abs(float(home_prob) - float(away_prob))
-        else:
-            prob_gap = 0.0
-        if (home_prob is None or away_prob is None or prob_gap < no_bet_min_gap):
-            market_side = _market_favorite_side()
-            if market_side:
-                return market_side
+        weak_gap = 0.03
+    market_side = _market_favorite_side()
+    if (
+        clamp_market_favorite
+        and market_side in {'home', 'away'}
+        and home_prob is not None
+        and away_prob is not None
+        and abs(float(home_prob) - float(away_prob)) < float(max(0.0, weak_gap))
+    ):
+        candidate_side = market_side
 
-    home_edge = None
-    away_edge = None
-    try:
-        home_edge = float(getattr(prediction, 'home_moneyline_edge', np.nan))
-        if not np.isfinite(home_edge):
-            home_edge = None
-    except Exception:
-        home_edge = None
-    try:
-        away_edge = float(getattr(prediction, 'away_moneyline_edge', np.nan))
-        if not np.isfinite(away_edge):
-            away_edge = None
-    except Exception:
-        away_edge = None
-    if home_edge is not None or away_edge is not None:
-        home_score = home_edge if home_edge is not None else -1e9
-        away_score = away_edge if away_edge is not None else -1e9
-        return 'home' if home_score >= away_score else 'away'
+    # 4) Targeted dog-bias clamp: reject fragile underdog picks, especially +130+.
+    dog_clamp_enabled = str(os.getenv('ML_DOG_CLAMP_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+    if dog_clamp_enabled and candidate_side in {'home', 'away'}:
+        try:
+            dog_threshold = int(float(os.getenv('ML_DOG_CLAMP_ODDS_THRESHOLD', '130')))
+        except Exception:
+            dog_threshold = 130
+        try:
+            dog_min_prob = float(os.getenv('ML_DOG_CLAMP_MIN_PROB', '0.56'))
+        except Exception:
+            dog_min_prob = 0.56
+        try:
+            dog_min_edge = float(os.getenv('ML_DOG_CLAMP_MIN_EDGE', '0.02'))
+        except Exception:
+            dog_min_edge = 0.02
+        try:
+            extreme_threshold = int(float(os.getenv('ML_DOG_CLAMP_EXTREME_ODDS_THRESHOLD', '170')))
+        except Exception:
+            extreme_threshold = 170
+        try:
+            extreme_min_prob = float(os.getenv('ML_DOG_CLAMP_EXTREME_MIN_PROB', '0.60'))
+        except Exception:
+            extreme_min_prob = 0.60
+        try:
+            extreme_min_edge = float(os.getenv('ML_DOG_CLAMP_EXTREME_MIN_EDGE', '0.04'))
+        except Exception:
+            extreme_min_edge = 0.04
 
-    # Last fallback: choose side with stronger market implied probability when odds exist.
-    try:
-        h_odds = getattr(prediction, 'home_moneyline_odds', None)
-        a_odds = getattr(prediction, 'away_moneyline_odds', None)
-        h_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(h_odds))) if h_odds is not None else None
-        a_prob = odds_decimal_to_implied_prob(odds_american_to_decimal(int(a_odds))) if a_odds is not None else None
-        if h_prob is not None or a_prob is not None:
-            h_score = float(h_prob) if h_prob is not None else -1.0
-            a_score = float(a_prob) if a_prob is not None else -1.0
-            return 'home' if h_score >= a_score else 'away'
-    except Exception:
-        pass
+        chosen_odds = home_odds if candidate_side == 'home' else away_odds
+        chosen_prob = home_prob if candidate_side == 'home' else away_prob
+        chosen_edge = home_edge if candidate_side == 'home' else away_edge
+        chosen_market_prob = market_home_prob if candidate_side == 'home' else market_away_prob
 
-    return 'home'
+        if isinstance(chosen_odds, int) and chosen_odds >= dog_threshold:
+            implied_edge = None
+            if chosen_prob is not None and chosen_market_prob is not None:
+                implied_edge = float(chosen_prob - chosen_market_prob)
+            elif chosen_edge is not None:
+                implied_edge = float(chosen_edge)
+
+            fails = False
+            if chosen_prob is None or float(chosen_prob) < float(dog_min_prob):
+                fails = True
+            if implied_edge is None or float(implied_edge) < float(dog_min_edge):
+                fails = True
+
+            if chosen_odds >= int(extreme_threshold):
+                if chosen_prob is None or float(chosen_prob) < float(extreme_min_prob):
+                    fails = True
+                if implied_edge is None or float(implied_edge) < float(extreme_min_edge):
+                    fails = True
+
+            if fails:
+                if clamp_market_favorite and market_side in {'home', 'away'}:
+                    candidate_side = market_side
+                else:
+                    candidate_side = 'away' if candidate_side == 'home' else 'home'
+
+    return candidate_side or 'home'
+
+
+def resolve_moneyline_action(prediction: OverUnderPrediction) -> str:
+    """Classify moneyline output as actionable bet or directional pick.
+
+    This stays stable even when display labels replace HOME/AWAY ML text.
+    """
+    ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
+    ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
+    no_bet_reason = str(getattr(prediction, 'moneyline_no_bet_reason', '') or '').strip()
+    if ml_raw.startswith('NO BET'):
+        return 'ML_PICK'
+    if ml_side in {'home', 'away'} and not no_bet_reason:
+        return 'ML_BET'
+    if ('HOME ML' in ml_raw or 'AWAY ML' in ml_raw) and not no_bet_reason:
+        return 'ML_BET'
+    return 'ML_PICK'
 
 
 def save_public_predictions_json(
@@ -10529,6 +10516,7 @@ def save_public_predictions_json(
     for pred in predictions:
         totals_pick = resolve_totals_pick(pred)
         totals_action = 'BET' if str(getattr(pred, 'recommendation', '') or '').strip().upper() in {'OVER', 'UNDER'} else 'PICK'
+        moneyline_action = resolve_moneyline_action(pred)
 
         totals_conf = _safe_float(getattr(pred, 'confidence', None))
         if totals_conf is not None and totals_conf <= 1.0:
@@ -10581,6 +10569,9 @@ def save_public_predictions_json(
             'moneyline_fair_odds': _prob_to_american(ml_prob),
             'moneyline_edge': ml_edge,
             'moneyline_confidence_pct': _safe_float((ml_prob * 100.0) if ml_prob is not None else 50.0),
+            'moneyline_action': moneyline_action,
+            'moneyline_no_bet_reason': str(getattr(pred, 'moneyline_no_bet_reason', '') or '').strip() or None,
+            'moneyline_bet_size_pct': _safe_float(getattr(pred, 'moneyline_bet_size', None)),
         })
 
     payload = {'generated_at': generated_at, 'games': rows}
@@ -10796,8 +10787,7 @@ def log_bets(predictions: List[OverUnderPrediction], logfile: str = 'bets_log.cs
         # tracked even when the model decides "No Bet".
         ml_side = resolve_moneyline_pick(p)
         ml_side_norm = 'HOME' if str(ml_side).strip().lower() == 'home' else 'AWAY'
-        ml_rec = str(getattr(p, 'moneyline_recommendation', '') or '').strip().upper()
-        ml_action = 'ML_BET' if ml_rec in {'HOME ML', 'AWAY ML'} else 'ML_PICK'
+        ml_action = resolve_moneyline_action(p)
         if ml_side_norm == 'HOME':
             ml_price = getattr(p, 'home_moneyline_odds', None)
             ml_edge = getattr(p, 'home_moneyline_edge', None)
@@ -11677,14 +11667,15 @@ def build_predictions_table_html(predictions: List[OverUnderPrediction]) -> str:
     head = (
         "<!DOCTYPE html>\n"
         "<html><head><meta charset=\"utf-8\"><style>\n"
-        "body { font-family: Segoe UI, Arial, sans-serif; background:#ffffff; color:#2c3e50; }\n"
-        "table { border-collapse: collapse; width: 100%; background:#ffffff; }\n"
-        "th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }\n"
-        "th { background:#2c3e50; color:#fff; text-align:left; }\n"
+        "body { font-family: Segoe UI, Arial, sans-serif; background:#0f1420; color:#e6edf7; }\n"
+        "table { border-collapse: collapse; width: 100%; background:#121a2b; }\n"
+        "th, td { border: 1px solid #3a445a; padding: 8px; font-size: 14px; }\n"
+        "th { background:#273248; color:#f8fbff; text-align:left; }\n"
         ".rec-over { background:#27ae60; color:#ffffff; font-weight:700; }\n"
         ".rec-under { background:#c0392b; color:#ffffff; font-weight:700; }\n"
-        ".rec-no-bet { background:#f9e79f; color:#7d6608; font-weight:700; }\n"
-        "tr:nth-child(even) { background:#fafafa; }\n"
+        ".rec-no-bet { background:#5f4f68; color:#f4e9ff; font-weight:700; }\n"
+        "tr:nth-child(odd) { background:#141b2d; }\n"
+        "tr:nth-child(even) { background:#101728; }\n"
         "</style></head><body>\n<table>\n<thead><tr>\n"
         "<th>Matchup</th><th>Line</th><th>Predicted</th><th>Edge</th><th>Home ML</th><th>Away ML</th>\n"
         "<th>Over%</th><th>Under%</th><th>Confidence</th><th>Env</th><th>Lineup</th><th>Recommendation</th><th>Kelly%</th>\n"
@@ -11889,8 +11880,8 @@ def save_predictions_image(
             ml_team = getattr(pred, 'away_team', None)
         ml_is_no_bet = ml_upper.startswith('NO BET') or ml_upper == '—'
         ml_display = 'No Bet' if ml_is_no_bet else '—'
-        ml_bg_color = '#ecf0f1'
-        ml_text_color = '#2c3e50'
+        ml_bg_color = '#2a3142'
+        ml_text_color = '#c7d3e6'
         if ml_team and not ml_is_no_bet:
             abbr = get_team_abbreviation(ml_team)
             fallback_label = 'HOME' if ml_side == 'home' else 'AWAY'
@@ -11925,8 +11916,8 @@ def save_predictions_image(
 
     df = df.sort_values(by=['_sort_key', 'Time'])
     row_count = len(df)
-    moneyline_bg = df['_MoneylineBg'].tolist() if '_MoneylineBg' in df.columns else ['#ecf0f1'] * row_count
-    moneyline_text = df['_MoneylineText'].tolist() if '_MoneylineText' in df.columns else ['#2c3e50'] * row_count
+    moneyline_bg = df['_MoneylineBg'].tolist() if '_MoneylineBg' in df.columns else ['#2a3142'] * row_count
+    moneyline_text = df['_MoneylineText'].tolist() if '_MoneylineText' in df.columns else ['#c7d3e6'] * row_count
     drop_cols = [col for col in ['_sort_key', '_MoneylineBg', '_MoneylineText'] if col in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
@@ -11939,7 +11930,8 @@ def save_predictions_image(
     bottom_pad_in = 0.25
     fig_height = max(1.0, (n_table_rows * row_height_in) + title_height_in + bottom_pad_in)
     fig, ax = plt.subplots(figsize=(11.5, fig_height))
-    fig.patch.set_facecolor('white')
+    fig.patch.set_facecolor('#0f1420')
+    ax.set_facecolor('#0f1420')
     ax.axis('off')
 
     perf_line_segments = [segment for segment in [ytd_str, yesterday_str] if segment]
@@ -11950,7 +11942,7 @@ def save_predictions_image(
         "Confidence is the model's probability the prediction is accurate.\n"
         "Odds from FanDuel."
     )
-    ax.set_title(title_text, fontsize=16, fontweight='bold', loc='center', pad=6)
+    ax.set_title(title_text, fontsize=16, fontweight='bold', color='#e8edf5', loc='center', pad=6)
     top_margin = title_height_in / fig_height
     bottom_margin = bottom_pad_in / fig_height
     ax.set_position([0.02, bottom_margin, 0.96, 1.0 - top_margin - bottom_margin])
@@ -11984,10 +11976,10 @@ def save_predictions_image(
     table.scale(1, 1.0)
 
     for (row_idx, col_idx), cell in table.get_celld().items():
-        cell.set_edgecolor('#bdc3c7')
+        cell.set_edgecolor('#3a445a')
         if row_idx == 0:
-            cell.set_facecolor('#2c3e50')
-            cell.set_text_props(color='white', weight='bold', fontsize=13)
+            cell.set_facecolor('#273248')
+            cell.set_text_props(color='#f8fbff', weight='bold', fontsize=13)
         else:
             col_name = columns[col_idx] if col_idx < len(columns) else ''
             if col_name == 'Pick':
@@ -11999,23 +11991,28 @@ def save_predictions_image(
                     cell.set_facecolor('#c0392b')
                     cell.set_text_props(color='white', weight='bold')
                 else:
-                    cell.set_facecolor('#ecf0f1')
+                    cell.set_facecolor('#5f4f68')
+                    cell.set_text_props(color='#f4e9ff', weight='bold')
             elif col_name == 'Moneyline':
                 data_idx = row_idx - 1
                 ml_val = str(df.iloc[data_idx, col_idx]).strip() if data_idx < len(df) else ''
-                bg_color = moneyline_bg[data_idx] if data_idx < len(moneyline_bg) else '#ecf0f1'
-                text_color = moneyline_text[data_idx] if data_idx < len(moneyline_text) else '#2c3e50'
+                bg_color = moneyline_bg[data_idx] if data_idx < len(moneyline_bg) else '#2a3142'
+                text_color = moneyline_text[data_idx] if data_idx < len(moneyline_text) else '#c7d3e6'
                 upper_val = ml_val.upper()
                 if not ml_val or upper_val == '—' or upper_val.startswith('NO BET'):
-                    bg_color = '#ecf0f1'
-                    text_color = '#2c3e50'
+                    bg_color = '#2a3142'
+                    text_color = '#c7d3e6'
                     font_weight = 'normal'
                 else:
                     font_weight = 'bold'
                 cell.set_facecolor(bg_color)
                 cell.set_text_props(color=text_color, weight=font_weight)
             elif row_idx % 2 == 0:
-                cell.set_facecolor('#f8f9fa')
+                cell.set_facecolor('#101728')
+                cell.set_text_props(color='#dfe7f3')
+            else:
+                cell.set_facecolor('#141b2d')
+                cell.set_text_props(color='#dfe7f3')
 
     plt.tight_layout()
     plt.savefig(image_path, bbox_inches='tight', dpi=200)
@@ -12025,6 +12022,259 @@ def save_predictions_image(
         print(f"✅ Saved predictions image to {image_path}")
         return image_path
 
+    return None
+
+
+def save_public_app_snapshot_image(
+    log_path: Optional[str] = None,
+    image_path: str = "predictions_discord.png",
+    max_rows_per_table: int = 0,
+) -> Optional[str]:
+    """Render a Discord image that mirrors Streamlit public app content.
+
+    max_rows_per_table:
+        0 or negative => include the full slate (no truncation).
+        positive      => cap rows per table.
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        print("⚠️  Matplotlib not available; cannot render public snapshot image.")
+        return None
+    try:
+        import streamlit_public as public_view
+    except Exception as exc:
+        print(f"⚠️  Could not import streamlit_public for Discord snapshot: {exc}")
+        return None
+
+    try:
+        board_path = Path("public_predictions.json")
+        log_file = str(log_path or "bets_log.csv")
+        log_path_obj = Path(log_file)
+        board_games, board_dt, board_branch, board_slate_date = public_view._read_public_predictions(
+            board_path,
+            prefer_remote=False,
+        )
+        run_rows, run_dt = public_view._latest_run_rows(
+            log_path_obj,
+            prefer_remote=False,
+            remote_branch=board_branch,
+        )
+        schedule_tz = str(os.getenv("SCHEDULE_TZ", "US/Eastern") or "US/Eastern").strip() or "US/Eastern"
+        if ZoneInfo is not None:
+            try:
+                metrics_ref_date = datetime.now(ZoneInfo(schedule_tz)).date()
+            except Exception:
+                metrics_ref_date = datetime.now().date()
+        else:
+            metrics_ref_date = datetime.now().date()
+        metrics = public_view._compute_record_blocks(
+            log_path_obj,
+            prefer_remote=False,
+            remote_branch=board_branch,
+            reference_date=metrics_ref_date,
+        )
+        ml_rows, ou_rows = public_view._build_tables_from_public(board_games)
+        if not ou_rows and run_rows:
+            ou_rows = public_view._build_totals_from_log_rows(run_rows)
+        shown_dt = board_dt or run_dt or datetime.now()
+        last_updated_et = public_view._format_last_updated_et(shown_dt)
+        if board_slate_date is not None:
+            slate_date_text = datetime.combine(board_slate_date, datetime.min.time()).strftime("%A, %b %d, %Y")
+        else:
+            slate_date_text = shown_dt.strftime("%A, %b %d, %Y")
+    except Exception as exc:
+        print(f"⚠️  Failed to build public app snapshot payload: {exc}")
+        return None
+
+    table_columns = ["Game Time (ET)", "Away", "Home", "Mkt", "Fair", "Pick", "Edge", "Confidence"]
+
+    def _strip_internal_cols(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                out.append({k: v for k, v in row.items() if not str(k).startswith("_")})
+        return out
+
+    ml_clean = _strip_internal_cols(ml_rows)
+    ou_clean = _strip_internal_cols(ou_rows)
+    try:
+        row_cap = int(max_rows_per_table)
+    except Exception:
+        row_cap = 0
+    if row_cap > 0:
+        if len(ml_clean) > row_cap or len(ou_clean) > row_cap:
+            print(
+                f"ℹ️  Discord snapshot row cap enabled ({row_cap}); "
+                f"ML rows={len(ml_clean)}, O/U rows={len(ou_clean)} before cap."
+            )
+        ml_clean = ml_clean[:row_cap]
+        ou_clean = ou_clean[:row_cap]
+
+    def _parse_number(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        txt = str(value).strip().replace("%", "")
+        if not txt or txt == "—":
+            return None
+        try:
+            out = float(txt)
+            if np.isfinite(out):
+                return out
+        except Exception:
+            return None
+        return None
+
+    def _text_color_for_bg(bg_hex: str) -> str:
+        raw = str(bg_hex or "").strip().lstrip("#")
+        if len(raw) == 3:
+            raw = "".join(ch * 2 for ch in raw)
+        if len(raw) != 6:
+            return "#f8fafc"
+        try:
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
+        except Exception:
+            return "#f8fafc"
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        return "#0b1220" if luminance > 0.55 else "#f8fafc"
+
+    def _render_table(ax: Any, title: str, rows: List[Dict[str, Any]]) -> None:
+        ax.axis("off")
+        ax.set_facecolor("#0b1220")
+        ax.text(
+            0.0,
+            1.08,
+            title,
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            color="#e2e8f0",
+            fontsize=11,
+            fontweight="bold",
+        )
+        if not rows:
+            ax.text(0.5, 0.5, "No rows available.", ha="center", va="center", color="#94a3b8", fontsize=10)
+            return
+        frame = pd.DataFrame(rows)
+        for col in table_columns:
+            if col not in frame.columns:
+                frame[col] = "—"
+        frame = frame[table_columns].fillna("—")
+        cell_text = frame.astype(str).values.tolist()
+        col_widths = [0.12, 0.18, 0.18, 0.08, 0.08, 0.14, 0.10, 0.12]
+        table = ax.table(
+            cellText=cell_text,
+            colLabels=table_columns,
+            colLoc="center",
+            cellLoc="center",
+            colWidths=col_widths,
+            loc="upper left",
+            bbox=[0.0, 0.0, 1.0, 1.0],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8.8)
+        table.scale(1, 1.14)
+
+        for (r_idx, c_idx), cell in table.get_celld().items():
+            cell.set_edgecolor("#32415f")
+            cell.set_linewidth(0.8)
+            if r_idx == 0:
+                cell.set_facecolor("#2a334a")
+                cell.get_text().set_color("#dbe7ff")
+                cell.get_text().set_fontweight("bold")
+                continue
+            row_pos = r_idx - 1
+            base_bg = "#0f1a2e" if r_idx % 2 else "#101d34"
+            cell.set_facecolor(base_bg)
+            cell.get_text().set_color("#f1f5f9")
+            col_name = table_columns[c_idx] if c_idx < len(table_columns) else ""
+            raw_val = frame.iloc[row_pos, c_idx] if row_pos < len(frame) else ""
+            txt_val = str(raw_val).strip()
+            upper_val = txt_val.upper()
+
+            if col_name == "Pick":
+                if upper_val == "OVER":
+                    cell.set_facecolor("#166534")
+                    cell.get_text().set_color("#dcfce7")
+                    cell.get_text().set_fontweight("bold")
+                elif upper_val == "UNDER":
+                    cell.set_facecolor("#991b1b")
+                    cell.get_text().set_color("#fee2e2")
+                    cell.get_text().set_fontweight("bold")
+                elif upper_val not in {"", "—", "NO BET"}:
+                    team_bg = str(get_team_primary_color(txt_val) or "#1d4ed8").strip()
+                    cell.set_facecolor(team_bg)
+                    cell.get_text().set_color(_text_color_for_bg(team_bg))
+                    cell.get_text().set_fontweight("bold")
+            elif col_name == "Edge":
+                edge_num = _parse_number(txt_val)
+                if edge_num is not None:
+                    intensity = min(0.8, 0.22 + min(abs(edge_num), 12.0) * 0.05)
+                    if edge_num >= 0:
+                        cell.set_facecolor((16 / 255.0, 185 / 255.0, 129 / 255.0, intensity))
+                        cell.get_text().set_color("#ecfeff")
+                    else:
+                        cell.set_facecolor((244 / 255.0, 63 / 255.0, 94 / 255.0, intensity))
+                        cell.get_text().set_color("#ffe4e6")
+            elif col_name == "Confidence":
+                conf_num = _parse_number(txt_val)
+                if conf_num is not None:
+                    centered = max(-1.0, min(1.0, (conf_num - 50.0) / 50.0))
+                    intensity = 0.2 + abs(centered) * 0.6
+                    if centered >= 0:
+                        cell.set_facecolor((20 / 255.0, 184 / 255.0, 166 / 255.0, intensity))
+                        cell.get_text().set_color("#ecfeff")
+                    else:
+                        cell.set_facecolor((236 / 255.0, 72 / 255.0, 153 / 255.0, intensity))
+                        cell.get_text().set_color("#fdf2f8")
+
+    metric_ml_line = (
+        f"ML Yesterday {metrics.get('ml_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_prev_day', ('0-0', '+0.0%'))[1]})"
+        f"   |   ML YTD {metrics.get('ml_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('ml_ytd', ('0-0', '+0.0%'))[1]})"
+    )
+    metric_totals_line = (
+        f"Totals Yesterday {metrics.get('tot_prev_day', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_prev_day', ('0-0', '+0.0%'))[1]})"
+        f"   |   Totals YTD {metrics.get('tot_ytd', ('0-0', '+0.0%'))[0]} ({metrics.get('tot_ytd', ('0-0', '+0.0%'))[1]})"
+    )
+    subtitle = f"Slate Date: {slate_date_text}   |   Last updated: {last_updated_et}"
+
+    ml_rows_count = max(1, len(ml_clean))
+    ou_rows_count = max(1, len(ou_clean))
+    table_unit_h = 0.27
+    fig_height = max(9.3, 3.0 + table_unit_h * (ml_rows_count + ou_rows_count))
+    fig = plt.figure(figsize=(15.5, fig_height))
+    fig.patch.set_facecolor("#0b1220")
+    gs = fig.add_gridspec(
+        3,
+        1,
+        height_ratios=[
+            1.15,
+            max(2.0, 1.2 + ml_rows_count * 0.13),
+            max(2.0, 1.2 + ou_rows_count * 0.13),
+        ],
+        hspace=0.22,
+    )
+
+    ax_head = fig.add_subplot(gs[0, 0])
+    ax_head.axis("off")
+    ax_head.set_facecolor("#0b1220")
+    ax_head.text(0.5, 0.78, "NHL Picks", ha="center", va="center", color="#f8fafc", fontsize=24, fontweight="bold")
+    ax_head.text(0.5, 0.52, metric_ml_line, ha="center", va="center", color="#cbd5e1", fontsize=12, fontweight="semibold")
+    ax_head.text(0.5, 0.30, metric_totals_line, ha="center", va="center", color="#cbd5e1", fontsize=12, fontweight="semibold")
+    ax_head.text(0.5, 0.10, subtitle, ha="center", va="center", color="#94a3b8", fontsize=10)
+
+    ax_ml = fig.add_subplot(gs[1, 0])
+    ax_ou = fig.add_subplot(gs[2, 0])
+    _render_table(ax_ml, "Moneyline Picks", ml_clean)
+    _render_table(ax_ou, "Over/Under Picks", ou_clean)
+
+    try:
+        plt.savefig(image_path, bbox_inches="tight", dpi=200, facecolor=fig.get_facecolor())
+    finally:
+        plt.close(fig)
+    if os.path.exists(image_path):
+        print(f"✅ Saved public app snapshot image to {image_path}")
+        return image_path
     return None
 
 def create_dashboard_html(
@@ -14922,6 +15172,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
             social_results = {'twitter': False, 'discord': False}
             try:
                 # Only post predictions image to Twitter (no text summary)
+                img_path = None
                 try:
                     img_path = save_predictions_image(
                         predictions,
@@ -14934,7 +15185,7 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                         social_poster.post_image_to_twitter(img_path, caption='🏒 NHL Predictions')
                 except Exception:
                     pass
-                # Optional inline predictions to Discord
+                # Optional Discord posting (prefer table image; fallback to inline text).
                 topn = 0
                 try:
                     if cli_args is not None:
@@ -14942,7 +15193,32 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 except Exception:
                     topn = 0
                 if not cli_args or getattr(cli_args, 'post_inline', False):
-                    social_poster.post_inline_predictions(predictions, top_n=topn, title='NHL Predictions')
+                    posted_discord = False
+                    discord_img_path = None
+                    try:
+                        discord_img_path = save_public_app_snapshot_image(
+                            log_path=getattr(cli_args, 'log_path', 'bets_log.csv') if cli_args else None,
+                            image_path='predictions_discord.png'
+                        )
+                    except Exception:
+                        discord_img_path = None
+                    if discord_img_path and os.path.exists(discord_img_path):
+                        posted_discord = social_poster.post_file_to_discord(
+                            discord_img_path,
+                            message='🏒 NHL Picks'
+                        )
+                    elif img_path and os.path.exists(img_path):
+                        posted_discord = social_poster.post_file_to_discord(
+                            img_path,
+                            message='🏒 NHL Predictions Table'
+                        )
+                    if not posted_discord:
+                        posted_discord = social_poster.post_inline_predictions(
+                            predictions,
+                            top_n=topn,
+                            title='NHL Predictions'
+                        )
+                    social_results['discord'] = bool(posted_discord)
             except Exception as e:
                 print(f"⚠️  Social posting skipped/failed: {e}")
         else:

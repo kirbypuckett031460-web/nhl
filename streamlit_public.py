@@ -19,8 +19,10 @@ except Exception:  # pragma: no cover - fallback only
     pd = None
 
 try:
-    from nhl_model.common import get_team_primary_color
+    from nhl_model.common import format_team_display, get_team_abbreviation, get_team_primary_color
 except Exception:  # pragma: no cover - fallback only
+    format_team_display = None
+    get_team_abbreviation = None
     get_team_primary_color = None
 
 
@@ -214,6 +216,34 @@ def _safe_int(raw_value: object) -> Optional[int]:
         return None
 
 
+def _team_display(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "—"
+    if format_team_display is not None:
+        try:
+            display = str(format_team_display(raw) or "").strip()
+            if display:
+                return display
+        except Exception:
+            pass
+    return raw
+
+
+def _team_code(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if get_team_abbreviation is not None:
+        try:
+            code = str(get_team_abbreviation(raw) or "").strip().upper()
+            if code:
+                return code
+        except Exception:
+            pass
+    return raw.upper()
+
+
 def _split_matchup(matchup: str) -> Tuple[str, str]:
     raw = str(matchup or "").strip()
     if "@" in raw:
@@ -358,15 +388,16 @@ def _read_public_predictions(path: Path, prefer_remote: bool = False) -> Tuple[L
                     for k in ("home_moneyline_odds", "away_moneyline_odds", "consensus_home_moneyline", "consensus_away_moneyline")
                 ):
                     moneyline_market_count += 1
-            # Prefer payloads with real scheduled games over synthetic/demo rows,
-            # then pick the freshest generated_at among those.
+            # Prefer real slates with market coverage and fresh timestamps.
+            # This avoids selecting stale branch payloads that have more games
+            # but missing market fields.
             key = (
                 1 if real_count > 0 else 0,
-                real_count,
-                totals_market_count,
-                moneyline_market_count,
+                1 if (totals_market_count > 0 or moneyline_market_count > 0) else 0,
                 1 if generated_dt is not None else 0,
                 generated_dt or datetime.min,
+                moneyline_market_count + totals_market_count,
+                real_count,
                 -synthetic_count,
                 len(games),
             )
@@ -407,20 +438,23 @@ def _compute_record_blocks(
     reference_date: Optional[date] = None,
 ) -> Dict[str, Tuple[str, str]]:
     ref_date = reference_date or datetime.now().date()
+
+    def _default_season_start(ref: date) -> date:
+        same_year_start = date(ref.year, 9, 29)
+        return same_year_start if ref >= same_year_start else date(ref.year - 1, 9, 29)
+
+    season_start = _default_season_start(ref_date)
     season_start_raw = str(os.getenv("NHL_SEASON_START", "")).strip()
-    if not season_start_raw:
-        current_year_start = date(ref_date.year, 9, 29)
-        # During late off-season (Jul-Sep before opening day), track against the upcoming season start.
-        if ref_date.month >= 7 and ref_date < current_year_start:
-            season_start_raw = current_year_start.strftime("%Y-%m-%d")
-        elif ref_date >= current_year_start:
-            season_start_raw = current_year_start.strftime("%Y-%m-%d")
-        else:
-            season_start_raw = date(ref_date.year - 1, 9, 29).strftime("%Y-%m-%d")
-    try:
-        season_start = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
-    except Exception:
-        season_start = datetime.now().date().replace(month=1, day=1)
+    if season_start_raw:
+        try:
+            configured = datetime.strptime(season_start_raw, "%Y-%m-%d").date()
+            # Accept configured start only when it's plausibly this season
+            # (allows a few-week override without letting stale prior-season
+            # values inflate current YTD records).
+            if abs((configured - season_start).days) <= 45:
+                season_start = configured
+        except Exception:
+            pass
     yesterday = ref_date - timedelta(days=1)
     blocks = {
         "ml_prev_day": [0, 0],
@@ -509,8 +543,12 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
         return None
 
     for game in games:
-        away = str(game.get("away_abbrev") or game.get("away_team") or "").strip() or "—"
-        home = str(game.get("home_abbrev") or game.get("home_team") or "").strip() or "—"
+        away_raw = game.get("away_team") or game.get("away_abbrev") or ""
+        home_raw = game.get("home_team") or game.get("home_abbrev") or ""
+        away = _team_display(away_raw)
+        home = _team_display(home_raw)
+        away_code = _team_code(away_raw)
+        home_code = _team_code(home_raw)
         game_time = str(game.get("game_time_et") or "").strip() or "—"
 
         totals_edge = _safe_float(game.get("totals_edge"))
@@ -527,15 +565,25 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
             "_edge_abs": abs(totals_edge) if totals_edge is not None else -1.0,
         })
 
-        ml_pick = str(game.get("moneyline_pick_team") or "").strip().upper()
+        ml_pick_raw = str(game.get("moneyline_pick_team") or "").strip()
+        ml_pick = _team_display(ml_pick_raw) if ml_pick_raw else ""
         if not ml_pick:
             side_hint = str(game.get("moneyline_pick_side") or "").strip().lower()
             ml_pick = home if side_hint == "home" else away if side_hint == "away" else home
         else:
             side_hint = str(game.get("moneyline_pick_side") or "").strip().lower()
+            if not side_hint:
+                pick_code = _team_code(ml_pick_raw or ml_pick)
+                if pick_code and pick_code == away_code:
+                    side_hint = "away"
+                elif pick_code and pick_code == home_code:
+                    side_hint = "home"
         market_ml = _resolve_moneyline_market(game, side_hint)
         ml_edge = _safe_float(game.get("moneyline_edge"))
         ml_conf = _safe_float(game.get("moneyline_confidence_pct"))
+        ml_action = str(game.get("moneyline_action") or "").strip().upper()
+        if ml_action not in {"ML_BET", "ML_PICK"}:
+            ml_action = "ML_PICK"
         moneyline_rows.append({
             "Game Time (ET)": game_time,
             "Away": away,
@@ -546,6 +594,7 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
             "Edge": _fmt_signed(ml_edge * 100.0 if ml_edge is not None else None, places=1, pct=True),
             "Confidence": _fmt_signed(ml_conf, places=1, pct=True).replace("+", ""),
             "_edge_abs": abs(ml_edge) if ml_edge is not None else -1.0,
+            "_ml_action": ml_action,
         })
 
     totals_rows.sort(key=lambda r: str(r.get("Game Time (ET)") or ""))
@@ -556,7 +605,9 @@ def _build_tables_from_public(games: List[Dict[str, object]]) -> Tuple[List[Dict
 def _build_totals_from_log_rows(run_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for row in run_rows:
-        away, home = _split_matchup(row.get("matchup", ""))
+        away_raw, home_raw = _split_matchup(row.get("matchup", ""))
+        away = _team_display(away_raw) if format_team_display is not None else away_raw
+        home = _team_display(home_raw) if format_team_display is not None else home_raw
         line = _safe_float(row.get("line"))
         fair = _safe_float(row.get("pred_total"))
         edge = _safe_float(row.get("edge"))
@@ -660,11 +711,11 @@ def _render_table(rows: List[Dict[str, object]], title: str = "", subtitle: str 
     frame = pd.DataFrame(clean_rows)
     width_map = {
         "Game Time (ET)": "110px",
-        "Away": "180px",
-        "Home": "180px",
+        "Away": "230px",
+        "Home": "230px",
         "Mkt": "64px",
         "Fair": "64px",
-        "Pick": "190px",
+        "Pick": "220px",
         "Edge": "74px",
         "Confidence": "90px",
     }
@@ -731,7 +782,10 @@ def render_public_app() -> None:
 
     log_path = APP_ROOT / "bets_log.csv"
     board_path = APP_ROOT / "public_predictions.json"
-    prefer_remote = _env_truthy("PUBLIC_APP_PREFER_REMOTE_DATA", default=True)
+    # Prefer remote repository artifacts by default so the app reflects the
+    # latest published outputs even when the app container's local files lag.
+    # Set PUBLIC_APP_FORCE_LOCAL=true only when intentionally debugging local files.
+    prefer_remote = not _env_truthy("PUBLIC_APP_FORCE_LOCAL", default=False)
     board_games, board_dt, board_branch, board_slate_date = _read_public_predictions(board_path, prefer_remote=prefer_remote)
     run_rows, run_dt = _latest_run_rows(log_path, prefer_remote=prefer_remote, remote_branch=board_branch)
     # "Yesterday" metrics should reflect the real calendar day in schedule timezone,
@@ -773,7 +827,8 @@ def render_public_app() -> None:
     tab_ml, tab_ou = st.tabs(["Moneyline Picks", "Over/Under Picks"])
     with tab_ml:
         _render_table(ml_rows)
-        top_ml = sorted(ml_rows, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
+        top_source = ml_rows
+        top_ml = sorted(top_source, key=lambda r: float(r.get("_edge_abs", -1.0)), reverse=True)[:5]
         _render_table(top_ml, "Top Plays")
     with tab_ou:
         _render_table(ou_rows)
