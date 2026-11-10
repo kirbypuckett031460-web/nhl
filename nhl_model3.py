@@ -10225,14 +10225,13 @@ def resolve_totals_pick(prediction: OverUnderPrediction) -> str:
 def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
     """Return a deterministic moneyline side ('home' or 'away') for every game."""
     ml_side = str(getattr(prediction, 'moneyline_recommendation_side', '') or '').strip().lower()
-    if ml_side in {'home', 'away'}:
-        return ml_side
-
+    explicit_side: Optional[str] = ml_side if ml_side in {'home', 'away'} else None
     ml_raw = str(getattr(prediction, 'moneyline_recommendation', '') or '').strip().upper()
-    if 'HOME' in ml_raw:
-        return 'home'
-    if 'AWAY' in ml_raw:
-        return 'away'
+    if explicit_side is None:
+        if 'HOME' in ml_raw:
+            explicit_side = 'home'
+        elif 'AWAY' in ml_raw:
+            explicit_side = 'away'
 
     home_prob = None
     away_prob = None
@@ -10280,6 +10279,31 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
         resolve_longshot_min_edge = float(os.getenv('ML_RESOLVE_LONGSHOT_MIN_EDGE', '0.02'))
     except Exception:
         resolve_longshot_min_edge = 0.02
+    resolve_away_dog_enable = str(os.getenv('ML_RESOLVE_AWAY_DOG_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+    try:
+        resolve_away_dog_odds_threshold = int(float(os.getenv('ML_RESOLVE_AWAY_DOG_ODDS_THRESHOLD', '100')))
+    except Exception:
+        resolve_away_dog_odds_threshold = 100
+    try:
+        resolve_away_dog_min_prob = float(os.getenv('ML_RESOLVE_AWAY_DOG_MIN_PROB', '0.57'))
+    except Exception:
+        resolve_away_dog_min_prob = 0.57
+    try:
+        resolve_away_dog_min_edge = float(os.getenv('ML_RESOLVE_AWAY_DOG_MIN_EDGE', '0.03'))
+    except Exception:
+        resolve_away_dog_min_edge = 0.03
+    try:
+        resolve_away_dog_extreme_odds_threshold = int(float(os.getenv('ML_RESOLVE_AWAY_DOG_EXTREME_ODDS_THRESHOLD', '130')))
+    except Exception:
+        resolve_away_dog_extreme_odds_threshold = 130
+    try:
+        resolve_away_dog_extreme_min_prob = float(os.getenv('ML_RESOLVE_AWAY_DOG_EXTREME_MIN_PROB', '0.61'))
+    except Exception:
+        resolve_away_dog_extreme_min_prob = 0.61
+    try:
+        resolve_away_dog_extreme_min_edge = float(os.getenv('ML_RESOLVE_AWAY_DOG_EXTREME_MIN_EDGE', '0.06'))
+    except Exception:
+        resolve_away_dog_extreme_min_edge = 0.06
     try:
         resolve_max_delta_from_market = float(os.getenv('ML_RESOLVE_MAX_DELTA_FROM_MARKET', '0.20'))
     except Exception:
@@ -10360,7 +10384,7 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
         ):
             return market_side
 
-        picked_side = 'home' if home_score >= away_score else 'away'
+        picked_side = explicit_side if explicit_side in {'home', 'away'} else ('home' if home_score >= away_score else 'away')
         picked_prob = float(home_score) if picked_side == 'home' else float(away_score)
         picked_market_prob = market_home_prob if picked_side == 'home' else market_away_prob
         picked_odds = h_odds if picked_side == 'home' else a_odds
@@ -10376,6 +10400,26 @@ def resolve_moneyline_pick(prediction: OverUnderPrediction) -> str:
                 if market_side:
                     return market_side
                 return 'away' if picked_side == 'home' else 'home'
+        if (
+            resolve_away_dog_enable
+            and picked_side == 'away'
+            and isinstance(picked_odds, (int, float))
+            and float(picked_odds) >= float(resolve_away_dog_odds_threshold)
+        ):
+            implied_edge = (picked_prob - float(picked_market_prob)) if picked_market_prob is not None else None
+            min_prob_req = float(resolve_away_dog_min_prob)
+            min_edge_req = float(resolve_away_dog_min_edge)
+            if float(picked_odds) >= float(resolve_away_dog_extreme_odds_threshold):
+                min_prob_req = max(min_prob_req, float(resolve_away_dog_extreme_min_prob))
+                min_edge_req = max(min_edge_req, float(resolve_away_dog_extreme_min_edge))
+            if (
+                picked_prob < min_prob_req
+                or implied_edge is None
+                or implied_edge < min_edge_req
+            ):
+                if resolve_market_favorite and market_side:
+                    return market_side
+                return 'home'
         return picked_side
 
     no_bet_market_favorite = str(os.getenv('ML_NO_BET_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
