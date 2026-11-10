@@ -639,6 +639,47 @@ class RealDataNHLModel:
         self.kelly_cap_pct: float = float(os.getenv('KELLY_CAP_PCT', 2.0))  # percent
         self.daily_exposure_cap_pct: float = float(os.getenv('DAILY_EXPOSURE_CAP_PCT', 6.0))  # percent
         self.kelly_use_fair: bool = False
+        # Moneyline calibration / guardrails (accuracy-first defaults)
+        self.ml_market_prob_shrink_enable: bool = str(os.getenv('ML_MARKET_PROB_SHRINK_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_market_prob_anchor_base: float = float(os.getenv('ML_MARKET_PROB_ANCHOR_BASE', os.getenv('ML_MARKET_PROB_ANCHOR', '0.35')))
+        except Exception:
+            self.ml_market_prob_anchor_base = 0.35
+        try:
+            self.ml_market_prob_anchor_longshot: float = float(os.getenv('ML_MARKET_PROB_ANCHOR_LONGSHOT', '0.70'))
+        except Exception:
+            self.ml_market_prob_anchor_longshot = 0.70
+        try:
+            self.ml_market_prob_anchor_weak_gap: float = float(os.getenv('ML_MARKET_PROB_ANCHOR_WEAK_GAP', '0.65'))
+        except Exception:
+            self.ml_market_prob_anchor_weak_gap = 0.65
+        try:
+            self.ml_market_prob_weak_gap: float = float(os.getenv('ML_MARKET_PROB_WEAK_GAP', '0.03'))
+        except Exception:
+            self.ml_market_prob_weak_gap = 0.03
+        try:
+            self.ml_longshot_odds_threshold: int = int(float(os.getenv('ML_LONGSHOT_ODDS_THRESHOLD', '140')))
+        except Exception:
+            self.ml_longshot_odds_threshold = 140
+        self.ml_longshot_filter_enable: bool = str(os.getenv('ML_LONGSHOT_FILTER_ENABLE', '1')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_longshot_min_prob: float = float(os.getenv('ML_LONGSHOT_MIN_PROB', '0.58'))
+        except Exception:
+            self.ml_longshot_min_prob = 0.58
+        try:
+            self.ml_longshot_min_edge: float = float(os.getenv('ML_LONGSHOT_MIN_EDGE', '0.04'))
+        except Exception:
+            self.ml_longshot_min_edge = 0.04
+        self.ml_force_decision: bool = str(os.getenv('ML_FORCE_DECISION', '0')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_force_min_prob_gap: float = float(os.getenv('ML_FORCE_MIN_PROB_GAP', '0.03'))
+        except Exception:
+            self.ml_force_min_prob_gap = 0.03
+        self.ml_no_bet_market_favorite: bool = str(os.getenv('ML_NO_BET_MARKET_FAVORITE', '1')).strip().lower() in TRUTHY_FLAGS
+        try:
+            self.ml_no_bet_min_prob_gap: float = float(os.getenv('ML_NO_BET_MIN_PROB_GAP', '0.03'))
+        except Exception:
+            self.ml_no_bet_min_prob_gap = 0.03
         self._team_alias_map: Optional[Dict[str, str]] = None
         self.ref_goal_baseline: Optional[float] = None
         try:
@@ -7062,17 +7103,24 @@ class RealDataNHLModel:
                 home_win_prob = float(home_win_prob / pair_sum)
                 away_win_prob = float(max(0.0, min(1.0, 1.0 - home_win_prob)))
 
-            # Lightly anchor toward no-vig market fair probs when both ML prices exist.
-            if home_moneyline_odds is not None and away_moneyline_odds is not None:
+            # Accuracy guard: anchor toward no-vig market fair probabilities,
+            # with stronger shrinkage on longshots and near-coinflip model calls.
+            if self.ml_market_prob_shrink_enable and home_moneyline_odds is not None and away_moneyline_odds is not None:
                 try:
                     home_imp = decimal_to_implied_prob(american_to_decimal(int(home_moneyline_odds)))
                     away_imp = decimal_to_implied_prob(american_to_decimal(int(away_moneyline_odds)))
                     vig_ml = max(1e-9, home_imp + away_imp)
                     fair_home_ml = float(home_imp / vig_ml)
-                    try:
-                        anchor = float(os.getenv('ML_MARKET_PROB_ANCHOR', '0.35'))
-                    except Exception:
-                        anchor = 0.35
+                    model_gap = float(abs(float(home_win_prob) - float(away_win_prob)))
+                    longshot_present = bool(
+                        (isinstance(home_moneyline_odds, (int, float)) and float(home_moneyline_odds) >= float(self.ml_longshot_odds_threshold))
+                        or (isinstance(away_moneyline_odds, (int, float)) and float(away_moneyline_odds) >= float(self.ml_longshot_odds_threshold))
+                    )
+                    anchor = float(self.ml_market_prob_anchor_base)
+                    if longshot_present:
+                        anchor = max(anchor, float(self.ml_market_prob_anchor_longshot))
+                    if model_gap < float(self.ml_market_prob_weak_gap):
+                        anchor = max(anchor, float(self.ml_market_prob_anchor_weak_gap))
                     anchor = float(min(max(anchor, 0.0), 1.0))
                     try:
                         max_delta = float(os.getenv('ML_MAX_PROB_DELTA_FROM_MARKET', '0.20'))
@@ -7140,11 +7188,31 @@ class RealDataNHLModel:
         ml_edge_floor = float(getattr(self, 'moneyline_edge_floor', 0.02))
         ml_prob_floor = float(getattr(self, 'moneyline_prob_floor', 0.0))
         ml_candidates: List[Tuple[str, float, float]] = []
+        longshot_filtered = False
+
+        def _ml_side_allowed(prob: Optional[float], edge_val: Optional[float], odds_val: Optional[int]) -> bool:
+            nonlocal longshot_filtered
+            if not self.ml_longshot_filter_enable:
+                return True
+            try:
+                odds_num = float(odds_val) if odds_val is not None else None
+            except Exception:
+                odds_num = None
+            # Longshot guard applies to plus-money underdogs at/above threshold only.
+            if odds_num is None or odds_num < float(self.ml_longshot_odds_threshold):
+                return True
+            prob_num = float(prob) if prob is not None else 0.0
+            edge_num = float(edge_val) if edge_val is not None else 0.0
+            allow = (prob_num >= float(self.ml_longshot_min_prob)) and (edge_num >= float(self.ml_longshot_min_edge))
+            if not allow:
+                longshot_filtered = True
+            return allow
+
         if home_ml_edge is not None and home_win_prob is not None and home_ml_ev is not None:
-            if home_win_prob >= ml_prob_floor and home_ml_edge >= ml_edge_floor:
+            if home_win_prob >= ml_prob_floor and home_ml_edge >= ml_edge_floor and _ml_side_allowed(home_win_prob, home_ml_edge, home_moneyline_odds):
                 ml_candidates.append(('HOME ML', home_ml_edge, home_ml_ev))
         if away_ml_edge is not None and away_win_prob is not None and away_ml_ev is not None:
-            if away_win_prob >= ml_prob_floor and away_ml_edge >= ml_edge_floor:
+            if away_win_prob >= ml_prob_floor and away_ml_edge >= ml_edge_floor and _ml_side_allowed(away_win_prob, away_ml_edge, away_moneyline_odds):
                 ml_candidates.append(('AWAY ML', away_ml_edge, away_ml_ev))
         if ml_candidates:
             ml_candidates.sort(key=lambda x: (x[1], x[2]))
@@ -7163,6 +7231,8 @@ class RealDataNHLModel:
                 moneyline_no_bet_reason = 'odds_missing'
             elif home_win_prob is None or away_win_prob is None:
                 moneyline_no_bet_reason = 'prob_missing'
+            elif longshot_filtered:
+                moneyline_no_bet_reason = 'longshot_guard'
             else:
                 moneyline_no_bet_reason = 'edge_guard'
 
@@ -7178,15 +7248,19 @@ class RealDataNHLModel:
 
             home_prob_val = _coerce_prob(home_win_prob)
             away_prob_val = _coerce_prob(away_win_prob)
-            if home_prob_val is not None or away_prob_val is not None:
+            if self.ml_force_decision and (home_prob_val is not None or away_prob_val is not None):
                 home_score = home_prob_val if home_prob_val is not None else -1.0
                 away_score = away_prob_val if away_prob_val is not None else -1.0
-                forced_side = 'home' if home_score >= away_score else 'away'
-                moneyline_recommendation_side = forced_side
-                moneyline_recommendation = 'HOME ML' if forced_side == 'home' else 'AWAY ML'
-                moneyline_bet_size = 0.0
-                if moneyline_no_bet_reason in (None, 'edge_guard'):
-                    moneyline_no_bet_reason = 'forced_decision'
+                prob_gap = abs(home_score - away_score)
+                if prob_gap >= float(self.ml_force_min_prob_gap):
+                    forced_side = 'home' if home_score >= away_score else 'away'
+                    moneyline_recommendation_side = forced_side
+                    moneyline_recommendation = 'HOME ML' if forced_side == 'home' else 'AWAY ML'
+                    moneyline_bet_size = 0.0
+                    if moneyline_no_bet_reason in (None, 'edge_guard', 'longshot_guard'):
+                        moneyline_no_bet_reason = 'forced_decision'
+                elif moneyline_no_bet_reason in (None, 'edge_guard'):
+                    moneyline_no_bet_reason = 'weak_signal'
         
         # Isotonic calibration of probability towards historical outcomes (if calibration fitted)
         try:
@@ -14307,6 +14381,71 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                 'expected_pace_shrunk': baseline_total
             }
 
+            def _safe_float_or_default(value: Any, default: float) -> float:
+                try:
+                    out = float(value)
+                    if np.isfinite(out):
+                        return out
+                except Exception:
+                    pass
+                return float(default)
+
+            def _safe_int_or_default(value: Any, default: int) -> int:
+                try:
+                    return int(float(value))
+                except Exception:
+                    return int(default)
+
+            def _build_fallback_prediction(game_row: Any, reason: str) -> OverUnderPrediction:
+                """Create a deterministic placeholder prediction so every game appears in outputs."""
+                game_id_local = str(game_row.get('game_id', f'fallback_{len(predictions)}'))
+                odds_row = betting_odds.get(game_id_local, {}) if isinstance(betting_odds, dict) else {}
+                default_line = float(os.getenv('DEFAULT_MARKET_TOTAL', '6.0'))
+                line_local = _safe_float_or_default(odds_row.get('total', default_line) if isinstance(odds_row, dict) else default_line, default_line)
+                over_local = _safe_int_or_default(odds_row.get('over', -110) if isinstance(odds_row, dict) else -110, -110)
+                under_local = _safe_int_or_default(odds_row.get('under', -110) if isinstance(odds_row, dict) else -110, -110)
+                pred = OverUnderPrediction(
+                    game_id=game_id_local,
+                    home_team=str(game_row.get('home_team', 'HOME')),
+                    away_team=str(game_row.get('away_team', 'AWAY')),
+                    predicted_total=float(line_local),
+                    betting_line=float(line_local),
+                    over_probability=0.5,
+                    under_probability=0.5,
+                    push_probability=0.0,
+                    confidence=0.5,
+                    expected_value_over=0.0,
+                    expected_value_under=0.0,
+                    recommendation='No Bet',
+                    edge=0.0,
+                    kelly_bet_size=0.0,
+                    over_american_odds=over_local,
+                    under_american_odds=under_local,
+                    moneyline_recommendation='No Bet',
+                    moneyline_no_bet_reason=reason,
+                )
+                try:
+                    home_ml = odds_row.get('home_moneyline') if isinstance(odds_row, dict) else None
+                    away_ml = odds_row.get('away_moneyline') if isinstance(odds_row, dict) else None
+                    pred.home_moneyline_odds = int(home_ml) if home_ml is not None else None
+                    pred.away_moneyline_odds = int(away_ml) if away_ml is not None else None
+                except Exception:
+                    pred.home_moneyline_odds = None
+                    pred.away_moneyline_odds = None
+                try:
+                    game_date_raw = game_row.get('date')
+                    start_ts = pd.to_datetime(game_date_raw, errors='coerce', utc=True)
+                    if start_ts is not None and not pd.isna(start_ts):
+                        start_ts_et = start_ts.tz_convert('US/Eastern')
+                        pred.game_datetime = start_ts_et.to_pydatetime()
+                        pred.game_datetime_utc = start_ts.tz_convert('UTC').to_pydatetime()
+                        pred.start_time_display = start_ts_et.strftime('%I:%M %p ET')
+                except Exception:
+                    pred.game_datetime = None
+                    pred.game_datetime_utc = None
+                    pred.start_time_display = ''
+                return pred
+
             for idx, game in todays_features.iterrows():
                 try:
                     game_id = str(game.get('game_id', f'game_{idx}'))
@@ -14869,8 +15008,38 @@ def main(cli_args: Optional[argparse.Namespace] = None):
                     predictions.append(pred)
 
                 except Exception as e:
-                    print(f"⚠️  Error predicting game {idx}: {e}")
+                    try:
+                        game_id_err = str(game.get('game_id', f'game_{idx}'))
+                    except Exception:
+                        game_id_err = f'game_{idx}'
+                    print(f"⚠️  Error predicting game {idx} ({game_id_err}): {e}")
+                    predictions.append(_build_fallback_prediction(game, reason='prediction_error'))
                     continue
+
+            # Safety net: ensure all scheduled games are represented, even if a row
+            # failed during feature/prediction plumbing.
+            try:
+                expected_games = todays_games.copy() if isinstance(todays_games, pd.DataFrame) else pd.DataFrame()
+                expected_ids: List[str] = []
+                if not expected_games.empty and 'game_id' in expected_games.columns:
+                    expected_ids = [str(v) for v in expected_games['game_id'].tolist()]
+                predicted_ids = {str(getattr(pred, 'game_id', '') or '') for pred in predictions}
+                recovered = 0
+                if expected_ids:
+                    row_lookup: Dict[str, Any] = {}
+                    for _, g_row in expected_games.iterrows():
+                        gid_val = str(g_row.get('game_id', ''))
+                        if gid_val and gid_val not in row_lookup:
+                            row_lookup[gid_val] = g_row
+                    for gid in expected_ids:
+                        if gid and gid not in predicted_ids and gid in row_lookup:
+                            predictions.append(_build_fallback_prediction(row_lookup[gid], reason='prediction_missing'))
+                            predicted_ids.add(gid)
+                            recovered += 1
+                if recovered:
+                    print(f"ℹ️  Added fallback predictions for {recovered} game(s) to preserve full slate output.")
+            except Exception as reconciliation_err:
+                print(f"⚠️  Could not reconcile full slate predictions: {reconciliation_err}")
 
             try:
                 model.apply_risk_budget(predictions)
