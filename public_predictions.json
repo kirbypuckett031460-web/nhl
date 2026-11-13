@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-13T13:46:35Z",
+  "generated_at": "2026-11-13T20:47:28Z",
   "games": [
     {
-      "generated_at": "2026-11-13T13:46:35Z",
+      "generated_at": "2026-11-13T20:47:28Z",
       "game_id": "2026020310",
       "away_team": "NYR",
       "home_team": "VAN",
@@ -19,16 +19,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "NYR",
-      "moneyline_market_odds": -220.0,
-      "moneyline_fair_odds": -144,
-      "moneyline_edge": -0.09768873931623934,
-      "moneyline_confidence_pct": 58.981126068376064,
+      "moneyline_market_odds": -210.0,
+      "moneyline_fair_odds": -140,
+      "moneyline_edge": -0.09454696151142872,
+      "moneyline_confidence_pct": 58.28723933272809,
       "moneyline_action": "ML_PICK",
       "moneyline_no_bet_reason": "longshot_guard",
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-13T13:46:35Z",
+      "generated_at": "2026-11-13T20:47:28Z",
       "game_id": "2026020311",
       "away_team": "NSH",
       "home_team": "VGK",
@@ -43,15 +43,15 @@
       "totals_edge": 0.2504049367838146,
       "totals_confidence_pct": 41.412284209436464,
       "totals_action": "PICK",
-      "moneyline_pick_side": "home",
-      "moneyline_pick_team": "VGK",
-      "moneyline_market_odds": -176.0,
-      "moneyline_fair_odds": -111,
-      "moneyline_edge": -0.11254300776152204,
-      "moneyline_confidence_pct": 52.51381516587678,
-      "moneyline_action": "ML_PICK",
-      "moneyline_no_bet_reason": "longshot_guard",
-      "moneyline_bet_size_pct": 0.0
+      "moneyline_pick_side": "away",
+      "moneyline_pick_team": "NSH",
+      "moneyline_market_odds": 132.0,
+      "moneyline_fair_odds": -139,
+      "moneyline_edge": 0.1498216024758533,
+      "moneyline_confidence_pct": 58.0856085234474,
+      "moneyline_action": "ML_BET",
+      "moneyline_no_bet_reason": null,
+      "moneyline_bet_size_pct": 2.0
     }
   ],
   "slate_date": "2026-11-13"
