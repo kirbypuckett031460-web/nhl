@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-18T14:10:21Z",
+  "generated_at": "2026-11-18T14:13:27Z",
   "games": [
     {
-      "generated_at": "2026-11-18T14:10:21Z",
+      "generated_at": "2026-11-18T14:13:27Z",
       "game_id": "2026020344",
       "away_team": "BOS",
       "home_team": "DET",
@@ -28,7 +28,7 @@
       "moneyline_bet_size_pct": 2.0
     },
     {
-      "generated_at": "2026-11-18T14:10:21Z",
+      "generated_at": "2026-11-18T14:13:27Z",
       "game_id": "2026020345",
       "away_team": "MTL",
       "home_team": "NJD",
@@ -54,7 +54,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-18T14:10:21Z",
+      "generated_at": "2026-11-18T14:13:27Z",
       "game_id": "2026020346",
       "away_team": "COL",
       "home_team": "UTA",
