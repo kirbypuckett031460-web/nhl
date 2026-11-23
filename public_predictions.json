@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-23T14:10:38Z",
+  "generated_at": "2026-11-23T21:06:38Z",
   "games": [
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020378",
       "away_team": "CBJ",
       "home_team": "NJD",
@@ -20,15 +20,15 @@
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "NJD",
       "moneyline_market_odds": -205.0,
-      "moneyline_fair_odds": -202,
-      "moneyline_edge": -0.002811606342481676,
-      "moneyline_confidence_pct": 66.93195411985019,
+      "moneyline_fair_odds": -204,
+      "moneyline_edge": -0.001589106342481661,
+      "moneyline_confidence_pct": 67.0542041198502,
       "moneyline_action": "ML_PICK",
       "moneyline_no_bet_reason": "edge_guard",
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020379",
       "away_team": "LAK",
       "home_team": "MTL",
@@ -54,7 +54,7 @@
       "moneyline_bet_size_pct": 1.5
     },
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020380",
       "away_team": "CGY",
       "home_team": "OTT",
@@ -71,16 +71,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "OTT",
-      "moneyline_market_odds": -235.0,
-      "moneyline_fair_odds": -139,
-      "moneyline_edge": -0.11986609363414125,
-      "moneyline_confidence_pct": 58.16264436792916,
+      "moneyline_market_odds": -255.0,
+      "moneyline_fair_odds": -147,
+      "moneyline_edge": -0.12254747998918258,
+      "moneyline_confidence_pct": 59.576237916574705,
       "moneyline_action": "ML_PICK",
       "moneyline_no_bet_reason": "longshot_guard",
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020381",
       "away_team": "TOR",
       "home_team": "NYI",
@@ -106,7 +106,7 @@
       "moneyline_bet_size_pct": 1.5
     },
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020382",
       "away_team": "UTA",
       "home_team": "WPG",
@@ -123,16 +123,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "WPG",
-      "moneyline_market_odds": -102.0,
-      "moneyline_fair_odds": -113,
-      "moneyline_edge": 0.024803310949800483,
-      "moneyline_confidence_pct": 52.975380599930546,
-      "moneyline_action": "ML_BET",
-      "moneyline_no_bet_reason": null,
-      "moneyline_bet_size_pct": 1.5
+      "moneyline_market_odds": -110.0,
+      "moneyline_fair_odds": -112,
+      "moneyline_edge": 0.00467672619047621,
+      "moneyline_confidence_pct": 52.848625000000006,
+      "moneyline_action": "ML_PICK",
+      "moneyline_no_bet_reason": "edge_guard",
+      "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020383",
       "away_team": "ANA",
       "home_team": "SEA",
@@ -149,16 +149,16 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "ANA",
-      "moneyline_market_odds": -105.0,
-      "moneyline_fair_odds": -223,
-      "moneyline_edge": 0.17798812412207887,
-      "moneyline_confidence_pct": 69.01832460732984,
+      "moneyline_market_odds": -102.0,
+      "moneyline_fair_odds": -215,
+      "moneyline_edge": 0.177685379234225,
+      "moneyline_confidence_pct": 68.263587428373,
       "moneyline_action": "ML_BET",
       "moneyline_no_bet_reason": null,
       "moneyline_bet_size_pct": 1.5
     },
     {
-      "generated_at": "2026-11-23T14:10:38Z",
+      "generated_at": "2026-11-23T21:06:38Z",
       "game_id": "2026020384",
       "away_team": "MIN",
       "home_team": "SJS",
@@ -175,13 +175,13 @@
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "MIN",
-      "moneyline_market_odds": -200.0,
-      "moneyline_fair_odds": -216,
-      "moneyline_edge": 0.016905144927536253,
-      "moneyline_confidence_pct": 68.35718115942029,
-      "moneyline_action": "ML_PICK",
-      "moneyline_no_bet_reason": "edge_guard",
-      "moneyline_bet_size_pct": 0.0
+      "moneyline_market_odds": -176.0,
+      "moneyline_fair_odds": -196,
+      "moneyline_edge": 0.024811992238477965,
+      "moneyline_confidence_pct": 66.24931516587678,
+      "moneyline_action": "ML_BET",
+      "moneyline_no_bet_reason": null,
+      "moneyline_bet_size_pct": 1.5
     }
   ],
   "slate_date": "2026-11-23"
