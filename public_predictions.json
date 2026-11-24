@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-24T13:35:05Z",
+  "generated_at": "2026-11-24T14:10:05Z",
   "games": [
     {
-      "generated_at": "2026-11-24T13:35:05Z",
+      "generated_at": "2026-11-24T14:10:05Z",
       "game_id": "2026020385",
       "away_team": "VGK",
       "home_team": "EDM",
@@ -12,10 +12,10 @@
       "game_time_et": "08:00 PM ET",
       "game_datetime_utc": "2026-11-25 01:00:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 6.860473430270557,
+      "totals_fair": 6.827015096937224,
       "totals_pick": "OVER",
-      "totals_edge": 0.3604734302705568,
-      "totals_confidence_pct": 43.063311611737596,
+      "totals_edge": 0.32701509693722386,
+      "totals_confidence_pct": 42.561436611737605,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "VGK",
