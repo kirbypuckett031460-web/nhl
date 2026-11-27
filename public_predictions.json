@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-27T14:10:26Z",
+  "generated_at": "2026-11-27T14:33:41Z",
   "games": [
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020400",
       "away_team": "TOR",
       "home_team": "BOS",
@@ -28,7 +28,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020401",
       "away_team": "CGY",
       "home_team": "NJD",
@@ -54,7 +54,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020402",
       "away_team": "UTA",
       "home_team": "NSH",
@@ -80,7 +80,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020403",
       "away_team": "DAL",
       "home_team": "STL",
@@ -90,10 +90,10 @@
       "game_time_et": "02:00 PM ET",
       "game_datetime_utc": "2026-11-27 19:00:00+00:00",
       "totals_line": 6.5,
-      "totals_fair": 6.770556529336204,
+      "totals_fair": 6.7705565293362024,
       "totals_pick": "OVER",
-      "totals_edge": 0.2705565293362042,
-      "totals_confidence_pct": 41.71455809772231,
+      "totals_edge": 0.27055652933620244,
+      "totals_confidence_pct": 41.71455809772229,
       "totals_action": "PICK",
       "moneyline_pick_side": "away",
       "moneyline_pick_team": "DAL",
@@ -106,7 +106,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020404",
       "away_team": "OTT",
       "home_team": "TBL",
@@ -132,7 +132,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020405",
       "away_team": "VAN",
       "home_team": "PHI",
@@ -158,7 +158,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020406",
       "away_team": "FLA",
       "home_team": "WSH",
@@ -184,7 +184,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020407",
       "away_team": "DET",
       "home_team": "CBJ",
@@ -194,10 +194,10 @@
       "game_time_et": "03:00 PM ET",
       "game_datetime_utc": "2026-11-27 20:00:00+00:00",
       "totals_line": 5.5,
-      "totals_fair": 6.512395628114101,
+      "totals_fair": 6.512395628114099,
       "totals_pick": "OVER",
-      "totals_edge": 1.0123956281141009,
-      "totals_confidence_pct": 52.84214457939076,
+      "totals_edge": 1.012395628114099,
+      "totals_confidence_pct": 52.842144579390734,
       "totals_action": "PICK",
       "moneyline_pick_side": "home",
       "moneyline_pick_team": "CBJ",
@@ -210,7 +210,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020408",
       "away_team": "COL",
       "home_team": "MIN",
@@ -236,7 +236,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020409",
       "away_team": "LAK",
       "home_team": "ANA",
@@ -262,7 +262,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020410",
       "away_team": "VGK",
       "home_team": "SJS",
@@ -288,7 +288,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020411",
       "away_team": "NYR",
       "home_team": "CHI",
@@ -314,7 +314,7 @@
       "moneyline_bet_size_pct": 0.0
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020412",
       "away_team": "WPG",
       "home_team": "NYI",
@@ -340,7 +340,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020413",
       "away_team": "PIT",
       "home_team": "BUF",
@@ -366,7 +366,7 @@
       "moneyline_bet_size_pct": 0.75
     },
     {
-      "generated_at": "2026-11-27T14:10:26Z",
+      "generated_at": "2026-11-27T14:33:41Z",
       "game_id": "2026020414",
       "away_team": "SEA",
       "home_team": "EDM",
