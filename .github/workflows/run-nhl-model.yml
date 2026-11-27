@@ -62,27 +62,141 @@ jobs:
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout
+      - name: Slate lock gate
+        id: slate_lock_gate
         if: steps.schedule_gate.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' > /tmp/slate_lock_gate.out
+          import json
+          from datetime import datetime, timezone
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+          et_zone = ZoneInfo("America/New_York")
+          now_utc = datetime.now(timezone.utc)
+          now_et = datetime.now(et_zone)
+          run_date_raw = "${{ github.event.inputs.run_date }}".strip()
+          if run_date_raw:
+              try:
+                  target_date = datetime.strptime(run_date_raw, "%Y-%m-%d").date()
+              except Exception:
+                  target_date = now_et.date()
+          else:
+              target_date = now_et.date()
+
+          target_date_iso = target_date.isoformat()
+          lock_open = "true"
+          reason = "slate_open"
+          lock_time_utc = ""
+
+          if target_date < now_et.date():
+              lock_open = "false"
+              reason = "past_slate_locked"
+          elif target_date == now_et.date():
+              urls = [
+                  f"https://api-web.nhle.com/v1/schedule/{target_date_iso}",
+                  f"https://api-web.nhle.com/v1/scoreboard/{target_date_iso}",
+              ]
+
+              def parse_ts(raw: str):
+                  if not raw:
+                      return None
+                  try:
+                      dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                  except Exception:
+                      return None
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  else:
+                      dt = dt.astimezone(timezone.utc)
+                  return dt
+
+              starts = []
+              for url in urls:
+                  try:
+                      req = Request(
+                          url,
+                          method="GET",
+                          headers={
+                              "Accept": "application/json",
+                              "User-Agent": "nhl-github-action/1.0",
+                          },
+                      )
+                      with urlopen(req, timeout=15) as resp:
+                          payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                  except Exception:
+                      continue
+
+                  games = []
+                  if isinstance(payload, dict):
+                      direct_games = payload.get("games")
+                      if isinstance(direct_games, list):
+                          games.extend([g for g in direct_games if isinstance(g, dict)])
+                      game_week = payload.get("gameWeek")
+                      if isinstance(game_week, list):
+                          selected = []
+                          for day in game_week:
+                              if not isinstance(day, dict):
+                                  continue
+                              if str(day.get("date") or "").strip() != target_date_iso:
+                                  continue
+                              day_games = day.get("games")
+                              if isinstance(day_games, list):
+                                  selected = [g for g in day_games if isinstance(g, dict)]
+                                  break
+                          if selected:
+                              games.extend(selected)
+                  if not games:
+                      continue
+                  for game in games:
+                      ts = parse_ts(str(game.get("startTimeUTC") or game.get("gameDate") or game.get("startTime") or ""))
+                      if ts is not None:
+                          starts.append(ts)
+                  if starts:
+                      break
+
+              if starts:
+                  first_start = min(starts)
+                  lock_time_utc = first_start.isoformat()
+                  if now_utc >= first_start:
+                      lock_open = "false"
+                      reason = "today_slate_locked"
+                  else:
+                      reason = "today_slate_open"
+              else:
+                  reason = "lock_time_unavailable"
+
+          print(f"lock_open={lock_open}")
+          print(f"reason={reason}")
+          print(f"target_date={target_date_iso}")
+          print(f"lock_time_utc={lock_time_utc}")
+          PY
+          cat /tmp/slate_lock_gate.out
+          cat /tmp/slate_lock_gate.out >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        if: steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Install dependencies
-        if: steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Restore model/cache artifacts
-        if: steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -91,7 +205,7 @@ jobs:
           key: nhl-model-cache-v1
 
       - name: Run NHL prediction pipeline
-        if: steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -150,7 +264,7 @@ jobs:
           "${CMD[@]}"
 
       - name: Publish updated outputs
-        if: steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -217,3 +331,12 @@ jobs:
       - name: Skip notice
         if: steps.schedule_gate.outputs.should_run != 'true'
         run: echo "Skipping this scheduled run because it is not the active 4:00 PM ET slot."
+
+      - name: Slate lock skip notice
+        if: steps.schedule_gate.outputs.should_run == 'true' && steps.slate_lock_gate.outputs.lock_open != 'true'
+        run: |
+          echo "Skipping run because slate is locked for date ${{ steps.slate_lock_gate.outputs.target_date }}."
+          echo "Reason: ${{ steps.slate_lock_gate.outputs.reason }}"
+          if [[ -n "${{ steps.slate_lock_gate.outputs.lock_time_utc }}" ]]; then
+            echo "Lock time (UTC): ${{ steps.slate_lock_gate.outputs.lock_time_utc }}"
+          fi
