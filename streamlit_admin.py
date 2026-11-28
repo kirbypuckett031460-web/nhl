@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -19,6 +20,7 @@ from streamlit_public import _latest_record
 
 APP_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = APP_ROOT / "data" / "runtime"
+ET_ZONE = ZoneInfo("America/New_York")
 
 
 def _read_streamlit_secret(name: str) -> str:
@@ -354,6 +356,94 @@ def _trigger_github_workflow_dispatch(
         return False, f"Workflow dispatch failed: {e}", details
 
 
+def _parse_utc_timestamp(value: object) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    iso_val = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso_val)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
+def _extract_schedule_games(payload: object, target_date_iso: str) -> List[Dict[str, object]]:
+    if not isinstance(payload, dict):
+        return []
+    games: List[Dict[str, object]] = []
+    direct_games = payload.get("games")
+    if isinstance(direct_games, list):
+        games.extend([g for g in direct_games if isinstance(g, dict)])
+    game_week = payload.get("gameWeek")
+    if isinstance(game_week, list):
+        selected: List[Dict[str, object]] = []
+        for day in game_week:
+            if not isinstance(day, dict):
+                continue
+            day_date = str(day.get("date") or "").strip()
+            day_games = day.get("games")
+            if not isinstance(day_games, list):
+                continue
+            if day_date == target_date_iso:
+                selected = [g for g in day_games if isinstance(g, dict)]
+                break
+        if selected:
+            games.extend(selected)
+    return games
+
+
+def _fetch_slate_lock_time_utc(target_date: date) -> Optional[datetime]:
+    date_str = target_date.isoformat()
+    urls = [
+        f"https://api-web.nhle.com/v1/schedule/{date_str}",
+        f"https://api-web.nhle.com/v1/scoreboard/{date_str}",
+    ]
+    for url in urls:
+        try:
+            req = Request(
+                url,
+                method="GET",
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "nhl-streamlit-admin/1.0",
+                },
+            )
+            with urlopen(req, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+        starts: List[datetime] = []
+        for game in _extract_schedule_games(payload, date_str):
+            ts = _parse_utc_timestamp(
+                game.get("startTimeUTC") or game.get("gameDate") or game.get("startTime")
+            )
+            if ts is not None:
+                starts.append(ts)
+        if starts:
+            return min(starts)
+    return None
+
+
+def _slate_lock_status(run_date: date) -> Tuple[bool, Optional[datetime], str]:
+    now_et = datetime.now(ET_ZONE)
+    now_utc = datetime.now(timezone.utc)
+    if run_date < now_et.date():
+        return True, None, "Selected slate date is in the past and is locked."
+    if run_date > now_et.date():
+        return False, None, "Future slate date is editable until first puck drop."
+    lock_time_utc = _fetch_slate_lock_time_utc(run_date)
+    if lock_time_utc is None:
+        return False, None, "Could not determine first game time; lock check unavailable."
+    if now_utc >= lock_time_utc:
+        return True, lock_time_utc, "Slate is locked at first scheduled game time."
+    return False, lock_time_utc, "Slate remains open until first scheduled game time."
+
+
 def render_admin_app() -> None:
     st.set_page_config(page_title="NHL O/U Admin Runner", layout="wide")
     st.title("NHL Over/Under Admin")
@@ -378,6 +468,21 @@ def render_admin_app() -> None:
 
         st.header("Run Settings")
         run_date = st.date_input("Prediction date", value=date.today())
+        lock_active, lock_time_utc, lock_note = _slate_lock_status(run_date)
+        if lock_time_utc is not None:
+            lock_et = lock_time_utc.astimezone(ET_ZONE)
+            lock_text = lock_et.strftime("%Y-%m-%d %I:%M %p ET")
+            if lock_active:
+                st.error(f"🔒 Slate locked ({lock_text}).")
+            else:
+                st.caption(f"Slate lock time: {lock_text}")
+        elif lock_active:
+            st.error("🔒 Slate locked.")
+        if lock_note:
+            if lock_active:
+                st.caption(lock_note)
+            else:
+                st.info(lock_note)
         train_speed = st.selectbox("Training speed", options=["fast", "balanced", "full"], index=1)
         train_target = st.selectbox("Train target", options=["auto", "edge", "total"], index=0)
         historical_days = st.number_input("Historical days", min_value=30, max_value=2000, value=365, step=30)
@@ -460,9 +565,18 @@ def render_admin_app() -> None:
         else:
             st.caption("Set `GITHUB_PUSH_TOKEN` (or `GITHUB_TOKEN` / `GH_TOKEN`) in secrets/env, or use override, to enable publishing.")
 
-    run_clicked = st.button("Run Model", type="primary")
+    run_clicked = st.button(
+        "Run Model",
+        type="primary",
+        disabled=lock_active,
+        help="Disabled because the selected slate is locked." if lock_active else None,
+    )
 
     if not run_clicked:
+        return
+
+    if lock_active:
+        st.error("Slate is locked. No new picks or slate changes are allowed after first puck drop.")
         return
 
     uploaded_odds_path = _save_uploaded_file(odds_upload, "odds_uploaded.json")
